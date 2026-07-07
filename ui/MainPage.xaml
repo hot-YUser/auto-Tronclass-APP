@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="Ui.MainPage">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="24" Spacing="12" MaximumWidthRequest="640">
+
+            <Label Text="TronClass — Walking Skeleton" FontSize="24" FontAttributes="Bold" />
+            <Label Text="One login through the Rust core. Defaults point at the local fake server."
+                   TextColor="Gray" />
+
+            <Entry x:Name="BaseUrlEntry" Placeholder="base_url" Text="http://127.0.0.1:8779" />
+            <Entry x:Name="UserEntry" Placeholder="username" Text="test" />
+            <Entry x:Name="PassEntry" Placeholder="password" Text="secret" IsPassword="True" />
+
+            <Button x:Name="LoginButton" Text="Login" Clicked="OnLoginClicked" />
+
+            <Label x:Name="ResultLabel" FontSize="18" FontAttributes="Bold" Margin="0,4,0,0" />
+
+            <Label Text="Events (live from core)" FontAttributes="Bold" Margin="0,12,0,0" />
+            <Label x:Name="LogLabel" FontFamily="Monospace" FontSize="12" TextColor="Gray" />
+
+        </VerticalStackLayout>
+    </ScrollView>
+
+</ContentPage>

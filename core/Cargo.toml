@@ -1,0 +1,29 @@
+[package]
+name = "tronclass-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+# Output artifact name → tronclass_core.dll / libtronclass_core.so.
+# NOT "core": that shadows the std `core` crate. DllImport("tronclass_core") follows this name.
+name = "tronclass_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+csbindgen = "1"
+
+[features]
+# The in-repo fake TronClass server is dev/test-only; the shipped cdylib never contains it.
+fakeserver = []
+
+[[bin]]
+name = "fake_tronclass"
+required-features = ["fakeserver"]
