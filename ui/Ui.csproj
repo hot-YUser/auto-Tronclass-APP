@@ -85,13 +85,26 @@
 		</None>
 	</ItemGroup>
 
+	<!-- All four Android ABIs. .NET 11 preview's CoreCLR-on-Android only ships 64-bit runtime packs
+	     (no CoreCLR.*.android-arm / -x86), so the 32-bit ABIs require the Mono runtime. -->
+	<PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">
+		<RuntimeIdentifiers>android-arm64;android-arm;android-x64;android-x86</RuntimeIdentifiers>
+		<UseMonoRuntime>true</UseMonoRuntime>
+	</PropertyGroup>
+
 	<ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">
-		<!-- x86_64 for the emulator, arm64-v8a for a real device. build-core.ps1 -Head android builds both. -->
+		<!-- All four ABIs. build-core.ps1 -Head android cross-compiles each with cargo-ndk. -->
+		<AndroidNativeLibrary Include="..\core\jniLibs\arm64-v8a\libtronclass_core.so">
+			<Abi>arm64-v8a</Abi>
+		</AndroidNativeLibrary>
+		<AndroidNativeLibrary Include="..\core\jniLibs\armeabi-v7a\libtronclass_core.so">
+			<Abi>armeabi-v7a</Abi>
+		</AndroidNativeLibrary>
 		<AndroidNativeLibrary Include="..\core\jniLibs\x86_64\libtronclass_core.so">
 			<Abi>x86_64</Abi>
 		</AndroidNativeLibrary>
-		<AndroidNativeLibrary Include="..\core\jniLibs\arm64-v8a\libtronclass_core.so">
-			<Abi>arm64-v8a</Abi>
+		<AndroidNativeLibrary Include="..\core\jniLibs\x86\libtronclass_core.so">
+			<Abi>x86</Abi>
 		</AndroidNativeLibrary>
 	</ItemGroup>
 

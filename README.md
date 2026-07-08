@@ -4,31 +4,59 @@ Cross-platform TronClass client (rollcall + LLM-assisted answering). Rust core (
 logic) + .NET MAUI dumb view, joined by one in-process FFI seam. See `docs/` for the spec and
 `AGENTS.md` for the ground rules. Licensed AGPL-3.0-or-later.
 
-## Status: walking skeleton (build-order step 0)
+## Status: slice 4 — core feature-complete (Phase A done)
 
-One button → the Rust core does a real async login round-trip → the UI shows the result. Its
-only job is to prove the three riskiest things once, on the real architecture:
+Slices 0–3 are done (FFI seam on .NET **MAUI 11** preview; vault; registry; accounts; real login;
+multi-account monitoring; four rollcall types; the whole auto-answer subsystem + LLM). Slice 4 is the
+last stop of Phase A — filling the miscellaneous gaps that make the core feature-complete, still
+**headless / command-driven** (UI paused until a later phase):
 
-1. **async over FFI** — C# `await`/Task ↔ Rust tokio future
-2. **event callback (reverse channel)** — the core pushes unsolicited events + a heartbeat up to the UI
-3. **the platform keeps the process alive** — desktop naturally; Android via a foreground service
+- **settings system** — every tuning knob is typed in `Settings`, runtime-patchable via `UpdateConfig`,
+  persisted: `llm_max_tokens` (`0` → safe 16384), the radar strategy chain, number brute-force
+  concurrency/cooldown, poll + quiz-detect cadences, `log_level`, and operating hours.
+- **operating hours** (`Operating::is_open`, pure) — the monitor only polls inside enabled per-weekday
+  windows (empty schedule = always-on); local time = UTC + a fixed `tz_offset_minutes` (default +8),
+  zero new deps.
+- **captcha login** (docs 30) — a captcha page is detected, its image shipped as a `CaptchaChallenge`
+  event, and the user's typed answer (`SubmitCaptcha`) completes the login. **No OCR.** SSO / email-SPA
+  pages route to the browser-cookie fallback (`ImportCookies`).
+- **single redaction pass** (docs 90 §4) — every event crosses the seam through one audited
+  `redaction::emit`; secrets (password/cookie/LLM key) never reach a log/event. Leveled logging
+  (normal/debug).
+- **vault unlock layer** (docs 10) — a `KeyStore` trait + in-memory stub; the vault can unlock from a
+  stored key (`UnlockWithKeystore`) as well as the master password. Real Keychain/Keystore/DPAPI → Phase B.
 
-All three are runtime-proven (see below), on .NET **MAUI 11** preview. No domain features yet
-(rollcall, answering, QR, providers, vault, login feature-routing are later slices). The skeleton
-logs into an in-repo **fake** TronClass, so it needs zero credentials and names no school.
+### Slice 3 — auto-answer subsystem + LLM
+
+- **pure decision layer** (`quiz.rs`) — per subject: a server-leaked answer → replay, else → LLM;
+  group types flatten, `paragraph_desc` skips, fill/cloze/short send **verbatim (HTML included)**,
+  matching uses member-validation. (docs 31 scoring gotchas.)
+- **answer flow** (docs 20 flow A) — prepare (don't send) → **per-account conflict** check (never
+  overwrite an existing answer; resolve via `SetAnswer{account_id,…}`) → core-owned 15 s countdown
+  with submit-now / hold / discard → submit → resubmit-for-correct. LLM failure never submits blank.
+- **per-source contracts** — exam / vote / courseware-quiz / classroom-exam (per-subject full
+  wrapper) / homework / questionnaire, submit bodies exactly per docs 31.
+- **LLM client** (`llm.rs`) — NVIDIA NIM + minimax default, reasoning always on, explicit
+  `max_tokens`, reasoning streamed as `ReasoningChunk`, key from the vault. In a **merged** activity
+  the LLM runs **once** (shared); each account keeps/overrides its own answers and submits for itself.
+
+Quiz detection is a per-account × per-course fan-out. The monitor **actor never awaits network**
+(prepare / LLM / submit all spawned). Development runs against an in-repo **fake** TronClass + a fake
+LLM endpoint; no real NIM calls in tests.
 
 ## Layout
 
-- `core/` — Rust `cdylib` (`tronclass_core`). FFI surface in `src/lib.rs` (`core_init/send/free`
-  + one event callback), heartbeat + login in `src/engine.rs`/`src/login.rs`, wire schema in
-  `src/protocol.rs`, the fake server in `src/fake.rs`. `build.rs` runs csbindgen →
-  `ui/Interop/NativeMethods.g.cs`.
-- `ui/` — .NET MAUI app (net11.0 android + windows). `Interop/Core.cs` is the whole C# side of
-  the seam; `MainPage` is the dumb view; `Platforms/Android/CoreForegroundService.cs` is the
-  keepalive service.
-- `smoke/` — headless C# console that P/Invokes the core against the fake server (CI-able proof
-  of the marshalling without a GUI).
-- `build-core.ps1` — builds the native core (Windows dll / both Android ABIs).
+- `core/` — Rust `cdylib` (`tronclass_core`). FFI in `src/lib.rs` (`core_init/send/free` + one
+  callback); state machine + dispatch in `src/engine.rs`; `src/providers.rs` (registry/endpoints),
+  `src/config.rs` (metadata + typed settings + operating hours), `src/secrets.rs` (vault),
+  `src/keystore.rs` (unlock layer), `src/redaction.rs` (single audited event/log chokepoint),
+  `src/login.rs` (feature detection + captcha), `src/protocol.rs` (commands), `src/fake.rs` (fake
+  server). `build.rs` runs csbindgen → `ui/Interop/NativeMethods.g.cs`.
+- `ui/` — .NET MAUI app (net11.0 android + windows). `Interop/Core.cs` is the whole C# side of the
+  seam; dumb-view screens in `Pages/` (Unlock → Accounts → AddAccount → Dashboard);
+  `Platforms/Android/CoreForegroundService.cs` is the keepalive service.
+- `smoke/` — headless C# console that drives the account+login flow over P/Invoke (CI-able, no GUI).
+- `build-core.ps1` — builds the native core (Windows dll / all four Android ABIs).
 - `package-windows.ps1` — Windows distribution: portable exe and/or signed MSIX.
 
 ## Prereqs
@@ -50,9 +78,14 @@ dotnet run --project smoke -- http://127.0.0.1:8779                             
 # 3. Windows app — portable
 pwsh ./build-core.ps1                        # builds tronclass_core.dll
 dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0
-#   run it, keep the fake server up, press Login: ticks stream, state → logging_in, result shows,
-#   the button never blocks.
 ```
+
+**Using it (the slice-1 flow):** launch → *Create vault* (set a master password) → *Add account*
+(pick a school or type a `base_url`, e.g. the fake server `http://127.0.0.1:8779`, + username/password)
+→ *Open dashboard* → *Login active account*. Point `base_url` at your own school and enter your own
+credentials to log into it for real — they go into the vault, never the repo.
+(Unpackaged Windows launch needs the WindowsAppSDK; build with `-p:WindowsAppSDKSelfContained=true`
+if the runtime isn't installed machine-wide.)
 
 ### Windows distribution — portable and MSIX
 
@@ -77,7 +110,8 @@ Then double-click `Ui_1.0.0.0_x64.msix`. Without the trust step the install fail
 ### Android — runtime-proven keepalive
 
 ```sh
-pwsh ./build-core.ps1 -Head android          # cargo-ndk → core/jniLibs/{x86_64,arm64-v8a}/libtronclass_core.so
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+pwsh ./build-core.ps1 -Head android          # cargo-ndk → core/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}/libtronclass_core.so
 # .NET 11 preview's android workload compiles against API 37, which isn't in the default SDK channel:
 dotnet build ui/Ui.csproj -t:InstallAndroidDependencies -f net11.0-android -p:AcceptAndroidSDKLicenses=true
 # Build a directly-installable APK (Debug uses fast-deployment, so embed assemblies for adb install):
@@ -89,9 +123,11 @@ adb shell dumpsys battery unplug && adb shell dumpsys deviceidle force-idle   # 
 adb logcat -s tronclass                              # heartbeat ticks keep coming → process held alive
 ```
 
-Verified on an API-36 x86_64 emulator: the heartbeat keeps ticking (1/s) while backgrounded **and**
-under forced deep Doze, same pid throughout — the foreground service holds the process. Use `10.0.2.2`
-as the base_url host from an emulator to reach the fake server on your machine.
+The APK packages **all four ABIs** (arm64-v8a / armeabi-v7a / x86_64 / x86). .NET 11 preview's
+CoreCLR-on-Android only ships 64-bit runtime packs, so the csproj sets `UseMonoRuntime=true` to
+include the 32-bit ABIs; revisit at GA. Verified on an API-36 x86_64 emulator: the heartbeat keeps
+ticking (1/s) while backgrounded **and** under forced deep Doze, same pid throughout — the foreground
+service holds the process. Use `10.0.2.2` as the base_url host from an emulator to reach the fake server.
 
 > Honesty ceiling: emulator + forced Doze proves the *mechanism*. Real all-day survival on a
 > physical device under OEM battery-killers is not proven here — and API 35+ caps `dataSync`

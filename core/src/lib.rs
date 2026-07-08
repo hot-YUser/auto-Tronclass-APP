@@ -4,15 +4,38 @@
 
 use std::ffi::c_void;
 
+mod answer;
+mod config;
 mod engine;
+mod keystore;
+mod llm;
 mod login;
+mod monitor;
 mod protocol;
+mod providers;
+mod quiz;
+mod radar;
+mod redaction;
+mod rollcall;
+mod secrets;
 
 #[cfg(any(test, feature = "fakeserver"))]
 pub mod fake;
 
 #[cfg(test)]
 mod seam_test;
+
+#[cfg(test)]
+mod slice1_test;
+
+#[cfg(test)]
+mod slice2_test;
+
+#[cfg(test)]
+mod slice3_test;
+
+#[cfg(test)]
+mod slice4_test;
 
 use engine::Core;
 

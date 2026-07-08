@@ -28,6 +28,9 @@ code / README / UI / 設定 四處都「**全列或都不列**」；任何名單
 匯出 / debug 輸出一律經**單一遮蔽走訪**把祕密遮成 `[redacted]`。
 **Why**：「會不會漏祕密」要能只審一處；單一遮蔽點 + 加密庫讓這件事可稽核。
 **別**在寫檔路徑遮蔽（那會把使用者真正的金鑰/密碼寫成 `[redacted]` 毀檔）——只在顯示/序列化層遮。
+**實作（slice 4）**：唯一的過縫函式 `redaction::emit`（core/src/redaction.rs）先跑一趟遞迴遮蔽再序列化，
+engine/monitor/llm 三個 `emit` 都轉呼它 → 「會不會漏祕密」只審這一處。分級日誌 `log_level`（normal/debug）
+在此 gate，`debug` 行在 normal 下不輸出。（匯出畫面 + 環形緩衝屬 Phase C。）
 
 ## 5. 錯誤永不靜默
 

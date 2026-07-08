@@ -7,9 +7,9 @@ using System.Text.Json;
 namespace TronClass.Interop;
 
 /// <summary>
-/// Process-lifetime wrapper over the native core. Exactly one instance for the whole app —
-/// never owned by a Page or Activity, so backgrounding or view recreation never disturbs the
-/// running core. This is the entire C# side of the FFI seam.
+/// Process-lifetime wrapper over the native core — the entire C# side of the FFI seam. One
+/// instance for the whole app; never owned by a Page. Commands correlate by id; unsolicited
+/// events are raised on <see cref="EventReceived"/> (and the latest of each cached for dumb views).
 /// </summary>
 public sealed class Core
 {
@@ -17,17 +17,26 @@ public sealed class Core
 
     private static unsafe void* _handle;
     private static long _nextId;
-
-    // Correlates a command's reply back to its awaiting caller. RunContinuationsAsynchronously
-    // is essential: SetResult runs on a Rust tokio worker thread, and we must not let the
-    // caller's await-continuation run inline there and block the worker.
+    private static int _booted;
     private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<JsonElement>> Pending = new();
 
-    /// <summary>Unsolicited events (id == null): StateChanged, LogLine, Tick, Error. Raised on a
-    /// worker thread — subscribers must marshal to the UI thread before touching UI.</summary>
+    /// <summary>Raised (on a worker thread) for unsolicited events. Subscribers marshal to the UI thread.</summary>
     public event Action<JsonElement>? EventReceived;
 
+    // Latest snapshot of each state event, so a screen can render immediately on appearing.
+    public JsonElement? LastProviders { get; private set; }
+    public JsonElement? LastAccounts { get; private set; }
+    public JsonElement? LastVaultState { get; private set; }
+
     private Core() { }
+
+    /// <summary>Start the core and load state from <paramref name="dataDir"/> — exactly once.</summary>
+    public async Task BootAsync(string dataDir)
+    {
+        if (Interlocked.Exchange(ref _booted, 1) == 1) return;
+        Start();
+        await InitAsync(dataDir);
+    }
 
     public unsafe void Start()
     {
@@ -35,32 +44,24 @@ public sealed class Core
         _handle = NativeMethods.core_init(&OnEvent);
     }
 
-    public void Shutdown()
-    {
-        unsafe
-        {
-            if (_handle == null) return;
-            NativeMethods.core_free(_handle);
-            _handle = null;
-        }
-    }
+    public Task<JsonElement> InitAsync(string dataDir) => SendAsync("Init", ("data_dir", dataDir));
+    public Task<JsonElement> CreateVaultAsync(string pw) => SendAsync("CreateVault", ("master_password", pw));
+    public Task<JsonElement> UnlockAsync(string pw) => SendAsync("Unlock", ("master_password", pw));
+    public Task<JsonElement> AddAccountAsync(string label, string school, string user, string pass) =>
+        SendAsync("AddAccount", ("label", label), ("school", school), ("username", user), ("password", pass));
+    public Task<JsonElement> SwitchAccountAsync(string accountId) => SendAsync("SwitchAccount", ("account_id", accountId));
+    public Task<JsonElement> DeleteAccountAsync(string accountId) => SendAsync("DeleteAccount", ("account_id", accountId));
+    public Task<JsonElement> LoginAsync(string accountId) => SendAsync("Login", ("account_id", accountId));
 
-    /// <summary>Perform one login. Completes when the core replies with the correlated result.</summary>
-    public Task<JsonElement> LoginAsync(string baseUrl, string username, string password)
+    private Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
     {
         var id = (ulong)Interlocked.Increment(ref _nextId);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = tcs;
 
-        var json = JsonSerializer.Serialize(new
-        {
-            id,
-            cmd = "Login",
-            base_url = baseUrl,
-            username,
-            password,
-        });
-        Send(json);
+        var dict = new Dictionary<string, object?> { ["id"] = id, ["cmd"] = cmd };
+        foreach (var (k, v) in fields) dict[k] = v;
+        Send(JsonSerializer.Serialize(dict));
         return tcs.Task;
     }
 
@@ -76,22 +77,25 @@ public sealed class Core
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static unsafe void OnEvent(byte* ptr, nuint len)
     {
-        // Copy synchronously: the buffer is only valid for this call, which is on a Rust
-        // worker thread. Return quickly.
         var json = Encoding.UTF8.GetString(new ReadOnlySpan<byte>(ptr, (int)len));
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        var idProp = root.GetProperty("id");
-        if (idProp.ValueKind == JsonValueKind.Number)
+        // id-tagged events are command replies (Reply / LoginResult) → complete the awaiting Task.
+        if (root.GetProperty("id").ValueKind == JsonValueKind.Number)
         {
-            if (Pending.TryRemove(idProp.GetUInt64(), out var tcs))
-            {
-                tcs.SetResult(root.Clone()); // returns immediately (RunContinuationsAsynchronously)
-            }
+            if (Pending.TryRemove(root.GetProperty("id").GetUInt64(), out var tcs))
+                tcs.SetResult(root.Clone());
             return;
         }
 
-        Instance.EventReceived?.Invoke(root.Clone());
+        var clone = root.Clone();
+        switch (root.GetProperty("event").GetString())
+        {
+            case "Providers": Instance.LastProviders = clone; break;
+            case "Accounts": Instance.LastAccounts = clone; break;
+            case "VaultState": Instance.LastVaultState = clone; break;
+        }
+        Instance.EventReceived?.Invoke(clone);
     }
 }

@@ -21,7 +21,9 @@ if (-not (Test-Path $dotnet)) { $dotnet = "dotnet" }
 & (Join-Path $root "build-core.ps1")
 
 function Publish-Portable {
-    & $dotnet publish $proj -f $tfm -c Release -p:PackageMode=portable
+    # WindowsAppSDKSelfContained bundles the Windows App Runtime so the unpackaged exe launches on a
+    # clean machine (else REGDB_E_CLASSNOTREG when the runtime isn't installed machine-wide).
+    & $dotnet publish $proj -f $tfm -c Release -p:PackageMode=portable -p:WindowsAppSDKSelfContained=true
     Write-Host "portable -> ui/bin/Release/$tfm/win-x64/publish/"
 }
 

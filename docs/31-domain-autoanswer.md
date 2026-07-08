@@ -96,11 +96,17 @@ media · analysis · paragraph_desc
 **「學生端 /subjects 是否漏 correct_answers」尚未定論**——需要一個真實的課件測驗才能驗；此為已知的
 待補資料點（不要假設漏或不漏）。
 
-## homework / classroom-exam 細節
+## homework / classroom-exam / questionnaire 細節
 
-- homework 送出補 `slides: []`。作答次數看每生 `submission_count` + `submit_times`（無 `has_submitted`）。
-- classroom-exam：`GET /api/classroom-exams/{id}`；提交 `POST /api/classroom/{id}/submit/{subjectId}`。
-  狀態機只有 none/start/finish；「可送出的門」＝ `started_subjects_count ≥ 1`（"start" 為必要非充分）。
+- **homework 交卷**：`POST /api/course/activities/{activity_id}/submissions`，
+  body `{ comment: <答案文字>, is_draft: false, slides: [], uploads: [] }`。
+  作答次數看每生 `submission_count` + `submit_times`（無 `has_submitted`）。
+- **classroom-exam 交卷**：**逐子題** `POST /api/classroom/{activity_id}/submit/{subject_id}`（每子題一次呼叫），
+  但 body 用**整卷 exam wrapper** `{ exam_paper_instance_id, subjects: [ 該子題的 answer ] }`——
+  送扁平 per-subject body 會 **400**。狀態機只有 none/start/finish；「可送出的門」＝ `started_subjects_count ≥ 1`
+  （"start" 為必要非充分）；即時測驗另受教師 live-session 狀態伺服器端把關。
+- **questionnaire（問卷，與 vote 不同型）交卷**：`POST /api/questionnaire/{activity_id}/submissions`
+  （wrapper 形狀同 courseware 的 `subjects_answers`；端點不同、body 形狀相同）。
 
 ## LLM 客戶端
 

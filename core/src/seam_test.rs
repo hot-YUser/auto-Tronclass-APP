@@ -1,36 +1,50 @@
-//! Offline seam test (docs 90 §10): drive the real FFI entry points against the in-repo
-//! fake TronClass and assert the three skeleton risks in one run, plus the negative case.
-//!
-//! - async over FFI: a good-cred command round-trips to a `LoginResult{ok:true}`
-//! - reverse channel: an unsolicited `StateChanged` arrives, unrequested
-//! - process stays alive: the heartbeat `Tick` fires from the long-lived runtime task
-//! - bad creds fail loudly (`ok:false`), never silently
-//!
-//! One core, one callback, two correlated commands — so results can't clobber each other
-//! and the tests need no serialization.
+//! End-to-end seam test over the real FFI entry points: the slice-1 login flow (Init → CreateVault
+//! → AddAccount → Login) against the in-repo fake TronClass. Still proves the three skeleton risks
+//! (async over FFI, unsolicited reverse-channel events, heartbeat) and adds:
+//!   - a successful real-form login (good creds) → `LoginResult{ok:true}`
+//!   - a false-positive guard: bad creds land the fake's 200-with-login-page, and the content-based
+//!     `verify_session` rejects it → `LoginResult{ok:false}` (never a silent/false success).
 
+use crate::config::new_id;
 use crate::fake;
-use std::sync::mpsc::{channel, Sender};
+use serde_json::Value;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-// The callback is a bare `extern "C" fn` and cannot capture, so events route through a
-// global sender. Set once; the mpsc receiver lives on the test thread.
-static TX: OnceLock<Mutex<Sender<String>>> = OnceLock::new();
+// The callback can't capture, so events land in a global Vec. Only this test uses the callback.
+static EVENTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+fn events() -> &'static Mutex<Vec<String>> {
+    EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let s = String::from_utf8_lossy(bytes).into_owned();
-    let _ = TX.get().unwrap().lock().unwrap().send(s);
+    events().lock().unwrap().push(String::from_utf8_lossy(bytes).into_owned());
+}
+
+fn snapshot() -> Vec<Value> {
+    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+}
+
+fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Some(v) = snapshot().into_iter().find(&pred) {
+            return Some(v);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
+    move |v| v["event"] == "Reply" && v["id"] == id
 }
 
 fn start_fake() -> u16 {
-    let (ptx, prx) = channel();
+    let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -40,52 +54,67 @@ fn start_fake() -> u16 {
     prx.recv().unwrap()
 }
 
-fn send_login(handle: *mut std::ffi::c_void, id: u64, port: u16, user: &str, pass: &str) {
-    let cmd = format!(
-        r#"{{"id":{id},"cmd":"Login","base_url":"http://127.0.0.1:{port}","username":"{user}","password":"{pass}"}}"#
-    );
-    unsafe { crate::core_send(handle, cmd.as_ptr(), cmd.len()) };
+fn send(handle: *mut std::ffi::c_void, json: &str) {
+    unsafe { crate::core_send(handle, json.as_ptr(), json.len()) };
+}
+
+fn account_id_by_label(label: &str) -> Option<String> {
+    let accounts = snapshot();
+    // Scan Accounts events newest-last for the account with this label.
+    for ev in accounts.iter().rev() {
+        if ev["event"] == "Accounts" {
+            if let Some(list) = ev["accounts"].as_array() {
+                if let Some(a) = list.iter().find(|a| a["label"] == label) {
+                    return a["id"].as_str().map(str::to_string);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[test]
-fn seam_proves_three_things() {
-    let (tx, rx) = channel();
-    TX.set(Mutex::new(tx)).ok();
-
+fn seam_login_flow_end_to_end() {
     let port = start_fake();
+    let base = format!("http://127.0.0.1:{port}");
+    let data_dir = std::env::temp_dir().join(format!("tron-seam-{}", new_id()));
+    let data_dir = data_dir.to_string_lossy().replace('\\', "/"); // JSON-safe path
+
     let handle = crate::core_init(collect);
 
-    send_login(handle, 1, port, fake::GOOD_USER, fake::GOOD_PASS); // → ok
-    send_login(handle, 2, port, fake::GOOD_USER, "wrong"); // → fail
+    send(handle,&format!(r#"{{"id":1,"cmd":"Init","data_dir":"{data_dir}"}}"#));
+    assert!(wait_for(reply_ok(1), 10).is_some(), "Init should reply");
 
-    let mut result1: Option<bool> = None;
-    let mut result2: Option<bool> = None;
-    let mut saw_statechanged = false;
-    let mut saw_tick = false;
+    send(handle,r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#);
+    assert!(wait_for(reply_ok(2), 10).unwrap()["ok"] == true, "CreateVault ok");
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while (result1.is_none() || result2.is_none() || !saw_tick) && Instant::now() < deadline {
-        let Ok(ev) = rx.recv_timeout(Duration::from_secs(1)) else { continue };
-        let v: serde_json::Value = serde_json::from_str(&ev).expect("event is valid JSON");
-        match v["event"].as_str() {
-            Some("StateChanged") => saw_statechanged = true,
-            Some("Tick") => saw_tick = true,
-            Some("LoginResult") => {
-                let ok = v["ok"].as_bool().unwrap();
-                match v["id"].as_u64() {
-                    Some(1) => result1 = Some(ok),
-                    Some(2) => result2 = Some(ok),
-                    _ => panic!("LoginResult without a known id: {ev}"),
-                }
-            }
-            _ => {}
-        }
-    }
+    // Good account → successful real-form login.
+    send(
+        handle,
+        &format!(r#"{{"id":3,"cmd":"AddAccount","label":"good","school":"{base}","username":"test","password":"secret"}}"#),
+    );
+    assert!(wait_for(reply_ok(3), 10).unwrap()["ok"] == true, "AddAccount good ok");
+    let good_id = wait_for(|_| account_id_by_label("good").is_some(), 5)
+        .and_then(|_| account_id_by_label("good"))
+        .expect("good account id");
+    send(handle,&format!(r#"{{"id":4,"cmd":"Login","account_id":"{good_id}"}}"#));
+    let good_login = wait_for(|v| v["event"] == "LoginResult" && v["id"] == 4, 15).expect("good LoginResult");
+    assert_eq!(good_login["ok"], true, "good creds must log in via the real form");
+
+    // Bad account → the fake serves 200+login-page; content-based verify_session must reject it.
+    send(
+        handle,
+        &format!(r#"{{"id":5,"cmd":"AddAccount","label":"bad","school":"{base}","username":"test","password":"WRONG"}}"#),
+    );
+    wait_for(reply_ok(5), 10);
+    let bad_id = account_id_by_label("bad").expect("bad account id");
+    send(handle,&format!(r#"{{"id":6,"cmd":"Login","account_id":"{bad_id}"}}"#));
+    let bad_login = wait_for(|v| v["event"] == "LoginResult" && v["id"] == 6, 15).expect("bad LoginResult");
+    assert_eq!(bad_login["ok"], false, "bad creds must fail loudly (200-with-login-page is not success)");
+
+    // Skeleton risks still hold.
+    assert!(wait_for(|v| v["event"] == "Tick", 3).is_some(), "heartbeat ticks");
+    assert!(snapshot().iter().any(|v| v["event"] == "StateChanged"), "unsolicited StateChanged");
 
     unsafe { crate::core_free(handle) };
-
-    assert_eq!(result1, Some(true), "good creds must log in (async over FFI + reply routing)");
-    assert_eq!(result2, Some(false), "bad creds must fail loudly, never silently");
-    assert!(saw_statechanged, "core must push an unsolicited StateChanged (reverse channel)");
-    assert!(saw_tick, "heartbeat must tick (runtime/process stays alive between commands)");
 }

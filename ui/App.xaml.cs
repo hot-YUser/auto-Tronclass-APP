@@ -11,6 +11,7 @@ public partial class App : Application
 
 	protected override Window CreateWindow(IActivationState? activationState)
 	{
-		return new Window(new AppShell());
+		// Flow: Unlock → Accounts → (Add) / Dashboard, via a plain navigation stack.
+		return new Window(new NavigationPage(new UnlockPage()));
 	}
 }
