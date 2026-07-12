@@ -63,9 +63,20 @@ fn registry_resolves_key_alias_and_raw_url() {
 }
 
 #[test]
-fn factory_registry_ships_empty() {
+fn factory_registry_seeds_tronclass_schools() {
     let reg = Registry::factory();
-    assert!(reg.schools.is_empty(), "seed ships empty; schools are user-added");
+    // Seeded from v1 schools.toml — all list-or-none (school equality): a broad set, not a curated few.
+    assert!(reg.schools.len() >= 30, "expected the full TronClass school seed, got {}", reg.schools.len());
+    assert_eq!(reg.default_key.as_deref(), Some("thu"));
+    // Every seeded school is a usable https base_url with a key + label (no half-entries).
+    for s in &reg.schools {
+        assert!(!s.key.is_empty() && !s.label.is_empty(), "school missing key/label: {s:?}");
+        assert!(s.base_url.starts_with("https://"), "non-https base_url: {}", s.base_url);
+    }
+    // Key and (ci) alias both resolve to the same base_url.
+    assert_eq!(reg.resolve("thu").as_deref(), Some("https://ilearn.thu.edu.tw"));
+    assert_eq!(reg.resolve("東海").as_deref(), Some("https://ilearn.thu.edu.tw"));
+    assert!(reg.resolve("definitely-not-a-school").is_none());
 }
 
 #[test]

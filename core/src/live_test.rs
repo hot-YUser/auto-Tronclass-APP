@@ -86,6 +86,58 @@ async fn live_llm() {
     assert!(ans.to_uppercase().contains('B'), "expected the letter B, got {ans:?}");
 }
 
+// ---- School seed: probe every seeded base_url's /login and classify it with v2's detector ----
+// No creds needed: `cargo test --lib live_school_probe -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn live_school_probe() {
+    use crate::login::{detect_login_kind, LoginKind};
+    let reg = crate::providers::Registry::factory();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .unwrap();
+
+    let mut set = tokio::task::JoinSet::new();
+    for s in reg.schools.clone() {
+        let client = client.clone();
+        set.spawn(async move {
+            let url = format!("{}/login", s.base_url.trim_end_matches('/'));
+            let (label, known) = match client.get(&url).send().await {
+                Ok(r) => {
+                    let status = r.status();
+                    let final_url = r.url().to_string();
+                    let html = r.text().await.unwrap_or_default();
+                    let kind = match detect_login_kind(&html, &final_url) {
+                        LoginKind::PasswordForm(_) => "PasswordForm",
+                        LoginKind::PublicCloudEmail(_) => "PublicCloudEmail",
+                        LoginKind::Captcha { .. } => "Captcha",
+                        LoginKind::SsoRedirect => "SsoRedirect",
+                        LoginKind::EmailSpa => "EmailSpa",
+                        LoginKind::Unknown => "Unknown",
+                    };
+                    (format!("HTTP {} → {kind}", status.as_u16()), status.is_success() && kind != "Unknown")
+                }
+                Err(e) => (format!("ERR {e}"), false),
+            };
+            (s.key, s.base_url, label, known)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(Ok(r)) = set.join_next().await {
+        results.push(r);
+    }
+    results.sort();
+    let total = results.len();
+    let known = results.iter().filter(|r| r.3).count();
+    for (key, base, label, _) in &results {
+        println!("{key:>10}  {base:<40}  {label}");
+    }
+    println!("\n{known}/{total} schools reachable + classified to a known login kind");
+    assert!(total >= 30, "seed too small: {total}");
+    assert!(known * 100 / total >= 60, "too many schools unreachable/unclassified: {known}/{total}");
+}
+
 // ---- Phase 6: full monitor pipeline via the engine FFI (poll → detect → gate → sign → SignedIn) ----
 // Drives the REAL engine (Init/AddAccount/StartMonitoring) against a teacher-seeded RADAR rollcall
 // (radar signs with an empty body — no brute force). Seed + cleanup: scripts/_v2_rollcall_live.py.

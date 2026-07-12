@@ -96,8 +96,10 @@ pub fn detect_login_kind(html: &str, page_url: &str) -> LoginKind {
             }
         }
     }
-    // Enterprise SSO (NetIQ NAM `nidp`, SAML, generic "single sign-on").
-    if lower.contains("nidp") || lower.contains("saml") || lower.contains("single sign-on") {
+    // Enterprise SSO: NetIQ NAM (`nidp`), NEAI (Tamkang's NAM front-end — confirmed live on iclass.tku),
+    // SAML, or a generic "single sign-on". Headless auto-login isn't supported → the caller offers the
+    // browser-cookie fallback; classifying it as SSO (not Unknown) gives that honest message.
+    if lower.contains("nidp") || lower.contains("neai") || lower.contains("saml") || lower.contains("single sign-on") {
         return LoginKind::SsoRedirect;
     }
     if let Some(form) = form {

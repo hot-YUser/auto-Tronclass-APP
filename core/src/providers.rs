@@ -1,7 +1,8 @@
 //! School registry (docs 40). Logic vs data are separated: **no school literal lives in this
-//! `.rs` file** — the factory seed is a bundled JSON data file, and at runtime the source of
-//! truth is a copy in the user's data dir. A school is just a `base_url`; every endpoint derives
-//! from it. The seed ships empty; the user adds their own school in-UI or types a raw base_url.
+//! `.rs` file** — the factory seed is a bundled JSON data file (assets/providers.seed.json,
+//! generated from v1's schools.toml), and at runtime the source of truth is a copy in the user's
+//! data dir. A school is just a `base_url`; every endpoint derives from it. The user can still add
+//! their own school in-UI or type a raw base_url (which `resolve` passes through verbatim).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
