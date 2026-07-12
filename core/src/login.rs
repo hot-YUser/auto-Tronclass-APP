@@ -6,14 +6,32 @@
 use crate::providers::Endpoints;
 use reqwest::Client;
 
-/// A parsed username/password `<form>`: action + field names + **all hidden inputs verbatim** (CSRF
-/// tokens must be echoed back on POST).
+/// A parsed username/password `<form>`: action + field names + **every other named input verbatim**
+/// (CSRF/theme tokens must be echoed back on POST — not only `type=hidden`, some CAS/Keycloak themes
+/// render the token as a visible input). `captcha_field` is set when a form input matches the captcha
+/// allowlist (a form-scoped decision, never a whole-page substring).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswordForm {
     pub action: String,
     pub user_field: String,
     pub pass_field: String,
-    pub hidden: Vec<(String, String)>,
+    pub fields: Vec<(String, String)>,
+    pub captcha_field: Option<String>,
+}
+
+/// Captcha input-field allowlist (v1 `_classify_captcha`) — common static-`<img>` captcha field names.
+/// Deliberately NO bare `"code"` (it matches `session_code`/`authorization_code`). NOTE: Keycloak
+/// (`captchakey`/`captchacode`) is intentionally NOT here: an enforcing Keycloak realm serves the captcha
+/// image via AJAX JSON, not an `<img>`, so we can't auto-drive it — such tenants must use the
+/// browser-cookie login (Phase C). Don't imply support that isn't there (the QR "尚未發現" honesty rule).
+const CAPTCHA_FIELDS: &[&str] = &[
+    "captcha", "authcode", "auth_code", "verify_code", "verifycode",
+    "checkcode", "check_code", "vcode", "yzm", "imgcode", "seccode", "kaptcha", "validatecode", "validate_code",
+];
+
+fn is_captcha_field(name: &str) -> bool {
+    let low = name.to_lowercase();
+    CAPTCHA_FIELDS.iter().any(|f| low.contains(f))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,13 +66,14 @@ pub fn detect_login_kind(html: &str, _page_url: &str) -> LoginKind {
     let lower = html.to_lowercase();
     let form = find_password_form(html);
 
-    // Captcha gates even a present password form. We can only drive the human-in-loop flow if the
-    // page also has a parseable password form; otherwise fall through to the other classifications.
-    if lower.contains("captcha") {
-        if let Some(form) = form {
-            let image_url = find_captcha_image(html).unwrap_or_default();
-            let captcha_field = find_captcha_field(html).unwrap_or_else(|| "captcha".to_string());
-            return LoginKind::Captcha { form, image_url, captcha_field };
+    // Captcha ONLY when the password form itself carries a captcha field AND a real captcha <img> is
+    // present — not merely because page copy/JS mentions "captcha" (that false-blocks the many schools
+    // whose form is plain username+password but whose page text says "captcha"). Verified live 2026-06.
+    if let Some(f) = &form {
+        if let Some(cf) = &f.captcha_field {
+            if let Some(image_url) = find_captcha_image(html) {
+                return LoginKind::Captcha { form: f.clone(), image_url, captcha_field: cf.clone() };
+            }
         }
     }
     // Enterprise SSO (NetIQ NAM `nidp`, SAML, generic "single sign-on").
@@ -80,88 +99,70 @@ fn find_password_form(html: &str) -> Option<PasswordForm> {
     for form_handle in dom.query_selector("form")?.collect::<Vec<_>>() {
         let Some(form_tag) = form_handle.get(parser).and_then(|n| n.as_tag()) else { continue };
 
-        let mut pass_field = None;
-        let mut user_field: Option<String> = None;
-        let mut hidden = Vec::new();
-
-        // Walk every descendant input of this form (tl gives all descendants via children().all).
+        // Collect (name, type, value) for every named <input> in this form, then classify.
+        let mut inputs: Vec<(String, String, String)> = Vec::new();
         for child in form_tag.children().all(parser) {
             let Some(input) = child.as_tag() else { continue };
             if input.name().as_utf8_str() != "input" {
                 continue;
             }
             let attrs = input.attributes();
-            let ty = attrs
-                .get("type")
-                .flatten()
-                .map(|b| b.as_utf8_str().to_lowercase())
-                .unwrap_or_else(|| "text".to_string());
             let Some(name) = attrs.get("name").flatten() else { continue };
             let name = name.as_utf8_str().to_string();
-            match ty.as_str() {
-                "password" => pass_field = Some(name),
-                "hidden" => {
-                    let val = attrs
-                        .get("value")
-                        .flatten()
-                        .map(|b| b.as_utf8_str().to_string())
-                        .unwrap_or_default();
-                    hidden.push((name, val));
-                }
-                "text" | "email" | "tel" | "" if user_field.is_none() => user_field = Some(name),
-                _ => {}
-            }
+            let ty = attrs.get("type").flatten().map(|b| b.as_utf8_str().to_lowercase()).unwrap_or_else(|| "text".to_string());
+            let val = attrs.get("value").flatten().map(|b| b.as_utf8_str().to_string()).unwrap_or_default();
+            inputs.push((name, ty, val));
         }
 
-        if let Some(pass_field) = pass_field {
-            let action = form_tag
-                .attributes()
-                .get("action")
-                .flatten()
-                .map(|b| b.as_utf8_str().to_string())
-                .unwrap_or_default();
-            return Some(PasswordForm {
-                action,
-                user_field: user_field.unwrap_or_else(|| "username".to_string()),
-                pass_field,
-                hidden,
-            });
-        }
+        let Some(pass_field) = inputs.iter().find(|(_, ty, _)| ty == "password").map(|(n, ..)| n.clone()) else {
+            continue; // not a password form → try the next <form>
+        };
+        let captcha_field = inputs.iter().find(|(n, ..)| is_captcha_field(n)).map(|(n, ..)| n.clone());
+        // Username = first text-like input that isn't the password or the captcha field.
+        let user_field = inputs
+            .iter()
+            .find(|(n, ty, _)| matches!(ty.as_str(), "text" | "email" | "tel" | "") && *n != pass_field && captcha_field.as_deref() != Some(n))
+            .map(|(n, ..)| n.clone())
+            .unwrap_or_else(|| "username".to_string());
+        // Echo EVERY other named input verbatim (hidden CSRF, visible theme tokens) — but not the three
+        // fields we fill ourselves (user, pass, captcha).
+        let fields: Vec<(String, String)> = inputs
+            .iter()
+            .filter(|(n, ..)| *n != pass_field && *n != user_field && captcha_field.as_deref() != Some(n))
+            .map(|(n, _, v)| (n.clone(), v.clone()))
+            .collect();
+
+        let action = form_tag.attributes().get("action").flatten().map(|b| b.as_utf8_str().to_string()).unwrap_or_default();
+        return Some(PasswordForm { action, user_field, pass_field, fields, captcha_field });
     }
     None
 }
 
-/// The captcha image URL: the first `<img>` whose `src` looks like a captcha, else the first `<img>`.
+/// The captcha image URL: an `<img>` whose `src` looks like a captcha, else the first `<img>` that
+/// isn't obviously page chrome (logo/banner/icon/favicon). `None` ⇒ no captcha image on the page.
 fn find_captcha_image(html: &str) -> Option<String> {
     let dom = tl::parse(html, tl::ParserOptions::default()).ok()?;
     let parser = dom.parser();
-    let mut first: Option<String> = None;
+    let mut fallback: Option<String> = None;
     for h in dom.query_selector("img")?.collect::<Vec<_>>() {
         let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else { continue };
         let Some(src) = tag.attributes().get("src").flatten() else { continue };
         let src = src.as_utf8_str().to_string();
-        if src.to_lowercase().contains("captcha") || src.to_lowercase().contains("verif") {
+        let low = src.to_lowercase();
+        // strong-match toward v1's find_captcha_source regexes.
+        if ["captcha", "verif", "authimage", "getcode", "get_code", "kaptcha", "yzm", "valid"].iter().any(|w| low.contains(w)) {
             return Some(src);
         }
-        first.get_or_insert(src);
-    }
-    first
-}
-
-/// The captcha input field name: the first `<input>` whose name mentions captcha/verify/code.
-fn find_captcha_field(html: &str) -> Option<String> {
-    let dom = tl::parse(html, tl::ParserOptions::default()).ok()?;
-    let parser = dom.parser();
-    for h in dom.query_selector("input")?.collect::<Vec<_>>() {
-        let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else { continue };
-        let Some(name) = tag.attributes().get("name").flatten() else { continue };
-        let name = name.as_utf8_str().to_string();
-        let low = name.to_lowercase();
-        if low.contains("captcha") || low.contains("verif") || low.contains("code") {
-            return Some(name);
+        // fallback: the first <img> that isn't obviously page chrome.
+        if fallback.is_none()
+            && !["logo", "banner", "icon", "favicon", "header", "download_file", "loading", "btn", "button", "sprite", "avatar", "qrcode"]
+                .iter()
+                .any(|w| low.contains(w))
+        {
+            fallback = Some(src);
         }
     }
-    None
+    fallback
 }
 
 /// Perform login over `client` (whose cookie jar the caller owns for caching). GET the login page
@@ -175,18 +176,23 @@ pub async fn login(
     username: &str,
     password: &str,
 ) -> LoginOutcome {
-    let html = match client.get(endpoints.login_page()).send().await {
-        Ok(page) => match page.text().await {
-            Ok(h) => h,
-            Err(e) => return LoginOutcome::Failed(e.to_string()),
-        },
+    // Capture the FINAL url after redirects (an SSO/Keycloak host) BEFORE consuming the body — a
+    // relative form action / captcha src must resolve against where the page actually landed, not base.
+    let (final_url, html) = match client.get(endpoints.login_page()).send().await {
+        Ok(page) => {
+            let url = page.url().to_string();
+            match page.text().await {
+                Ok(h) => (url, h),
+                Err(e) => return LoginOutcome::Failed(e.to_string()),
+            }
+        }
         Err(e) => return LoginOutcome::Failed(format!("connect: {e}")),
     };
 
-    match detect_login_kind(&html, &endpoints.login_page()) {
+    match detect_login_kind(&html, &final_url) {
         LoginKind::PasswordForm(form) => {
-            let action_url = resolve_action(endpoints, &form.action);
-            let mut fields: Vec<(String, String)> = form.hidden;
+            let action_url = resolve_action(&final_url, &form.action);
+            let mut fields: Vec<(String, String)> = form.fields;
             fields.push((form.user_field, username.to_string()));
             fields.push((form.pass_field, password.to_string()));
 
@@ -201,12 +207,12 @@ pub async fn login(
             }
         }
         LoginKind::Captcha { form, image_url, captcha_field } => {
-            let action_url = resolve_action(endpoints, &form.action);
-            let mut base_form: Vec<(String, String)> = form.hidden;
+            let action_url = resolve_action(&final_url, &form.action);
+            let mut base_form: Vec<(String, String)> = form.fields;
             base_form.push((form.user_field, username.to_string()));
             base_form.push((form.pass_field, password.to_string()));
 
-            let img_url = resolve_action(endpoints, &image_url);
+            let img_url = resolve_action(&final_url, &image_url);
             let image_bytes = match client.get(&img_url).send().await {
                 Ok(r) => match r.bytes().await {
                     Ok(b) => b.to_vec(),
@@ -264,6 +270,20 @@ pub fn encode_base64(input: &[u8]) -> String {
     out
 }
 
+/// Capture the account's own TronClass user id after auth (for per-account recheck / my_present).
+/// Returns empty on failure — recheck then degrades to whole-class/top-level, never "any entry".
+/// `// ponytail:` the exact source (login response vs `/api/user`) needs a real tenant to confirm.
+pub async fn fetch_user_no(client: &Client, endpoints: &Endpoints) -> String {
+    let Ok(resp) = client.get(endpoints.current_user()).send().await else { return String::new() };
+    let Ok(v) = resp.json::<serde_json::Value>().await else { return String::new() };
+    ["user_no", "user_id", "id"]
+        .iter()
+        .find_map(|k| {
+            v.get(*k).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+        })
+        .unwrap_or_default()
+}
+
 /// Content-based session check — NEVER status-code alone. A failed/expired login commonly returns
 /// HTTP 200 with the login page or redirects back to it; only a genuine authenticated JSON body
 /// counts. Also restores a cached session: call it before re-login to skip an unnecessary one.
@@ -284,15 +304,14 @@ pub async fn verify_session(client: &Client, endpoints: &Endpoints) -> bool {
         .unwrap_or(false)
 }
 
-fn resolve_action(endpoints: &Endpoints, action: &str) -> String {
+/// Resolve a form action / captcha `src` against the ACTUAL fetched page URL (post-redirect), so a
+/// relative action on an SSO/Keycloak login page posts to that host — not the configured base.
+fn resolve_action(page_url: &str, action: &str) -> String {
     if action.is_empty() {
-        return endpoints.login_page();
+        return page_url.to_string();
     }
-    if action.starts_with("http://") || action.starts_with("https://") {
-        return action.to_string();
+    match reqwest::Url::parse(page_url).and_then(|base| base.join(action)) {
+        Ok(u) => u.to_string(),
+        Err(_) => action.to_string(),
     }
-    if let Some(rest) = action.strip_prefix('/') {
-        return format!("{}/{}", endpoints.base(), rest);
-    }
-    format!("{}/{}", endpoints.base(), action)
 }

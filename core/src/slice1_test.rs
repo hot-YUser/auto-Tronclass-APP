@@ -108,7 +108,7 @@ fn detect_login_kind_classifies_fixtures() {
             assert_eq!(form.action, "/do-login");
             assert_eq!(form.user_field, "user");
             assert_eq!(form.pass_field, "pass");
-            assert_eq!(form.hidden, vec![("csrf".to_string(), "tok123".to_string())]);
+            assert_eq!(form.fields, vec![("csrf".to_string(), "tok123".to_string())]);
         }
         other => panic!("expected PasswordForm, got {other:?}"),
     }
@@ -131,6 +131,33 @@ fn detect_login_kind_classifies_fixtures() {
         }
         other => panic!("expected Captcha, got {other:?}"),
     }
+    // R4-C: "captcha" in page COPY but the form has NO captcha field → plain PasswordForm, not Captcha
+    // (the whole-page substring used to wrongly block schools whose form is just username+password).
+    let copy_only = r#"<html><body><p>No captcha needed — just sign in.</p>
+        <form action="/login" method="post">
+          <input type="hidden" name="csrf" value="tok123">
+          <input type="text" name="username">
+          <input type="password" name="password">
+        </form></body></html>"#;
+    assert!(matches!(detect_login_kind(copy_only, "u"), LoginKind::PasswordForm(_)),
+        "captcha in copy without a captcha field must NOT be the captcha branch");
+
+    // R4-C: every named input is echoed on POST, not only type=hidden (some CAS/Keycloak themes render
+    // the token as a visible input).
+    let visible_token = r#"<html><body>
+        <form action="/login" method="post">
+          <input type="text" name="username">
+          <input type="text" name="execution" value="e1s1">
+          <input type="password" name="password">
+        </form></body></html>"#;
+    match detect_login_kind(visible_token, "u") {
+        LoginKind::PasswordForm(form) => {
+            assert_eq!(form.user_field, "username");
+            assert!(form.fields.contains(&("execution".to_string(), "e1s1".to_string())), "visible token echoed");
+        }
+        other => panic!("expected PasswordForm, got {other:?}"),
+    }
+
     assert!(matches!(
         detect_login_kind(r#"<html><meta name="saml"><body>redirecting to nidp</body>"#, "u"),
         LoginKind::SsoRedirect

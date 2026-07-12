@@ -27,6 +27,11 @@ getrandom = "0.2"                  # OS CSPRNG for salt + per-write nonce
 # tl: one small pure-Rust HTML parser; lenient on malformed pages. (Not scraper — that pulls
 # html5ever/selectors/cssparser and is heavier to compile across four ABIs, with no benefit here.)
 tl = "0.7"
+# Beacon radarSignal hash (docs/70 §1) — a small pure-Rust hash, not a math dependency.
+md-5 = "0.10"
+# PDF text extraction for the course-material tool (R5). Pure-Rust (lopdf/encoding_rs) → cross-compiles to
+# the 4 Android ABIs. A scanned/no-text-layer PDF returns empty → graceful "（無法取得內文）" degrade.
+pdf-extract = "0.7"
 
 [build-dependencies]
 csbindgen = "1"

@@ -317,14 +317,32 @@ fn handle_sync(core: &Core, cmd: Command) {
             if let Some(v) = patch.get("max_answer_reask").and_then(Value::as_u64) {
                 s.max_answer_reask = v as u32;
             }
+            if let Some(v) = patch.get("prepare_retry_budget_secs").and_then(Value::as_u64) {
+                s.prepare_retry_budget_secs = v;
+            }
+            if let Some(v) = patch.get("autoanswer_types").and_then(Value::as_array) {
+                s.autoanswer_types = v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+            }
+            if let Some(v) = patch.get("enable_llm_tools").and_then(Value::as_bool) {
+                s.enable_llm_tools = v;
+            }
+            if let Some(v) = patch.get("max_tool_iterations").and_then(Value::as_u64) {
+                s.max_tool_iterations = v as u32;
+            }
             if let Some(v) = patch.get("radar_strategy").and_then(Value::as_array) {
                 s.radar_strategy = v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
             }
             if let Some(v) = patch.get("number_concurrency").and_then(Value::as_u64) {
                 s.number_concurrency = v as u32;
             }
+            if let Some(v) = patch.get("number_min_concurrency").and_then(Value::as_u64) {
+                s.number_min_concurrency = v as u32;
+            }
             if let Some(v) = patch.get("number_cooldown_ms").and_then(Value::as_u64) {
                 s.number_cooldown_ms = v;
+            }
+            if let Some(v) = patch.get("number_max_cooldowns").and_then(Value::as_u64) {
+                s.number_max_cooldowns = v as u32;
             }
             if let Some(v) = patch.get("poll_idle_secs").and_then(Value::as_u64) {
                 s.poll_idle_secs = v;
@@ -513,10 +531,16 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
             llm_key: vault.get_llm_key(),
             llm_max_tokens: s.llm_max_tokens,
             max_answer_reask: s.max_answer_reask,
+            prepare_retry_budget_secs: s.prepare_retry_budget_secs,
+            autoanswer_types: s.autoanswer_types.clone(),
+            enable_llm_tools: s.enable_llm_tools,
+            max_tool_iterations: s.max_tool_iterations,
             resubmit_for_correct: s.resubmit_for_correct,
             radar_strategy: s.radar_strategy.clone(),
             number_concurrency: s.number_concurrency,
+            number_min_concurrency: s.number_min_concurrency,
             number_cooldown_ms: s.number_cooldown_ms,
+            number_max_cooldowns: s.number_max_cooldowns,
             poll_idle_secs: s.poll_idle_secs,
             quiz_detect_secs: s.quiz_detect_secs,
             operating: s.operating.clone(),
@@ -532,15 +556,20 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
         for (meta, base_url, password, cookies) in accts {
             match authed_client(&base_url, &meta.username, &password, &cookies).await {
                 Ok((client, new_cookies)) => {
+                    // Capture the account's own user id for per-account recheck (my_present).
+                    let user_no = login::fetch_user_no(&client, &Endpoints::derive(&base_url)).await;
                     emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": meta.id, "state": "online" }));
                     refreshed.push((meta.id.clone(), new_cookies));
                     monitor_accounts.push(monitor::Account {
                         id: meta.id.clone(),
                         device_id: meta.device_id.clone(),
+                        user_no,
                         is_teacher: meta.is_teacher,
                         course_id: meta.course_id.clone(),
                         base_url,
                         client,
+                        username: meta.username.clone(),
+                        password: crate::secrets::Secret::new(password),
                     });
                 }
                 Err(e) => emit(cb, &json!({ "id": null, "event": "AccountStatus",

@@ -6,6 +6,7 @@ use std::ffi::c_void;
 
 mod answer;
 mod config;
+mod course_context;
 mod engine;
 mod keystore;
 mod llm;
@@ -36,6 +37,24 @@ mod slice3_test;
 
 #[cfg(test)]
 mod slice4_test;
+
+#[cfg(test)]
+mod r1_test;
+
+#[cfg(test)]
+mod r2_test;
+
+#[cfg(test)]
+mod r3a_test;
+
+#[cfg(test)]
+mod r3b_test;
+
+#[cfg(test)]
+mod r4_test;
+
+#[cfg(test)]
+mod r5_test;
 
 use engine::Core;
 

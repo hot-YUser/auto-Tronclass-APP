@@ -25,8 +25,16 @@ fn operating_gate_open_and_closed() {
     .unwrap();
     assert!(sched.is_open(0, 0), "00:00 Thu is inside 00:00–01:00");
     assert!(sched.is_open(59 * 60, 0), "00:59 still inside");
-    assert!(!sched.is_open(60 * 60, 0), "01:00 is the exclusive end → closed");
+    assert!(sched.is_open(60 * 60, 0), "01:00 is the INCLUSIVE end → open (v1: start <= t <= end)");
+    assert!(!sched.is_open(61 * 60, 0), "01:01 past the window → closed");
     assert!(!sched.is_open(2 * 3600, 0), "02:00 outside the window");
+
+    // start==end means ALL DAY (v1 default 24/7 config); any minute is open.
+    let allday: Operating = serde_json::from_value(json!({
+        "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "00:00", "end": "00:00" }] }]
+    }))
+    .unwrap();
+    assert!(allday.is_open(0, 0) && allday.is_open(13 * 3600, 0), "00:00–00:00 = all day open");
 
     // A different weekday (Friday = epoch + 1 day) is not listed → inherits always-on.
     assert!(sched.is_open(86400 + 2 * 3600, 0), "Friday not listed → open");
@@ -45,6 +53,12 @@ fn operating_gate_open_and_closed() {
     .unwrap();
     assert!(morning.is_open(0, 480), "UTC 00:00 + 8h = 08:00 local, inside 07:00–09:00");
     assert!(!morning.is_open(0, 0), "without the offset it is 00:00, outside");
+
+    // v1 0=Sunday weekday import maps to internal 0=Monday..6=Sunday.
+    use crate::config::simple_weekday_to_internal;
+    assert_eq!(simple_weekday_to_internal(0), 6, "v1 Sunday → internal 6");
+    assert_eq!(simple_weekday_to_internal(1), 0, "v1 Monday → internal 0");
+    assert_eq!(simple_weekday_to_internal(6), 5, "v1 Saturday → internal 5");
 
     // A window that wraps past midnight.
     let overnight: Operating = serde_json::from_value(json!({

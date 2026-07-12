@@ -29,6 +29,32 @@ const ARGON_M_COST: u32 = 19_456;
 const ARGON_T_COST: u32 = 2;
 const ARGON_P_COST: u32 = 1;
 
+/// A string secret whose `Debug`/`Display` are masked, so a stray `{:?}`/log of a struct holding it
+/// (e.g. the monitor's `Account`, which carries a password for session re-login) never leaks it. The
+/// real value is reachable only via `expose()`. `redaction::emit` covers the event seam; this covers
+/// accidental debug logging that the seam can't see.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Secret(s.into())
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
 /// Per-account secret blob. This is what callers store; the vault encrypts the whole map.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountSecret {

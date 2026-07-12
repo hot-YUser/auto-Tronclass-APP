@@ -9,6 +9,7 @@
 
 use crate::answer::{self, Source};
 use crate::llm::LlmConfig;
+use crate::login;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
 use crate::rollcall::{self, RollcallKind, SignOutcome};
@@ -29,17 +30,27 @@ fn emit(cb: EventCb, v: &Value) {
     crate::redaction::emit(cb, v);
 }
 
-/// Per-account runtime context (session already authenticated by the engine).
+/// Per-account runtime context (session already authenticated by the engine). Carries the credentials
+/// (vault-sourced) so a poller can re-login on session expiry without an engine round-trip. NB: NO
+/// `#[derive(Debug)]` — the password (a `Secret`) must never be `{:?}`-logged (R4-D security).
 pub struct Account {
     pub id: String,
     pub device_id: String,
+    /// The account's own TronClass user id, captured at monitor start. Empty if capture failed —
+    /// recheck then falls back to whole-class/top-level (never "any entry").
+    pub user_no: String,
     pub is_teacher: bool,
     pub course_id: Option<String>,
     pub base_url: String,
     pub client: Client,
+    pub username: String,
+    pub password: crate::secrets::Secret,
 }
 
 type ActivityKey = (String, String, String); // (base_url, kind_str, rollcall_id)
+
+/// R4.1 #2: bound sign re-login retries so a permanent 403 (not a real expiry) can't loop forever.
+const MAX_RESIGN: u32 = 3;
 
 pub struct Detected {
     account_id: String,
@@ -57,13 +68,20 @@ pub enum MonitorMsg {
     SignNow { rollcall_id: String },
     Defer { rollcall_id: String },
     // --- quiz (slice 3) ---
-    QuizDetected { account_id: String, base_url: String, source: String, course: String, activity_id: String },
+    QuizDetected { account_id: String, base_url: String, source: String, course: String, course_id: String, activity_id: String, stem: String },
     QuizPrepared { key: ActivityKey, instance_id: String, subjects: Vec<Value>, shared: Map<String, Answer>, existing: Map<String, Map<String, Answer>>, allow_retake: bool, reveal: bool },
+    /// R3c all-or-nothing gate: prepare could NOT fully answer the paper (or a re-fetch failed / found
+    /// the activity gone). `gone` → the activity closed (silent done); else re-prepare with `partial`
+    /// carried, until `missing` clears or the retry budget deadline is hit.
+    QuizPrepareRetry { key: ActivityKey, partial: Map<String, Answer>, missing: Vec<String>, gone: bool },
     QuizSubmitResult { key: ActivityKey, account_id: String, result: Result<String, String> },
     QuizSubmitNow { quiz_id: String },
     QuizHold { quiz_id: String },
     QuizDiscard { quiz_id: String },
     QuizSetAnswer { quiz_id: String, account_id: String, subject_id: String, answer: Value },
+    // --- session expiry / re-login (R4-D) ---
+    AuthLost { account_id: String },
+    AuthRestored { account_id: String, ok: bool },
     Stop,
 }
 
@@ -78,6 +96,8 @@ struct Activity {
     countdown_deadline: Option<Instant>,
     acted: bool,
     signed: HashSet<String>,
+    needs_resign: HashSet<String>,        // accounts whose sign hit a dead session → re-sign after re-login
+    resign_attempts: HashMap<String, u32>, // per-account auth-lost re-sign count (bounds a permanent 403)
 }
 
 pub struct MonitorHandle {
@@ -93,10 +113,16 @@ pub struct MonitorConfig {
     pub llm_key: Option<String>,
     pub llm_max_tokens: u32,
     pub max_answer_reask: u32,
+    pub prepare_retry_budget_secs: u64,
+    pub autoanswer_types: Vec<String>,
+    pub enable_llm_tools: bool,
+    pub max_tool_iterations: u32,
     pub resubmit_for_correct: bool,
     pub radar_strategy: Vec<String>,
     pub number_concurrency: u32,
+    pub number_min_concurrency: u32,
     pub number_cooldown_ms: u64,
+    pub number_max_cooldowns: u32,
     pub poll_idle_secs: u64,
     pub quiz_detect_secs: u64,
     pub operating: crate::config::Operating,
@@ -110,6 +136,8 @@ impl MonitorConfig {
             model: self.llm_model.clone(),
             api_key: self.llm_key.clone().unwrap_or_default(),
             max_tokens: self.llm_max_tokens,
+            enable_tools: self.enable_llm_tools,
+            max_tool_iterations: self.max_tool_iterations,
         }
     }
 }
@@ -121,6 +149,7 @@ struct PollTuning {
     quiz_detect: Duration,
     operating: crate::config::Operating,
     tz_offset_minutes: i64,
+    wanted_types: Vec<String>, // R4 auto-answer family allowlist (empty = all)
 }
 
 fn now_epoch_secs() -> i64 {
@@ -128,6 +157,58 @@ fn now_epoch_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Classified GET result for the poll canary: a genuine JSON body, an auth-lost signal, or a plain
+/// transport/5xx failure.
+enum Fetched {
+    Ok(Value),
+    AuthLost,
+    Down,
+}
+
+/// GET `url` and classify the response for session-expiry (R4-D). Auth is lost on a `401`, a redirect
+/// whose final path contains `login`, or a `2xx` whose body isn't JSON (a 200 login page — which the
+/// old `json().unwrap_or(Null)` silently treated as healthy).
+async fn fetch_classified(client: &Client, url: &str) -> Fetched {
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(_) => return Fetched::Down,
+    };
+    if resp.status().as_u16() == 401 {
+        return Fetched::AuthLost;
+    }
+    if !resp.status().is_success() {
+        return Fetched::Down;
+    }
+    if rollcall::response_url_is_login(resp.url()) {
+        return Fetched::AuthLost; // redirected to a login URL (whole-url, lowercased — shared truth)
+    }
+    let body = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<Value>(body.trim()) {
+        Ok(v) if v.is_object() || v.is_array() => Fetched::Ok(v),
+        _ => Fetched::AuthLost, // 200 but not JSON → a login page was served
+    }
+}
+
+/// Re-login on the account's OWN client (its cookie jar is shared, so a fresh session cookie overwrites
+/// the stale one). A captcha school can't be driven unattended → `NeedCaptcha` counts as failure.
+async fn relogin(acc: &Account) -> bool {
+    let ep = Endpoints::derive(&acc.base_url);
+    matches!(
+        login::login(&acc.client, &ep, &acc.username, acc.password.expose()).await,
+        login::LoginOutcome::Ok
+    )
+}
+
+/// Spawn a re-login; emit the account's new online/offline status, then clear the actor's in-flight flag.
+fn spawn_relogin(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb) {
+    tokio::spawn(async move {
+        let ok = relogin(&acc).await;
+        emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": acc.id,
+                          "state": if ok { "online" } else { "offline" } }));
+        tx.send(MonitorMsg::AuthRestored { account_id: acc.id.clone(), ok }).ok();
+    });
 }
 
 /// Spawn the actor + one poller per account on the current tokio runtime.
@@ -141,6 +222,7 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
         quiz_detect: Duration::from_secs(cfg.quiz_detect_secs.max(1)),
         operating: cfg.operating.clone(),
         tz_offset_minutes: cfg.tz_offset_minutes,
+        wanted_types: cfg.autoanswer_types.clone(),
     };
 
     let mut tasks = Vec::new();
@@ -159,9 +241,12 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
 async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb, tune: PollTuning) {
     let ep = Endpoints::derive(&acc.base_url);
     let mut seen: HashSet<String> = HashSet::new();
-    let mut courses: Vec<String> = Vec::new(); // cached; the timetable rarely changes
+    let mut courses: Vec<String> = Vec::new(); // refreshed every 300s (a new enrolment appears)
+    let mut last_courses: Option<Instant> = None;
     let mut seen_quiz: HashSet<String> = HashSet::new();
+    let mut voted_quiz: HashSet<String> = HashSet::new(); // interactions already voted (skip re-cast)
     let mut last_quiz: Option<Instant> = None; // None → detect on the very first open iteration
+    let mut online = true; // the engine emitted the initial online; edge-trigger status changes only
     // ponytail: active=1s / idle=poll_idle_secs. The docs' 0.5s startup fast-window is a refinement —
     // the first poll is immediate anyway, so detection latency is already ~one interval.
     loop {
@@ -175,9 +260,13 @@ async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb,
             continue;
         }
 
-        let interval = match acc.client.get(ep.rollcalls()).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let v = resp.json::<Value>().await.unwrap_or(Value::Null);
+        let interval = match fetch_classified(&acc.client, &ep.rollcalls()).await {
+            Fetched::Ok(v) => {
+                if !online {
+                    // recovered from a transient blip → clear the stale offline badge (edge-triggered).
+                    emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": acc.id, "state": "online" }));
+                    online = true;
+                }
                 let list = extract_rollcalls(&v);
                 let active = !list.is_empty();
                 for rc in list {
@@ -196,15 +285,24 @@ async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb,
                 }
                 if active { Duration::from_secs(1) } else { tune.idle }
             }
-            _ => {
-                emit(cb, &json!({ "id": null, "event": "AccountStatus",
-                                  "account_id": acc.id, "state": "offline" }));
+            // The rollcall poll is the auth-lost canary (it runs every cycle): a 401 / redirect-to-login /
+            // 200-login-page → ask the actor to re-login (it dedups). Covers a session lost mid-sign too.
+            Fetched::AuthLost => {
+                tx.send(MonitorMsg::AuthLost { account_id: acc.id.clone() }).ok();
+                tune.idle
+            }
+            Fetched::Down => {
+                if online {
+                    emit(cb, &json!({ "id": null, "event": "AccountStatus",
+                                      "account_id": acc.id, "state": "offline" }));
+                    online = false;
+                }
                 tune.idle
             }
         };
         // Quiz detection on its own (slower) cadence, decoupled from the rollcall poll (docs 31).
         if last_quiz.is_none_or(|t| t.elapsed() >= tune.quiz_detect) {
-            detect_quizzes(&acc, &ep, &tx, &mut courses, &mut seen_quiz).await;
+            detect_quizzes(&acc, &ep, &tx, &mut courses, &mut last_courses, &mut seen_quiz, &mut voted_quiz, &tune.wanted_types).await;
             last_quiz = Some(Instant::now());
         }
 
@@ -216,41 +314,230 @@ async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb,
     }
 }
 
-/// Fetch the account's courses once (cached), then per course look for in-progress answerable
-/// activities and report each new one. `/distribute` is never used for detection (it churns).
+/// Refresh the account's courses (every 300s — a mid-semester enrolment is otherwise never seen), then
+/// per course run ONE detector per enabled family, each with its real list endpoint + array key + gate
+/// (v1 `_poll_course`). Emits each newly-answerable activity once with its family's canonical `source`.
+#[allow(clippy::too_many_arguments)]
 async fn detect_quizzes(
     acc: &Arc<Account>,
     ep: &Endpoints,
     tx: &UnboundedSender<MonitorMsg>,
     courses: &mut Vec<String>,
+    last_courses: &mut Option<Instant>,
     seen: &mut HashSet<String>,
+    voted: &mut HashSet<String>,
+    wanted: &[String],
 ) {
-    if courses.is_empty() {
+    if last_courses.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) || courses.is_empty() {
         if let Ok(v) = get_json(&acc.client, &ep.my_courses()).await {
-            *courses = extract_array(&v, "courses").iter().filter_map(id_of).collect();
+            let fresh: Vec<String> = first_array(&v, &["courses", "items", "data"]).iter().filter_map(course_id_of).collect();
+            if !fresh.is_empty() {
+                *courses = fresh;
+            }
+            *last_courses = Some(Instant::now());
         }
     }
-    for cid in courses.iter() {
-        for url in [ep.course_activities(cid), ep.course_exams(cid), ep.course_homework(cid)] {
-            let Ok(v) = get_json(&acc.client, &url).await else { continue };
-            for a in extract_array(&v, "activities") {
-                // "currently answerable": is_in_progress==false excludes; missing → keep (fall back).
-                if a.get("is_in_progress").and_then(Value::as_bool) == Some(false) {
-                    continue;
+    let want = |f: &str| wanted.is_empty() || wanted.iter().any(|w| w == f);
+    let now = now_epoch_secs();
+    for cid in courses.clone() {
+        if want("exam") {
+            for a in family_list(acc, &ep.course_exam_list(&cid), "exams").await {
+                if exam_answerable(&a, now) {
+                    emit_quiz(tx, acc, seen, "exam", &cid, &a, "");
                 }
-                let Some(aid) = id_of(&a) else { continue };
-                if !seen.insert(format!("{cid}/{aid}")) {
-                    continue;
-                }
-                tx.send(MonitorMsg::QuizDetected {
-                    account_id: acc.id.clone(),
-                    base_url: acc.base_url.clone(),
-                    source: a.get("type").and_then(Value::as_str).unwrap_or("exam").to_string(),
-                    course: a.get("course_name").and_then(Value::as_str).unwrap_or("").to_string(),
-                    activity_id: aid,
-                })
-                .ok();
             }
+        }
+        if want("questionnaire") {
+            for a in family_list(acc, &ep.course_questionnaire_list(&cid), "questionnaires").await {
+                // v1: absent is_started → not started → skip.
+                if field_or(&a, "is_started", false) && !field_or(&a, "is_closed", false) && !already_submitted(&a) {
+                    emit_quiz(tx, acc, seen, "questionnaire", &cid, &a, "");
+                }
+            }
+        }
+        if want("homework") {
+            for a in family_list(acc, &ep.course_homework(&cid), "homework_activities").await {
+                if !field_or(&a, "is_closed", false) && !already_submitted(&a) {
+                    let stem = a.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+                    emit_quiz(tx, acc, seen, "homework", &cid, &a, &stem);
+                }
+            }
+        }
+        if want("vote") {
+            detect_vote(acc, ep, tx, &cid, seen, voted).await;
+        }
+        if want("classroom") {
+            for a in family_list(acc, &ep.course_classroom_list(&cid), "classrooms").await {
+                // status stays "start" after 收答 closes but started_subjects_count drops to 0.
+                if a.get("status").and_then(Value::as_str) == Some("start")
+                    && a.get("started_subjects_count").and_then(Value::as_i64).unwrap_or(0) >= 1
+                {
+                    emit_quiz(tx, acc, seen, "classroom-exam", &cid, &a, "");
+                }
+            }
+        }
+        if want("courseware") {
+            detect_courseware(acc, ep, tx, &cid, seen).await;
+        }
+    }
+}
+
+/// GET a family list endpoint and return its items (by `key`, bare-array fallback); [] on any error.
+async fn family_list(acc: &Arc<Account>, url: &str, key: &str) -> Vec<Value> {
+    match get_json(&acc.client, url).await {
+        Ok(v) => extract_array(&v, key),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Dedup on `cid/aid`, then emit one QuizDetected with the family's canonical `source`.
+fn emit_quiz(tx: &UnboundedSender<MonitorMsg>, acc: &Arc<Account>, seen: &mut HashSet<String>, source: &str, cid: &str, a: &Value, stem: &str) {
+    let Some(aid) = id_of(a) else { return };
+    if !seen.insert(format!("{cid}/{aid}")) {
+        return;
+    }
+    tx.send(MonitorMsg::QuizDetected {
+        account_id: acc.id.clone(),
+        base_url: acc.base_url.clone(),
+        source: source.to_string(),
+        course: a.get("course_name").and_then(Value::as_str).unwrap_or("").to_string(),
+        course_id: cid.to_string(),
+        activity_id: aid,
+        stem: stem.to_string(),
+    })
+    .ok();
+}
+
+/// First present array among `keys`, else a bare top-level array.
+fn first_array(v: &Value, keys: &[&str]) -> Vec<Value> {
+    for k in keys {
+        if let Some(a) = v.get(*k).and_then(Value::as_array) {
+            return a.clone();
+        }
+    }
+    v.as_array().cloned().unwrap_or_default()
+}
+
+/// A course id from `id | course_id | courseId` (string or integer).
+fn course_id_of(v: &Value) -> Option<String> {
+    ["id", "course_id", "courseId"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string()))))
+}
+
+fn field_or(a: &Value, k: &str, default: bool) -> bool {
+    a.get(k).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Already-submitted across the family's variant field names (real tenants differ; §8 needs-real-account).
+fn already_submitted(a: &Value) -> bool {
+    ["has_submitted", "submitted", "is_submitted"].iter().any(|k| field_or(a, k, false))
+}
+
+/// Exam answerable gate (v1): started, not closed, not explicitly not-in-progress, window not past, not
+/// already submitted, and attempts not exhausted.
+fn exam_answerable(a: &Value, now: i64) -> bool {
+    // v1: absent is_started means NOT started → skip (don't default-open).
+    let started = field_or(a, "is_started", false);
+    let closed = field_or(a, "is_closed", false);
+    let in_progress = a.get("is_in_progress").and_then(Value::as_bool) != Some(false);
+    let past = end_epoch(a).map(|e| e < now).unwrap_or(false);
+    let times = a.get("submit_times").and_then(Value::as_i64).unwrap_or(0);
+    let used = a.get("submission_count").and_then(Value::as_i64).unwrap_or(0);
+    let exhausted = times > 0 && used >= times;
+    started && !closed && in_progress && !past && !already_submitted(a) && !exhausted
+}
+
+/// `end_time` as a UTC epoch — a real tenant sends an ISO-8601 string (v1 `_iso_before_now`); tolerate a
+/// bare integer epoch too. `None` (absent/unparseable) ⇒ the caller treats it as *not past* (never over-gate).
+fn end_epoch(a: &Value) -> Option<i64> {
+    let v = a.get("end_time")?;
+    v.as_i64().or_else(|| v.as_str().and_then(iso8601_to_epoch))
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]` to a UTC epoch (civil-date math; no date crate across the
+/// 4 ABIs). Lenient: missing tz → treated as UTC; anything unparseable → `None`.
+fn iso8601_to_epoch(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once(['T', ' '])?;
+    let mut d = date.split('-');
+    let (y, m, day) = (d.next()?.parse::<i64>().ok()?, d.next()?.parse::<i64>().ok()?, d.next()?.parse::<i64>().ok()?);
+    // Split the time from an optional trailing Z / ±HH:MM offset.
+    let (time, off_secs) = if let Some(t) = rest.strip_suffix('Z') {
+        (t, 0)
+    } else if let Some(pos) = rest.rfind(['+', '-']) {
+        let (t, off) = rest.split_at(pos);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let (oh, om) = off[1..].split_once(':')?;
+        (t, sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60))
+    } else {
+        (rest, 0)
+    };
+    let mut tp = time.split(':');
+    let hh = tp.next()?.parse::<i64>().ok()?;
+    let mm = tp.next()?.parse::<i64>().ok()?;
+    let ss = tp.next().unwrap_or("0").split('.').next()?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant): days since 1970-01-01.
+    let yy = y - i64::from(m <= 2);
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = yy - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hh * 3600 + mm * 60 + ss - off_secs)
+}
+
+/// vote: `interactions` → `type=="vote" && status=="start"`; then read the vote and skip if the caller
+/// already voted (`user_no` ∈ `students[].user_no`), caching voted ids to avoid re-cast 400 churn.
+async fn detect_vote(acc: &Arc<Account>, ep: &Endpoints, tx: &UnboundedSender<MonitorMsg>, cid: &str, seen: &mut HashSet<String>, voted: &mut HashSet<String>) {
+    for a in family_list(acc, &ep.course_interactions(cid), "interactions").await {
+        if a.get("type").and_then(Value::as_str) != Some("vote") || a.get("status").and_then(Value::as_str) != Some("start") {
+            continue;
+        }
+        let Some(aid) = id_of(&a) else { continue };
+        if voted.contains(&aid) || seen.contains(&format!("{cid}/{aid}")) {
+            continue;
+        }
+        if let Ok(v) = get_json(&acc.client, &ep.votes_read(&aid)).await {
+            let already = v.get("students").and_then(Value::as_array).map(|arr| {
+                arr.iter().any(|s| s.get("user_no").and_then(Value::as_str) == Some(acc.user_no.as_str()))
+            }).unwrap_or(false);
+            if already {
+                voted.insert(aid); // cache so we don't re-read/re-cast
+                continue;
+            }
+        }
+        emit_quiz(tx, acc, seen, "vote", cid, &a, "");
+    }
+}
+
+/// courseware: generic activities filtered to `type=="material"`, then per material the quizzes chain;
+/// each quiz gate `!is_closed && is_started!=false`, and skip when its `my-submission` is already truthy.
+async fn detect_courseware(acc: &Arc<Account>, ep: &Endpoints, tx: &UnboundedSender<MonitorMsg>, cid: &str, seen: &mut HashSet<String>) {
+    for m in family_list(acc, &ep.course_activities(cid), "activities").await {
+        if m.get("type").and_then(Value::as_str) != Some("material") {
+            continue;
+        }
+        let Some(mat_id) = id_of(&m) else { continue };
+        for q in family_list(acc, &ep.courseware_quizzes(&mat_id), "quizzes").await {
+            if field_or(&q, "is_closed", false) || !field_or(&q, "is_started", true) {
+                continue;
+            }
+            let Some(qid) = id_of(&q) else { continue };
+            if seen.contains(&format!("{cid}/{qid}")) {
+                continue;
+            }
+            // Skip when already answered (a truthy my-submission object).
+            let done = get_json(&acc.client, &ep.courseware_my_submission(&qid)).await
+                .map(|v| v.is_object() && !v.as_object().map(|o| o.is_empty()).unwrap_or(true))
+                .unwrap_or(false);
+            if done {
+                continue;
+            }
+            emit_quiz(tx, acc, seen, "courseware-quiz", cid, &q, "");
         }
     }
 }
@@ -264,6 +551,7 @@ async fn actor(
 ) {
     let mut activities: HashMap<ActivityKey, Activity> = HashMap::new();
     let mut quizzes: HashMap<ActivityKey, QuizActivity> = HashMap::new();
+    let mut reauth: HashSet<String> = HashSet::new(); // accounts with a re-login in flight (dedup)
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -275,19 +563,38 @@ async fn actor(
                     MonitorMsg::Detected(d) => on_detected(&mut activities, &accounts, &self_tx, cb, d),
                     MonitorMsg::GateResult { key, rate } => on_gate(&mut activities, &accounts, &self_tx, cb, &cfg, key, rate),
                     MonitorMsg::CodeRead { key, code } => { if let Some(a) = activities.get_mut(&key) { a.number_code = code; a.code_requested = true; } }
-                    MonitorMsg::SignResult { key, account_id, result } => on_sign_result(&mut activities, cb, key, account_id, result),
+                    MonitorMsg::SignResult { key, account_id, result } => on_sign_result(&mut activities, &self_tx, cb, key, account_id, result),
                     MonitorMsg::SignNow { rollcall_id } => { if let Some(key) = find_key(&activities, &rollcall_id) { dispatch_signs(&mut activities, &accounts, &self_tx, &cfg, cb, &key); } }
                     MonitorMsg::Defer { rollcall_id } => on_defer(&mut activities, cb, &rollcall_id),
-                    MonitorMsg::QuizDetected { account_id, base_url, source, course, activity_id } =>
-                        on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, activity_id, account_id),
+                    MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
+                        on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, course_id, activity_id, account_id, stem),
                     MonitorMsg::QuizPrepared { key, instance_id, subjects, shared, existing, allow_retake, reveal } =>
                         on_quiz_prepared(&mut quizzes, &cfg, cb, key, instance_id, subjects, shared, existing, allow_retake, reveal),
+                    MonitorMsg::QuizPrepareRetry { key, partial, missing, gone } =>
+                        on_quiz_prepare_retry(&mut quizzes, &cfg, cb, key, partial, missing, gone),
                     MonitorMsg::QuizSetAnswer { quiz_id, account_id, subject_id, answer } =>
                         on_quiz_set_answer(&mut quizzes, &cfg, cb, &quiz_id, &account_id, &subject_id, answer),
                     MonitorMsg::QuizSubmitNow { quiz_id } => { if let Some(key) = find_quiz_key(&quizzes, &quiz_id) { dispatch_quiz_submits(&mut quizzes, &accounts, &self_tx, &cfg, &key); } }
                     MonitorMsg::QuizHold { quiz_id } => { if let Some(q) = find_quiz_mut(&mut quizzes, &quiz_id) { q.countdown_deadline = None; q.held = true; } }
                     MonitorMsg::QuizDiscard { quiz_id } => { if let Some(q) = find_quiz_mut(&mut quizzes, &quiz_id) { q.countdown_deadline = None; q.discarded = true; emit(cb, &json!({"id":null,"event":"LogLine","level":"info","text":format!("quiz {quiz_id} discarded")})); } }
                     MonitorMsg::QuizSubmitResult { key, account_id, result } => on_quiz_submit_result(&mut quizzes, cb, key, account_id, result),
+                    MonitorMsg::AuthLost { account_id } => {
+                        // Session expired mid-poll. Re-login once (dedup concurrent triggers); the poller
+                        // keeps sending AuthLost each cycle until AuthRestored clears the in-flight flag.
+                        if reauth.insert(account_id.clone()) {
+                            match accounts.get(&account_id).cloned() {
+                                Some(acc) => spawn_relogin(acc, self_tx.clone(), cb),
+                                None => { reauth.remove(&account_id); }
+                            }
+                        }
+                    }
+                    MonitorMsg::AuthRestored { account_id, ok } => {
+                        reauth.remove(&account_id);
+                        // Only on a SUCCESSFUL re-login do we re-sign the rollcalls this account lost.
+                        if ok {
+                            redispatch_signs(&mut activities, &accounts, &self_tx, &cfg, &account_id);
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -318,6 +625,8 @@ fn on_detected(
         countdown_deadline: None,
         acted: false,
         signed: HashSet::new(),
+        needs_resign: HashSet::new(),
+        resign_attempts: HashMap::new(),
     });
     let is_new_participant = entry.participants.insert(d.account_id.clone());
     if is_new_participant {
@@ -414,31 +723,38 @@ fn dispatch_signs(
     let rollcall_id = key.2.clone();
     let base_url = key.0.clone();
     let radar_strategy = cfg.radar_strategy.clone();
-    let (num_conc, num_cooldown) = (cfg.number_concurrency, cfg.number_cooldown_ms);
+    let ncfg = rollcall::NumberCfg {
+        concurrency: cfg.number_concurrency,
+        min_concurrency: cfg.number_min_concurrency,
+        cooldown_ms: cfg.number_cooldown_ms,
+        max_cooldowns: cfg.number_max_cooldowns,
+    };
 
     if kind == RollcallKind::Qr {
         // QR: needs a teacher account for this base_url; teacher sources data, students sign their own id.
         let teacher = accounts.values().find(|acc| acc.base_url == base_url && acc.is_teacher).cloned();
         match teacher {
-            Some(t) if t.course_id.is_some() => {
+            // course_id may be empty — the task falls back to the teacher's first my-course.
+            Some(t) => {
                 let students: Vec<Arc<Account>> =
                     participants.iter().filter_map(|id| accounts.get(id).cloned()).filter(|acc| !acc.is_teacher).collect();
                 spawn_qr_teacher_assist(t, students, tx.clone(), key.clone());
             }
-            _ => emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
-                                   "code": "qr_needs_teacher", "message": format!("rollcall {rollcall_id}: qr needs a teacher account") })),
+            None => emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
+                                     "code": "qr_needs_teacher", "message": format!("rollcall {rollcall_id}: qr needs a teacher account") })),
         }
         return;
     }
 
     for acc_id in participants {
         let Some(acc) = accounts.get(&acc_id).cloned() else { continue };
-        spawn_sign(acc, kind, code.clone(), rollcall_id.clone(), radar_strategy.clone(), num_conc, num_cooldown, tx.clone(), key.clone());
+        spawn_sign(acc, kind, code.clone(), rollcall_id.clone(), radar_strategy.clone(), ncfg, tx.clone(), key.clone());
     }
 }
 
 fn on_sign_result(
     activities: &mut HashMap<ActivityKey, Activity>,
+    tx: &UnboundedSender<MonitorMsg>,
     cb: EventCb,
     key: ActivityKey,
     account_id: String,
@@ -448,14 +764,57 @@ fn on_sign_result(
     match result {
         Ok(outcome) => {
             a.signed.insert(account_id.clone());
+            a.needs_resign.remove(&account_id);
+            a.resign_attempts.remove(&account_id);
             if a.number_code.is_none() {
                 a.number_code = outcome.discovered_code.clone(); // share a brute-forced code
             }
             emit(cb, &json!({ "id": null, "event": "SignedIn", "rollcall_id": key.2,
                               "account_id": account_id, "course": a.course, "method": outcome.method }));
         }
+        // Session died mid-sign (R4.1 #2): DON'T give up on the first hit — mark for re-sign, ask the
+        // actor to re-login; `AuthRestored` re-dispatches this account (guarded by `signed`). BUT bound
+        // it: a permanent 403 (not a real expiry) re-logins fine yet keeps failing → after MAX_RESIGN
+        // give up with a hard sign_failed so it can't loop forever.
+        Err(e) if rollcall::is_auth_lost(&e) => {
+            let n = a.resign_attempts.entry(account_id.clone()).or_insert(0);
+            *n += 1;
+            if *n > MAX_RESIGN {
+                a.needs_resign.remove(&account_id);
+                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                                  "code": "sign_failed", "message": format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} re-logins)") }));
+            } else {
+                a.needs_resign.insert(account_id.clone());
+                emit(cb, &json!({ "id": null, "event": "LogLine", "level": "warn",
+                                  "text": format!("rollcall {}: {account_id} session lost mid-sign, re-logging in", key.2) }));
+                tx.send(MonitorMsg::AuthLost { account_id }).ok();
+            }
+        }
         Err(e) => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
                                     "code": "sign_failed", "message": format!("{account_id}: {e}") })),
+    }
+}
+
+/// After a re-login (R4.1 #2), re-dispatch a sign for ONLY the accounts that lost their session mid-sign
+/// on each activity — guarded by `signed` so an already-signed account is never re-signed (no double-sign).
+fn redispatch_signs(
+    activities: &mut HashMap<ActivityKey, Activity>,
+    accounts: &HashMap<String, Arc<Account>>,
+    tx: &UnboundedSender<MonitorMsg>,
+    cfg: &MonitorConfig,
+    account_id: &str,
+) {
+    let Some(acc) = accounts.get(account_id).cloned() else { return };
+    let ncfg = rollcall::NumberCfg {
+        concurrency: cfg.number_concurrency,
+        min_concurrency: cfg.number_min_concurrency,
+        cooldown_ms: cfg.number_cooldown_ms,
+        max_cooldowns: cfg.number_max_cooldowns,
+    };
+    for (key, a) in activities.iter_mut() {
+        if a.needs_resign.remove(account_id) && !a.signed.contains(account_id) {
+            spawn_sign(acc.clone(), a.kind, a.number_code.clone(), key.2.clone(), cfg.radar_strategy.clone(), ncfg, tx.clone(), key.clone());
+        }
     }
 }
 
@@ -495,13 +854,13 @@ fn spawn_code_read(accounts: &HashMap<String, Arc<Account>>, tx: &UnboundedSende
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_sign(acc: Arc<Account>, kind: RollcallKind, code: Option<String>, rollcall_id: String, radar_strategy: Vec<String>, num_conc: u32, num_cooldown: u64, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
+fn spawn_sign(acc: Arc<Account>, kind: RollcallKind, code: Option<String>, rollcall_id: String, radar_strategy: Vec<String>, ncfg: rollcall::NumberCfg, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
     tokio::spawn(async move {
         let ep = Endpoints::derive(&acc.base_url);
         let result = match kind {
-            RollcallKind::Number => rollcall::sign_number(&acc.client, &ep, &rollcall_id, &acc.device_id, code.as_deref(), num_conc, num_cooldown).await,
-            RollcallKind::Radar => rollcall::sign_radar(&acc.client, &ep, &rollcall_id, &radar_strategy).await,
-            RollcallKind::SelfRegistration => rollcall::sign_self_registration(&acc.client, &ep, &rollcall_id).await,
+            RollcallKind::Number => rollcall::sign_number(&acc.client, &ep, &rollcall_id, &acc.device_id, code.as_deref(), ncfg).await,
+            RollcallKind::Radar => rollcall::sign_radar(&acc.client, &ep, &rollcall_id, &radar_strategy, &acc.user_no, &acc.device_id).await,
+            RollcallKind::SelfRegistration => rollcall::sign_self_registration(&acc.client, &ep, &rollcall_id, &acc.user_no).await,
             RollcallKind::Qr | RollcallKind::Unknown => Err("unsupported here".into()),
         };
         tx.send(MonitorMsg::SignResult { key, account_id: acc.id.clone(), result }).ok();
@@ -509,15 +868,27 @@ fn spawn_sign(acc: Arc<Account>, kind: RollcallKind, code: Option<String>, rollc
 }
 
 /// Teacher sources `data` from its own qr rollcall, then each student signs THEIR own rollcall_id
-/// with that data (docs 32). One task signs all students, then messages a result per student.
+/// with that data (docs 32). Because the QR token is valid only ~1–4 s, this **re-sources and
+/// re-sends** every ~1.5 s for up to ~12 s until each student confirms (one snapshot is not enough).
 fn spawn_qr_teacher_assist(teacher: Arc<Account>, students: Vec<Arc<Account>>, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
     let student_rollcall_id = key.2.clone();
     tokio::spawn(async move {
         let ep = Endpoints::derive(&teacher.base_url);
-        let course_id = teacher.course_id.clone().unwrap_or_default();
+        // course_id: the teacher's, else fall back to its first my-course (don't just give up).
+        let course_id = match teacher.course_id.clone() {
+            Some(c) if !c.is_empty() => c,
+            _ => first_course(&teacher.client, &ep).await.unwrap_or_default(),
+        };
 
-        // Teacher starts its OWN qr rollcall purely to source the rotating data.
-        let teacher_rollcall_id = match teacher.client.post(ep.teacher_create_rollcall(&course_id)).json(&json!({ "type": "qr" })).send().await {
+        // Teacher starts its OWN qr rollcall purely to source the rotating data (full create body).
+        // ponytail: placeholder numeric/bool values; exact required fields need a real tenant to verify.
+        let create_body = json!({
+            "type": "qr_rollcall", "title": "auto", "status": "in_progress",
+            "is_radar": false, "is_number": false, "number_code": null,
+            "latitude": 0.0, "longitude": 0.0, "altitude": 0.0,
+            "use_beacon": false, "duration": 3600, "student_rollcalls": []
+        });
+        let teacher_rollcall_id = match teacher.client.post(ep.teacher_create_rollcall(&course_id)).json(&create_body).send().await {
             Ok(r) => {
                 let v = r.json::<Value>().await.unwrap_or(Value::Null);
                 v.get("rollcall_id").or_else(|| v.get("id")).and_then(|x| x.as_str()).unwrap_or_default().to_string()
@@ -526,16 +897,38 @@ fn spawn_qr_teacher_assist(teacher: Arc<Account>, students: Vec<Arc<Account>>, t
         };
         let _ = teacher.client.post(ep.teacher_start_rollcall(&teacher_rollcall_id)).send().await;
 
-        let data = rollcall::teacher_source_qr_data(&teacher.client, &ep, &course_id, &teacher_rollcall_id).await;
+        let mut confirmed: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while confirmed.len() < students.len() && Instant::now() < deadline {
+            if let Some(data) = rollcall::teacher_source_qr_data(&teacher.client, &ep, &course_id, &teacher_rollcall_id).await {
+                for s in &students {
+                    if confirmed.contains(&s.id) {
+                        continue;
+                    }
+                    if let Ok(outcome) = rollcall::sign_qr_with_teacher_data(&s.client, &ep, &student_rollcall_id, &s.device_id, &data, &s.user_no).await {
+                        confirmed.insert(s.id.clone());
+                        tx.send(MonitorMsg::SignResult { key: key.clone(), account_id: s.id.clone(), result: Ok(outcome) }).ok();
+                    }
+                }
+            }
+            if confirmed.len() < students.len() {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+        }
         for s in &students {
-            let result = match &data {
-                Some(data) => rollcall::sign_qr_with_teacher_data(&s.client, &ep, &student_rollcall_id, &s.device_id, data).await,
-                None => Err("qr: teacher could not source data".into()),
-            };
-            tx.send(MonitorMsg::SignResult { key: key.clone(), account_id: s.id.clone(), result }).ok();
+            if !confirmed.contains(&s.id) {
+                tx.send(MonitorMsg::SignResult { key: key.clone(), account_id: s.id.clone(),
+                    result: Err("qr: could not confirm within the token window".into()) }).ok();
+            }
         }
         let _ = teacher.client.put(ep.teacher_stop_qr(&teacher_rollcall_id)).send().await; // close teacher end
     });
+}
+
+/// The teacher's first course id (my-courses) — the QR create fallback when no course_id is set.
+async fn first_course(client: &Client, ep: &Endpoints) -> Option<String> {
+    let v = get_json(client, &ep.my_courses()).await.ok()?;
+    extract_array(&v, "courses").iter().find_map(id_of)
 }
 
 // --- small helpers ---
@@ -578,10 +971,13 @@ fn course_name(rc: &Value) -> String {
 struct QuizActivity {
     source: Source,
     course: String,
+    course_id: String, // R5: course the tool executor searches for materials
     activity_id: String,
+    stem: String, // homework question stem, from the detection payload
     participants: HashSet<String>,
     detect_at: Option<Instant>,
     prepare_started: bool,
+    prepare_deadline: Option<Instant>, // R3c: give-up deadline for the re-prepare retry budget
     instance_id: String,
     subjects: Vec<Value>,
     shared: Map<String, Answer>,                 // subject_id -> shared LLM/replay answer
@@ -606,17 +1002,22 @@ fn on_quiz_detected(
     base_url: String,
     source: String,
     course: String,
+    course_id: String,
     activity_id: String,
     account_id: String,
+    stem: String,
 ) {
     let key = (base_url, format!("quiz:{source}"), activity_id.clone());
     let q = quizzes.entry(key.clone()).or_insert_with(|| QuizActivity {
         source: Source::parse(&source),
         course,
+        course_id,
         activity_id: activity_id.clone(),
+        stem,
         participants: HashSet::new(),
         detect_at: None,
         prepare_started: false,
+        prepare_deadline: None,
         instance_id: String::new(),
         subjects: Vec::new(),
         shared: Map::new(),
@@ -678,6 +1079,50 @@ fn on_quiz_prepared(
     }
 }
 
+/// R3c all-or-nothing retry: prepare could not fully answer the paper (or a re-fetch failed/was gone).
+/// `gone` → the activity closed → silent done. Otherwise carry the partial answers and re-arm prepare
+/// after a backoff, until `missing` clears or the minutes-scale budget deadline is hit (then one Error).
+fn on_quiz_prepare_retry(
+    quizzes: &mut HashMap<ActivityKey, QuizActivity>,
+    cfg: &MonitorConfig,
+    cb: EventCb,
+    key: ActivityKey,
+    partial: Map<String, Answer>,
+    missing: Vec<String>,
+    gone: bool,
+) {
+    let Some(q) = quizzes.get_mut(&key) else { return };
+    if q.acted || q.discarded {
+        return;
+    }
+    if gone {
+        q.discarded = true; // activity closed → silent done (never a half-submit, no Error)
+        q.countdown_deadline = None;
+        return;
+    }
+    q.shared = partial; // carry answers resolved so far into the next prepare (leaked answers still win)
+    let now = Instant::now();
+    let deadline = *q
+        .prepare_deadline
+        .get_or_insert_with(|| now + Duration::from_secs(cfg.prepare_retry_budget_secs));
+    if now >= deadline {
+        // Budget exhausted → give up on THIS paper (never a half-submit); name the stuck subjects.
+        q.discarded = true;
+        q.countdown_deadline = None;
+        let detail = if missing.is_empty() {
+            "could not fetch the paper".to_string()
+        } else {
+            format!("unanswerable subjects: {}", missing.join(", "))
+        };
+        emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                          "code": "quiz_unanswerable", "message": format!("{}: {detail}", q.activity_id) }));
+        return;
+    }
+    // Re-arm prepare after a ~poll-idle backoff; the tick's grace-gate re-spawns with q.shared as prior.
+    q.prepare_started = false;
+    q.detect_at = Some(now + Duration::from_secs(cfg.poll_idle_secs.max(1)));
+}
+
 fn on_quiz_set_answer(
     quizzes: &mut HashMap<ActivityKey, QuizActivity>,
     cfg: &MonitorConfig,
@@ -721,7 +1166,7 @@ fn on_quiz_tick(
                 if now.saturating_duration_since(t) >= Duration::from_millis(1200) {
                     q.prepare_started = true;
                     let participants: Vec<Arc<Account>> = q.participants.iter().filter_map(|id| accounts.get(id).cloned()).collect();
-                    spawn_quiz_prepare(participants, q.source, q.activity_id.clone(), cfg.llm(), cfg.max_answer_reask, tx.clone(), key.clone(), cb);
+                    spawn_quiz_prepare(participants, q.source, q.activity_id.clone(), q.course_id.clone(), q.stem.clone(), cfg.llm(), cfg.max_answer_reask, q.shared.clone(), tx.clone(), key.clone(), cb);
                 }
             }
             continue;
@@ -780,23 +1225,36 @@ fn on_quiz_submit_result(quizzes: &mut HashMap<ActivityKey, QuizActivity>, cb: E
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_id: String, llm: LlmConfig, max_reask: u32, tx: UnboundedSender<MonitorMsg>, key: ActivityKey, cb: EventCb) {
+fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_id: String, course_id: String, stem: String, llm: LlmConfig, max_reask: u32, prior: Map<String, Answer>, tx: UnboundedSender<MonitorMsg>, key: ActivityKey, cb: EventCb) {
     tokio::spawn(async move {
         let Some(lead) = participants.first().cloned() else { return };
         let ep = Endpoints::derive(&lead.base_url);
-        let paper = match answer::fetch_paper(&lead.client, &ep, source, &activity_id).await {
+        let paper = match answer::fetch_paper(&lead.client, &ep, source, &activity_id, &stem).await {
             Ok(p) => p,
-            Err(e) => {
-                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error", "code": "quiz_fetch", "message": e }));
+            // R3c: a re-fetch failure is ambiguous (often a transient 404) → not-ready, retry; the actor
+            // Errors only at the budget deadline. Carry the prior partial so answered subjects survive.
+            Err(_) => {
+                tx.send(MonitorMsg::QuizPrepareRetry { key, partial: prior, missing: Vec::new(), gone: false }).ok();
                 return;
             }
         };
-        let shared = answer::shared_answers(&lead.client, &llm, cb, &activity_id, &paper.subjects, max_reask).await;
-        // Per-account existing answers (each account's own view), for conflict detection.
+        // An empty paper = the activity closed / dropped out → silent done (v1-style), never an Error.
+        if paper.subjects.is_empty() {
+            tx.send(MonitorMsg::QuizPrepareRetry { key, partial: prior, missing: Vec::new(), gone: true }).ok();
+            return;
+        }
+        let shared = answer::shared_answers(&lead.client, &llm, cb, &activity_id, &course_id, &lead.base_url, &paper.subjects, max_reask, &prior).await;
+        let missing = answer::missing_subjects(&paper.subjects, &shared);
+        if !missing.is_empty() {
+            // All-or-nothing: never submit a half-paper — carry the partial answers and retry.
+            tx.send(MonitorMsg::QuizPrepareRetry { key, partial: shared, missing, gone: false }).ok();
+            return;
+        }
+        // Fully answered → gather each account's existing answers (conflict detection) and prepare.
         let mut existing: Map<String, Map<String, Answer>> = Map::new();
         for acc in &participants {
             let epa = Endpoints::derive(&acc.base_url);
-            if let Ok(p) = answer::fetch_paper(&acc.client, &epa, source, &activity_id).await {
+            if let Ok(p) = answer::fetch_paper(&acc.client, &epa, source, &activity_id, &stem).await {
                 let mut m = Map::new();
                 for s in &p.subjects {
                     if let Some(a) = answer::existing_answer(s) {
@@ -822,29 +1280,40 @@ fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, instance_id: String, subjects: Vec<Value>, answers: Map<String, Answer>, allow_retake: bool, reveal: bool, resubmit: bool, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
+fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, instance_id: String, subjects: Vec<Value>, answers: Map<String, Answer>, _allow_retake: bool, _reveal: bool, resubmit: bool, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
     tokio::spawn(async move {
         let ep = Endpoints::derive(&acc.base_url);
         let result: Result<String, String> = match source {
             Source::Exam => match answer::submit_exam(&acc.client, &ep, &activity_id, &instance_id, &answers, &subjects).await {
-                Ok(sid) => {
-                    if resubmit && allow_retake && reveal {
-                        let _ = answer::resubmit_correct(&acc.client, &ep, &activity_id, &instance_id, &sid).await;
+                Ok((sid, retake)) => {
+                    // resubmit gate: EXAM + pref + the SUBMIT RESPONSE's allow_retake_exam + a submission
+                    // id (v1 answer_flow.py:456) — a single-attempt exam must not burn its one graded attempt.
+                    if resubmit && retake && !sid.is_empty() {
+                        let _ = answer::resubmit_correct(&acc.client, &ep, &activity_id, &sid, &answers, &subjects).await;
                     }
                     Ok(format!("submitted {sid}"))
                 }
                 Err(e) => Err(e),
             },
             Source::ClassroomExam => {
-                // per-subject POST with the full exam wrapper (flat body → 400).
+                // per-subject POST with the full exam wrapper (flat body → 400). ponytail: v1 also gates
+                // on the server's started_subjects_count≥1 (R2.5); here each answered subject is posted.
                 for s in &subjects {
                     let sid = crate::quiz::subject_id(s);
                     if let Some(a) = answers.get(&sid) {
-                        let body = answer::classroom_body(&instance_id, &sid, a);
+                        let body = answer::classroom_body(&instance_id, s, a);
                         let _ = acc.client.post(ep.classroom_submit(&activity_id, &sid)).json(&body).send().await;
                     }
                 }
                 Ok("submitted (classroom)".into())
+            }
+            Source::Questionnaire => {
+                // exam wrapper (NOT courseware), to the questionnaire endpoint.
+                let entries: Vec<Value> = subjects
+                    .iter()
+                    .filter_map(|s| answers.get(&crate::quiz::subject_id(s)).map(|a| answer::exam_subject_entry(s, a)))
+                    .collect();
+                post_json(&acc.client, &ep.questionnaire_submissions(&activity_id), &answer::questionnaire_body(&instance_id, &entries)).await.map(|_| "submitted (questionnaire)".into())
             }
             Source::Vote => {
                 let letters: Vec<String> = answers.values().flat_map(vote_letters).collect();
@@ -853,10 +1322,6 @@ fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, ins
             Source::CoursewareQuiz => {
                 let items = source_items(&subjects, &answers);
                 post_json(&acc.client, &ep.courseware_submissions(&activity_id), &answer::courseware_body(&items)).await.map(|_| "submitted (courseware)".into())
-            }
-            Source::Questionnaire => {
-                let items = source_items(&subjects, &answers);
-                post_json(&acc.client, &ep.questionnaire_submissions(&activity_id), &answer::questionnaire_body(&items)).await.map(|_| "submitted (questionnaire)".into())
             }
             Source::Homework => {
                 let text = answers.values().filter_map(answer_text).collect::<Vec<_>>().join("\n");
@@ -940,13 +1405,53 @@ fn answer_text(a: &Answer) -> Option<String> {
         _ => None,
     }
 }
-fn source_items(subjects: &[Value], answers: &Map<String, Answer>) -> Vec<(String, Answer)> {
+/// (subject_id, answer_type, answer) for each answered subject — courseware's `subjects_answers` needs
+/// all three (the answer_type falls back to the subject `type`).
+fn source_items(subjects: &[Value], answers: &Map<String, Answer>) -> Vec<(String, String, Answer)> {
     subjects
         .iter()
         .filter_map(|s| {
             let sid = crate::quiz::subject_id(s);
-            let qtype = s.get("type").and_then(Value::as_str).unwrap_or("").to_string();
-            answers.get(&sid).map(|a| (qtype, a.clone()))
+            let atype = s
+                .get("answer_type")
+                .and_then(Value::as_str)
+                .or_else(|| s.get("type").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
+            answers.get(&sid).map(|a| (sid, atype, a.clone()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso8601_epoch_parses_z_offset_and_int() {
+        // 2021-01-01T00:00:00Z = 1609459200.
+        assert_eq!(iso8601_to_epoch("2021-01-01T00:00:00Z"), Some(1_609_459_200));
+        // same instant expressed as +08:00 local (08:00 local == 00:00 UTC).
+        assert_eq!(iso8601_to_epoch("2021-01-01T08:00:00+08:00"), Some(1_609_459_200));
+        // fractional seconds + space separator tolerated.
+        assert_eq!(iso8601_to_epoch("2021-01-01 00:00:00.500Z"), Some(1_609_459_200));
+        assert_eq!(iso8601_to_epoch("not-a-date"), None);
+        // end_epoch also accepts a bare integer epoch.
+        assert_eq!(end_epoch(&json!({"end_time": 1_609_459_200_i64})), Some(1_609_459_200));
+        assert_eq!(end_epoch(&json!({"end_time": "2021-01-01T00:00:00Z"})), Some(1_609_459_200));
+        assert_eq!(end_epoch(&json!({})), None);
+    }
+
+    #[test]
+    fn exam_answerable_gates_iso_expiry_and_absent_started() {
+        let now = 1_700_000_000;
+        // started, open, future end → answerable.
+        assert!(exam_answerable(&json!({"is_started": true, "end_time": "2099-01-01T00:00:00Z"}), now));
+        // a PAST ISO end_time → not answerable even though is_closed is false (the bug this fixes).
+        assert!(!exam_answerable(&json!({"is_started": true, "is_closed": false, "end_time": "2000-01-01T00:00:00Z"}), now));
+        // absent is_started → v1 treats as not-started → skip.
+        assert!(!exam_answerable(&json!({"end_time": "2099-01-01T00:00:00Z"}), now));
+        // absent end_time → not past → answerable.
+        assert!(exam_answerable(&json!({"is_started": true}), now));
+    }
 }
