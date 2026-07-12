@@ -86,6 +86,72 @@ async fn live_llm() {
     assert!(ans.to_uppercase().contains('B'), "expected the letter B, got {ans:?}");
 }
 
+// ---- Phase 6: full monitor pipeline via the engine FFI (poll → detect → gate → sign → SignedIn) ----
+// Drives the REAL engine (Init/AddAccount/StartMonitoring) against a teacher-seeded RADAR rollcall
+// (radar signs with an empty body — no brute force). Seed + cleanup: scripts/_v2_rollcall_live.py.
+
+static MON_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+fn mon_events() -> &'static std::sync::Mutex<Vec<String>> {
+    MON_EVENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+extern "C" fn mon_collect(ptr: *const u8, len: usize) {
+    let b = unsafe { std::slice::from_raw_parts(ptr, len) };
+    mon_events().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+}
+fn mon_send(h: *mut std::ffi::c_void, cmd: &serde_json::Value) {
+    let s = cmd.to_string();
+    unsafe { crate::core_send(h, s.as_ptr(), s.len()) };
+}
+fn mon_wait<F: Fn(&serde_json::Value) -> bool>(pred: F, secs: u64) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        let hit = mon_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .find(&pred);
+        if hit.is_some() {
+            return hit;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    None
+}
+
+#[test] // plain #[test]: the engine FFI owns its OWN runtime — a #[tokio::test] nests runtimes → abort.
+#[ignore]
+fn live_monitor_pipeline() {
+    let base = env("TRON_BASE_URL");
+    let user = env("TRON_USER");
+    let pass = env("TRON_PASS");
+    mon_events().lock().unwrap().clear();
+    let h = crate::core_init(mon_collect);
+    let dir = std::env::temp_dir()
+        .join(format!("tron-live-{}", crate::config::new_id()))
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    mon_send(h, &serde_json::json!({"id":1,"cmd":"Init","data_dir":dir}));
+    mon_wait(|v| v["event"] == "Reply" && v["id"] == 1, 10);
+    // 1-student course → 0% present before signing, so drop the 15% gate; short countdown.
+    mon_send(h, &serde_json::json!({"id":2,"cmd":"UpdateConfig","patch":{"attendance_gate_percent":0.0,"countdown_secs":2}}));
+    mon_wait(|v| v["event"] == "Reply" && v["id"] == 2, 5);
+    mon_send(h, &serde_json::json!({"id":3,"cmd":"CreateVault","master_password":"pw"}));
+    mon_wait(|v| v["event"] == "Reply" && v["id"] == 3, 5);
+    mon_send(h, &serde_json::json!({"id":4,"cmd":"AddAccount","label":"stu","school":base,"username":user,"password":pass}));
+    mon_wait(|v| v["event"] == "Reply" && v["id"] == 4, 5);
+    mon_send(h, &serde_json::json!({"id":5,"cmd":"StartMonitoring"}));
+    mon_wait(|v| v["event"] == "Reply" && v["id"] == 5, 15);
+
+    let online = mon_wait(|v| v["event"] == "AccountStatus" && v["state"] == "online", 25);
+    println!("account online: {}", online.is_some());
+    let signed = mon_wait(|v| v["event"] == "SignedIn", 45);
+    println!("SignedIn event: {signed:?}");
+    unsafe { crate::core_free(h) };
+    assert!(signed.is_some(), "monitor did not detect+sign the seeded rollcall end-to-end");
+}
+
 // ---- Phase 4: auto-answer parity (needs a teacher-seeded live exam on 55379) ----
 // Seed + cleanup are driven by scripts/_v2_exam_live.py (teacher creates a 6-question known-answer exam).
 
