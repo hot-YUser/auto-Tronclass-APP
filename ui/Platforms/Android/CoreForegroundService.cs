@@ -3,6 +3,7 @@ using Android.Content;
 using Android.OS;
 using Android.Runtime;
 using AndroidX.Core.App;
+using Microsoft.Extensions.DependencyInjection;
 using System.Text.Json;
 using TronClass.Interop;
 
@@ -19,6 +20,7 @@ public class CoreForegroundService : Service
 {
     private const string ChannelId = "tronclass_monitor";
     private const int NotificationId = 1;
+    private ICore? _core;
 
     public override IBinder? OnBind(Intent? intent) => null;
 
@@ -35,15 +37,27 @@ public class CoreForegroundService : Service
         else
             StartForeground(NotificationId, notification);
 
-        Core.Instance.EventReceived += OnCoreEvent;
-        Core.Instance.Start();
+        // The UI boots the core; here we just resolve the same singleton (via the MAUI DI container)
+        // and mirror its heartbeat. BootAsync is idempotent — a safety net if the service outlives the UI.
+        _core = IPlatformApplication.Current?.Services.GetService<ICore>();
+        if (_core is not null)
+        {
+            _core.EventReceived += OnCoreEvent;
+            _ = _core.BootAsync(FileSystem.AppDataDirectory);
+        }
 
         return StartCommandResult.Sticky;
     }
 
+    public override void OnDestroy()
+    {
+        if (_core is not null) _core.EventReceived -= OnCoreEvent;
+        base.OnDestroy();
+    }
+
     private void OnCoreEvent(JsonElement ev)
     {
-        if (ev.GetProperty("event").GetString() != "Tick") return;
+        if (!ev.TryGetProperty("event", out var evName) || evName.GetString() != "Tick") return;
         var n = ev.GetProperty("n").GetInt64();
         global::Android.Util.Log.Info("tronclass", $"heartbeat tick {n}");
         var mgr = (NotificationManager)GetSystemService(NotificationService)!;
@@ -55,7 +69,7 @@ public class CoreForegroundService : Service
         // Set on the builder as statements: the chained setters are annotated nullable, and
         // the builder mutates in place, so this avoids the noisy null-deref warnings.
         var b = new NotificationCompat.Builder(this, ChannelId);
-        b.SetContentTitle("TronClass");
+        b.SetContentTitle("自動 Tronclass");
         b.SetContentText(text);
         b.SetSmallIcon(global::Android.Resource.Drawable.IcDialogInfo);
         b.SetOngoing(true);

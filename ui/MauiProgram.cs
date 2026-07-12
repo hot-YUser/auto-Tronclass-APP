@@ -1,4 +1,6 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using TronClass.Interop;
 
 namespace Ui;
 
@@ -14,6 +16,10 @@ public static class MauiProgram
 				fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");
 				fonts.AddFont("OpenSans-Semibold.ttf", "OpenSansSemibold");
 			});
+
+		// The FFI seam. Swap MockCore → NativeCore to drive the real Rust core (the UI is unchanged).
+		builder.Services.AddSingleton<ICore, MockCore>();
+		builder.Services.AddSingleton<MainPage>();
 
 #if DEBUG
 		builder.Logging.AddDebug();

@@ -1,17 +1,15 @@
-﻿using Microsoft.Extensions.DependencyInjection;
-
 namespace Ui;
 
 public partial class App : Application
 {
-	public App()
+	private readonly MainPage _main;
+
+	public App(MainPage main)
 	{
 		InitializeComponent();
+		_main = main;
 	}
 
-	protected override Window CreateWindow(IActivationState? activationState)
-	{
-		// Flow: Unlock → Accounts → (Add) / Dashboard, via a plain navigation stack.
-		return new Window(new NavigationPage(new UnlockPage()));
-	}
+	// Handoff scaffold: a single placeholder page on MockCore. The real four-tab shell is Fable's job.
+	protected override Window CreateWindow(IActivationState? activationState) => new(_main);
 }

@@ -3,33 +3,38 @@
 這一份是**定死的**：命令/事件 schema、能力旗標、兩個有時限流程的硬 UX 不變量。做錯這些會**不可逆地
 遺失資料或驚嚇使用者**。UI 的視覺長相是你的自由，但**這裡的行為與資料形狀不是**。
 
-以下用 pseudo-Rust enum 描述**契約語意**；確切的 wire 形式（csbindgen 型別化）由實作者定，只要保持
-**窄、穩、粗粒度**。欄位名可調，語意不可缺。
+下列命令/事件名與欄位＝**真 core 實際 wire**（對齊自程式碼 `engine.rs`/`monitor.rs`/`llm.rs`；`MockCore`
+照這個發，Fable 照這個綁）。線型：`{ "id": <num|null>, "cmd"|"event": "…", …欄位 }`。
+
+**信封（envelope）**：每則訊息都有 `id`。命令送出時帶一個遞增數字 `id`；core 以**同 `id` 的回覆**
+（`Reply` 或 `LoginResult`，`id` 為該數字）完成該次呼叫（`ICore.SendAsync` 回傳的 Task）。**主動事件的
+`id` 為 `null`**，帶 `event` 字串，走 `EventReceived`。
 
 ## 命令（UI → core）
 
 ```
-enum Command {
-  Init { data_dir },                 // 啟動 core：載入設定/狀態，回 CapabilityReport + StateChanged
-  Unlock { secret },                 // 解鎖保險庫（主密碼或平台密鑰庫提供的 key）
-  AddAccount { profile },            // 新增/更新一個帳號（含學校、憑證來源）
-  SwitchAccount { profile_id },      // 切換 active 帳號（或群組）
-  StartMonitoring,                   // 進入監控主迴圈（依排程/時段）
-  StopMonitoring,
-
-  // 點名有時限流程的使用者抉擇
-  SignNow { rollcall_id },           // 立即簽到（跳過剩餘倒數）
-  DeferSignIn { rollcall_id },       // 先不簽；轉入 PendingSignIn，之後可再 SignNow
-
-  // 答題有時限流程的使用者抉擇
-  SubmitNow { quiz_id },             // 立即送出目前答案（跳過剩餘倒數）
-  HoldAnswer { quiz_id },            // 保留 LLM 答案但暫緩送出（停止倒數，不自動送）
-  DiscardAnswer { quiz_id },         // 捨棄 LLM 答案（不送）
-  SetAnswer { quiz_id, subject_id, answer },  // 使用者手動改某題答案（見下方衝突/手改）
-
-  UpdateConfig { patch },            // 改設定（typed）
-  Shutdown,
-}
+// 每則命令 = { "id": <num>, "cmd": "<Name>", …欄位 }
+Init { data_dir }                    // 啟動 core：載入設定/狀態，回 Providers/Accounts/VaultState/Caps/StateChanged
+CreateVault { master_password }      // 首次建立保險庫
+Unlock { master_password }           // 主密碼解鎖
+UnlockWithKeystore {}                // 平台密鑰庫（生物辨識/免密碼）解鎖
+LockVault {}                         // 鎖回保險庫
+AddAccount { label, school, username, password }   // 新增帳號（school = 校代號或原始 base_url）
+SwitchAccount { account_id }
+DeleteAccount { account_id }
+Login { account_id }                 // 登入單一帳號（回 LoginResult）
+ImportCookies { account_id, cookies_json }         // 瀏覽器 cookie 登入後備
+SubmitCaptcha { account_id, text }   // 回覆 CaptchaChallenge 的驗證碼
+StartMonitoring {}  StopMonitoring {}
+SignNow { rollcall_id }              // 立即簽（跳過剩餘倒數；簽該活動全部參與帳號）
+DeferSignIn { rollcall_id }          // 先不簽 → PendingSignIn，之後可再 SignNow
+SubmitNow { quiz_id }                // 立即送
+HoldAnswer { quiz_id }               // 保留 LLM 答案但暫緩（停倒數）
+DiscardAnswer { quiz_id }            // 捨棄、不送
+SetAnswer { quiz_id, subject_id, answer }          // 手動改某題（衝突定案）
+SetLlmKey { key }                    // 設定 LLM 金鑰
+UpdateConfig { patch }               // typed 設定 patch
+Shutdown {}
 ```
 
 粒度要粗：一個「開始監控」而不是十個微命令。**穿過縫的命令種類越少越好。**
@@ -37,24 +42,31 @@ enum Command {
 ## 事件（core → UI，callback 推上來）
 
 ```
-enum Event {
-  CapabilityReport { caps },         // 平台能力旗標（見下）；啟動即發，變動可再發
-  StateChanged { monitor_state },    // idle / monitoring / offline / login_failed …
-  LogLine { level, text },           // 已遮蔽的日誌行（供 UI 日誌畫面）
-  Error { severity, code, message }, // 永不靜默吞錯；一律成事件上來
+// 每則事件 = { "id": null, "event": "<Name>", …欄位 }；回覆 = { "id": <num>, "event": "Reply"|"LoginResult", … }
+Reply { id, ok, error }                              // 命令的 id 相關回覆（error 為 null 即成功）
+LoginResult { id, ok, detail? , reason? }            // Login 的 id 相關回覆
+Tick { n }                                           // 每秒心跳（process-alive 證明）
+Caps { caps }                                        // 能力旗標（見下）；啟動即發，變動可再發
+StateChanged { state }                               // starting / idle / monitoring / login_failed …
+Providers { default_key, schools[] }                 // 學校登錄表（schools[] = {key,label,base_url,aliases,notes}）
+Accounts { active, accounts[] }                      // 帳號清單（accounts[] = {id,label,school_ref,username,device_id,is_teacher,course_id}）
+AccountStatus { account_id, state, error? }          // 單帳號 online / login_failed
+VaultState { exists, unlocked }
+CaptchaChallenge { account_id, image_b64 }           // 圖形驗證碼 → 顯示給使用者 → SubmitCaptcha
+LogLine { level, text }                              // 已遮蔽的日誌行
+Error { severity, code, message }                    // 永不靜默吞錯；一律成事件上來
 
-  // 點名
-  RollcallDetected { rollcall_id, kind, course, attendance_rate },
-  PendingSignIn { rollcall_id },     // 已偵測、達門檻，但使用者選擇先不簽（可隨時補簽）
-  Countdown { scope, id, remaining_secs, deadline },  // core 持有計時器，逐秒/定時發
-  SignedIn { rollcall_id, course, method },           // 已確認 on_call_fine
+// 點名
+RollcallDetected { rollcall_id, base_url, kind, course, attendance_rate, accounts[] }
+PendingSignIn { rollcall_id }                        // 達門檻但使用者選先不簽（可隨時補簽）
+Countdown { scope, id_, remaining_secs }             // scope="rollcall"|"quiz"；id_=活動id（避開信封 id）；core 持有計時器
+SignedIn { rollcall_id, account_id, course, method } // 已確認 on_call_fine（per-account）
 
-  // 答題
-  QuizPrepared { quiz_id, course, questions[], conflict_count, deadline },
-  ReasoningChunk { quiz_id, subject_id, text },       // LLM reasoning 串流（可展開觀看）
-  AnswerUpdated { quiz_id, subject_id, source, conflict },  // 某題答案變動（LLM 或使用者）
-  QuizSubmitted { quiz_id, result },                  // 送出結果（分數/狀態）
-}
+// 答題
+QuizPrepared { quiz_id, course, per_account[{account_id, questions[]}], conflict_count }
+ReasoningChunk { quiz_id, subject_id, text }         // LLM reasoning 串流（可展開觀看）
+AnswerUpdated { quiz_id, account_id, subject_id, source, conflict }  // 某題答案變動（LLM 或使用者）
+QuizSubmitted { quiz_id, account_id, result }        // 送出結果（per-account）
 ```
 
 **硬規矩：錯誤永不靜默。** LLM 連不上、登入失敗、送出被伺服器擋——一律以 `Error` 事件（帶可讀原因）
