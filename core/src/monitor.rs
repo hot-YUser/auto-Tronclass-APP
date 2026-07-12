@@ -503,7 +503,7 @@ async fn detect_vote(acc: &Arc<Account>, ep: &Endpoints, tx: &UnboundedSender<Mo
         }
         if let Ok(v) = get_json(&acc.client, &ep.votes_read(&aid)).await {
             let already = v.get("students").and_then(Value::as_array).map(|arr| {
-                arr.iter().any(|s| s.get("user_no").and_then(Value::as_str) == Some(acc.user_no.as_str()))
+                arr.iter().any(|s| s.get("user_no").and_then(Value::as_str).map(|u| u.eq_ignore_ascii_case(&acc.user_no)).unwrap_or(false))
             }).unwrap_or(false);
             if already {
                 voted.insert(aid); // cache so we don't re-read/re-cast

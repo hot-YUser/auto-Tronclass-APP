@@ -47,6 +47,24 @@ pub fn subject_id(s: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Serialize an id as a JSON **number** when it's a plain non-negative integer, else a string. The real
+/// TronClass submit endpoints REJECT string ids with HTTP 400 (confirmed live 2026-07: correct answers
+/// as strings → 400, as ints → 201); the offline fake accepted strings, hiding this. Vote letters
+/// (A, B, …) are not numeric ids, so they naturally stay strings.
+pub fn id_value(s: &str) -> Value {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = s.parse::<i64>() {
+            return Value::from(n);
+        }
+    }
+    Value::String(s.to_string())
+}
+
+/// `id_value` over a slice (e.g. `answer_option_ids`).
+pub fn id_values(ids: &[String]) -> Vec<Value> {
+    ids.iter().map(|s| id_value(s)).collect()
+}
+
 fn option_id(o: &Value) -> String {
     o.get("id")
         .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))

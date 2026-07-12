@@ -31,11 +31,15 @@ fn classify_response_table() {
     assert_eq!(classify_response(409, ""), Wrong);
     assert_eq!(classify_response(422, ""), Wrong);
     assert_eq!(classify_response(200, r#"{"success":false}"#), Wrong);
-    assert_eq!(classify_response(200, "just text no flag"), Wrong);
-    // Success: a 2xx with a success flag.
+    assert_eq!(classify_response(200, r#"{"message":"wrong number code"}"#), Wrong);
+    // Success: a 2xx with a success flag — OR any 2xx without a wrong/auth marker (v1 contract).
     assert_eq!(classify_response(200, r#"{"success":true}"#), Success);
     assert_eq!(classify_response(200, r#"{"is_success":true}"#), Success);
     assert_eq!(classify_response(200, r#"{"status":"success"}"#), Success);
+    // The REAL live accept body (2026-07): `{"id":…,"status":"on_call"}` — no success bool. v1 defaults a
+    // bare 2xx to Success; the old v2 default of Wrong silently rejected every real number sign.
+    assert_eq!(classify_response(200, r#"{"id":925957,"status":"on_call"}"#), Success);
+    assert_eq!(classify_response(200, "just text no flag"), Success);
 }
 
 // ===================== e2e (serialized via SEQ) =====================

@@ -56,6 +56,9 @@ mod r4_test;
 #[cfg(test)]
 mod r5_test;
 
+#[cfg(test)]
+mod live_test;
+
 use engine::Core;
 
 /// Start the core. `cb` is invoked (from runtime worker threads) with UTF-8 JSON event

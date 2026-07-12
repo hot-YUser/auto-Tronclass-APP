@@ -34,9 +34,20 @@ fn is_captcha_field(name: &str) -> bool {
     CAPTCHA_FIELDS.iter().any(|f| low.contains(f))
 }
 
+/// A public-cloud TronClass email login, extracted from the `<login-view>` web component. Its
+/// credentials POST plain to a discoverable endpoint (`{origin}/login?login=email`), so it logs in
+/// headlessly — no browser needed. Ground truth: v1 `tron_http.extract_public_cloud_email_login_form`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicCloudForm {
+    pub action: String,
+    pub fields: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginKind {
     PasswordForm(PasswordForm),
+    /// Public-cloud email SPA whose credentials POST to a discoverable endpoint — logs in headlessly.
+    PublicCloudEmail(PublicCloudForm),
     /// A password form guarded by an image captcha: carries the form, the captcha image URL, and the
     /// captcha input field name so the flow can grab the image and resubmit with the typed answer.
     Captcha { form: PasswordForm, image_url: String, captcha_field: String },
@@ -62,9 +73,18 @@ pub struct CaptchaPending {
 }
 
 /// Classify a login page by its features. Branch names describe the *page*, not any school.
-pub fn detect_login_kind(html: &str, _page_url: &str) -> LoginKind {
+pub fn detect_login_kind(html: &str, page_url: &str) -> LoginKind {
     let lower = html.to_lowercase();
     let form = find_password_form(html);
+
+    // Public-cloud email SPA: a `<login-view>` web component. Its credentials POST to a discoverable
+    // endpoint, so extract the form and log in headlessly (ground truth: v1
+    // extract_public_cloud_email_login_form). Checked first — this page has no server-rendered form.
+    if lower.contains("<login-view") {
+        if let Some(form) = extract_public_cloud_form(html, page_url) {
+            return LoginKind::PublicCloudEmail(form);
+        }
+    }
 
     // Captcha ONLY when the password form itself carries a captcha field AND a real captcha <img> is
     // present — not merely because page copy/JS mentions "captcha" (that false-blocks the many schools
@@ -138,6 +158,122 @@ fn find_password_form(html: &str) -> Option<PasswordForm> {
     None
 }
 
+/// Extract the public-cloud email login form from a `<login-view>` page (ground truth: v1
+/// `extract_public_cloud_email_login_form`). Body = the component's hidden inputs + `next`/`org_id`/
+/// `submit=login` (+`remember_me` when set); the caller appends `email`/`password`. `None` if the
+/// component isn't the expected email login.
+fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudForm> {
+    // Hidden inputs carried in the `email-login-hidden-tag` attribute (an HTML fragment).
+    let mut fields: Vec<(String, String)> = Vec::new();
+    if let Some(hidden) = attr_value(html, "email-login-hidden-tag") {
+        if let Ok(dom) = tl::parse(&hidden, tl::ParserOptions::default()) {
+            let parser = dom.parser();
+            if let Some(q) = dom.query_selector("input") {
+                for h in q.collect::<Vec<_>>() {
+                    let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else { continue };
+                    let Some(name) = tag.attributes().get("name").flatten() else { continue };
+                    let val = tag.attributes().get("value").flatten().map(|b| b.as_utf8_str().to_string()).unwrap_or_default();
+                    fields.push((name.as_utf8_str().to_string(), val));
+                }
+            }
+        }
+    }
+
+    // `:email-login-form` is a JSON blob carrying next / org_id / remember defaults.
+    let form_json: serde_json::Value = attr_value(html, ":email-login-form")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let json_str = |k: &str| form_json.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // next: the hidden input, else the JSON, else the page's `?next=`.
+    let mut next = fields.iter().find(|(n, _)| n == "next").map(|(_, v)| v.clone()).unwrap_or_default();
+    if next.is_empty() {
+        next = json_str("next");
+    }
+    if next.is_empty() {
+        next = query_param(page_url, "next").unwrap_or_default();
+    }
+    // org_id: the JSON, else the `:org-id` attribute (a literal "0" means "none").
+    let mut org_id = json_str("org_id");
+    if org_id.is_empty() {
+        let a = attr_value(html, ":org-id").unwrap_or_default();
+        org_id = if a.trim() == "0" { String::new() } else { a.trim().to_string() };
+    }
+
+    // setdefault (keep an existing hidden input; add ours only if absent) — matches v1.
+    if !fields.iter().any(|(n, _)| n == "next") {
+        fields.push(("next".into(), next.clone()));
+    }
+    if !fields.iter().any(|(n, _)| n == "org_id") {
+        fields.push(("org_id".into(), org_id));
+    }
+    fields.push(("submit".into(), "login".into()));
+    let remember = form_json.get("remember").and_then(|v| v.as_bool()).unwrap_or(false)
+        || form_json.get("remember_me").and_then(|v| v.as_bool()).unwrap_or(false);
+    if remember && !fields.iter().any(|(n, _)| n == "remember_me") {
+        fields.push(("remember_me".into(), "true".into()));
+    }
+
+    Some(PublicCloudForm { action: public_cloud_email_url(page_url, &next), fields })
+}
+
+/// The public-cloud email login POST URL: `{origin}/login?login=email` (+ `next` when set).
+fn public_cloud_email_url(page_url: &str, next: &str) -> String {
+    let origin = reqwest::Url::parse(page_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| format!("{}://{}", u.scheme(), h)))
+        .unwrap_or_default();
+    if next.is_empty() {
+        format!("{origin}/login?login=email")
+    } else {
+        format!("{origin}/login?next={}&login=email", urlencode(next))
+    }
+}
+
+/// One `?key=` value from a URL. ponytail: a tiny scan — enough for the single `next` param.
+fn query_param(url: &str, key: &str) -> Option<String> {
+    reqwest::Url::parse(url).ok()?.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
+}
+
+/// Read a (possibly `:`-prefixed) HTML attribute's value by name, HTML-unescaping entities.
+/// ponytail: a light forward scanner, not a full attribute parser — sized for the `<login-view>` tag.
+fn attr_value(html: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(p) = html[from..].find(name) {
+        let idx = from + p;
+        from = idx + name.len();
+        let rest = html[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let rest = rest.trim_start();
+        let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') else { continue };
+        if let Some(end) = rest[1..].find(quote) {
+            return Some(html_unescape(&rest[1..1 + end]));
+        }
+    }
+    None
+}
+
+/// Minimal HTML entity unescape for attribute values (`&amp;` last to avoid double-decoding).
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"").replace("&#34;", "\"")
+        .replace("&#39;", "'").replace("&apos;", "'")
+        .replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&#x2F;", "/").replace("&#47;", "/")
+        .replace("&amp;", "&")
+}
+
+/// Percent-encode a query value (RFC 3986 unreserved pass through).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The captcha image URL: an `<img>` whose `src` looks like a captcha, else the first `<img>` that
 /// isn't obviously page chrome (logo/banner/icon/favicon). `None` ⇒ no captcha image on the page.
 fn find_captcha_image(html: &str) -> Option<String> {
@@ -198,6 +334,20 @@ pub async fn login(
 
             // Same client/jar carries the CSRF+session cookies from the GET into this POST.
             if let Err(e) = client.post(&action_url).form(&fields).send().await {
+                return LoginOutcome::Failed(format!("post: {e}"));
+            }
+            if verify_session(client, endpoints).await {
+                LoginOutcome::Ok
+            } else {
+                LoginOutcome::Failed("login failed: credentials rejected or session not established".into())
+            }
+        }
+        LoginKind::PublicCloudEmail(form) => {
+            // action is already absolute (built from the page origin); fields carry the hidden inputs.
+            let mut fields = form.fields;
+            fields.push(("email".to_string(), username.to_string()));
+            fields.push(("password".to_string(), password.to_string()));
+            if let Err(e) = client.post(&form.action).form(&fields).send().await {
                 return LoginOutcome::Failed(format!("post: {e}"));
             }
             if verify_session(client, endpoints).await {
@@ -270,18 +420,12 @@ pub fn encode_base64(input: &[u8]) -> String {
     out
 }
 
-/// Capture the account's own TronClass user id after auth (for per-account recheck / my_present).
-/// Returns empty on failure — recheck then degrades to whole-class/top-level, never "any entry".
-/// `// ponytail:` the exact source (login response vs `/api/user`) needs a real tenant to confirm.
-pub async fn fetch_user_no(client: &Client, endpoints: &Endpoints) -> String {
-    let Ok(resp) = client.get(endpoints.current_user()).send().await else { return String::new() };
-    let Ok(v) = resp.json::<serde_json::Value>().await else { return String::new() };
-    ["user_no", "user_id", "id"]
-        .iter()
-        .find_map(|k| {
-            v.get(*k).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
-        })
-        .unwrap_or_default()
+/// The account's own identity for per-account recheck / my_present — the **login username**, lowercased.
+/// Confirmed against a real tenant (2026-07): a rollcall roster's `student_rollcalls[].user_no` is the
+/// login id itself (e.g. the account email), NOT any numeric id — and `/api/user` returns `{message}`
+/// here, so it is never a reliable source. Matches v1 `_current_user_no` (the active profile's `user`).
+pub fn user_no_from_username(username: &str) -> String {
+    username.trim().to_lowercase()
 }
 
 /// Content-based session check — NEVER status-code alone. A failed/expired login commonly returns
@@ -313,5 +457,34 @@ fn resolve_action(page_url: &str, action: &str) -> String {
     match reqwest::Url::parse(page_url).and_then(|base| base.join(action)) {
         Ok(u) => u.to_string(),
         Err(_) => action.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trimmed `<login-view>` mirroring the real www.tronclass.com.tw markup (single-quoted attrs).
+    const LOGIN_VIEW: &str = r#"<html><body><div id="app"><login-view token="abc123" next=""
+        email-login-hidden-tag='<input id="next" name="next" type="hidden" value="">'
+        :email-login-form='{"captcha_code": "", "email": "", "next": null, "org_id": "", "password": "", "remember": false, "submit": false}'
+        :org-id='0'></login-view></div></body></html>"#;
+
+    #[test]
+    fn public_cloud_email_detected_and_posts_plain() {
+        let kind = detect_login_kind(LOGIN_VIEW, "https://www.tronclass.com.tw/login");
+        let LoginKind::PublicCloudEmail(form) = kind else { panic!("expected PublicCloudEmail, got {kind:?}") };
+        assert_eq!(form.action, "https://www.tronclass.com.tw/login?login=email");
+        // body carries the hidden `next`, an `org_id` (empty, "0" dropped), and submit=login.
+        assert!(form.fields.contains(&("next".into(), "".into())));
+        assert!(form.fields.contains(&("org_id".into(), "".into())));
+        assert!(form.fields.contains(&("submit".into(), "login".into())));
+        assert!(!form.fields.iter().any(|(n, _)| n == "remember_me"), "remember=false → no remember_me");
+    }
+
+    #[test]
+    fn login_view_less_email_spa_still_defers() {
+        // No <login-view> → the old browser-fallback path is unchanged.
+        assert!(matches!(detect_login_kind(r#"<div id="app"></div>"#, "u"), LoginKind::EmailSpa));
     }
 }

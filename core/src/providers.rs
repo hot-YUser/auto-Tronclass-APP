@@ -78,10 +78,6 @@ impl Endpoints {
     pub fn current_semester(&self) -> String {
         format!("{}/api/current-semester-info", self.base)
     }
-    /// The logged-in account's own profile — source of its `user_no` for per-account recheck.
-    pub fn current_user(&self) -> String {
-        format!("{}/api/user", self.base)
-    }
     pub fn rollcalls(&self) -> String {
         format!("{}/api/radar/rollcalls?api_version=1.1.0", self.base)
     }

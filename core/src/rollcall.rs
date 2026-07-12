@@ -85,7 +85,7 @@ fn my_present(v: &Value, user_no: &str) -> bool {
         .map(|a| {
             a.iter().any(|e| {
                 let uid = e.get("user_no").or_else(|| e.get("user_id")).and_then(Value::as_str);
-                uid == Some(user_no) && entry_fine(e)
+                uid.map(|u| u.eq_ignore_ascii_case(user_no)).unwrap_or(false) && entry_fine(e)
             })
         })
         .unwrap_or(false)
@@ -150,22 +150,70 @@ pub fn classify_response(status: u16, body: &str) -> CodeResult {
         return CodeResult::Wrong; // this code is wrong, others may be right
     }
     if (200..300).contains(&status) {
-        let low = body.to_lowercase();
-        if low.contains("<form") && low.contains("login") {
-            return CodeResult::Fatal; // a 200 that is really the login page = session expired
-        }
-        if is_success_body(body) {
-            return CodeResult::Success;
-        }
-        return CodeResult::Wrong; // 2xx without a success flag → treat as a rejected code
+        return classify_number_2xx(body);
     }
     CodeResult::Wrong
 }
 
-fn is_success_body(body: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<Value>(body) else { return false };
-    ["success", "is_success", "ok"].iter().any(|k| v.get(*k).and_then(Value::as_bool) == Some(true))
-        || v.get("status").and_then(Value::as_str) == Some("success")
+// Number-answer body markers (v1 `number_rollcall`), matched case-insensitively against body+message.
+const SUCCESS_MARKERS: &[&str] =
+    &["success", "ok", "on_call", "on_call_fine", "accepted", "completed", "已完成", "成功", "點名成功", "簽到成功"];
+const WRONG_CODE_MARKERS: &[&str] =
+    &["wrong", "incorrect", "invalid number", "invalid code", "not match", "mismatch", "錯誤", "錯碼", "不正確", "失敗", "不存在", "過期"];
+const UNAUTHORIZED_MARKERS: &[&str] =
+    &["unauthorized", "forbidden", "login", "sign in", "session expired", "未登入", "請登入", "登入逾時", "權限"];
+
+/// Classify a 2xx number-answer body — faithful port of v1 `classify_number_response`'s 2xx branch.
+/// Confirmed live (2026-07): a real accept is `{"id":…,"status":"on_call"}` with NO success bool, so a
+/// 2xx **defaults to Success** (the old v2 default of Wrong silently rejected every real sign). Empty →
+/// Success; auth markers → Fatal; explicit `success` bool wins; wrong markers / `success:false` → Wrong.
+fn classify_number_2xx(body: &str) -> CodeResult {
+    let text = body.trim();
+    if text.is_empty() {
+        return CodeResult::Success;
+    }
+    let payload: Option<Value> = serde_json::from_str::<Value>(text).ok().filter(Value::is_object);
+    let message = payload.as_ref().map(payload_message).unwrap_or_default();
+    let combined = format!("{text} {message}").to_lowercase();
+
+    if has_marker(&combined, UNAUTHORIZED_MARKERS) {
+        return CodeResult::Fatal; // a 2xx that is really the login page / an auth error = session expired
+    }
+    let success_flag = payload.as_ref().and_then(|p| payload_bool(p, &["success", "ok", "is_success"]));
+    if success_flag == Some(true) {
+        return CodeResult::Success;
+    }
+    if has_marker(&combined, WRONG_CODE_MARKERS) {
+        return CodeResult::Wrong;
+    }
+    if success_flag == Some(false) {
+        return CodeResult::Wrong;
+    }
+    let marker_text = if payload.is_some() { message.to_lowercase() } else { combined };
+    if has_marker(&marker_text, SUCCESS_MARKERS) {
+        return CodeResult::Success;
+    }
+    CodeResult::Success // v1's 2xx default
+}
+
+/// The human message a payload carries (v1 `_payload_message`) — the first non-empty of these keys.
+fn payload_message(p: &Value) -> String {
+    ["message", "msg", "error", "error_description", "detail", "status"]
+        .iter()
+        .find_map(|k| match p.get(*k) {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn payload_bool(p: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|k| p.get(*k).and_then(Value::as_bool))
+}
+
+fn has_marker(text_lower: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|m| text_lower.contains(m))
 }
 
 /// The token every sign type's auth-lost `Err` carries, so `is_auth_lost` recognises it (R4.1 #2).

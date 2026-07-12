@@ -556,8 +556,8 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
         for (meta, base_url, password, cookies) in accts {
             match authed_client(&base_url, &meta.username, &password, &cookies).await {
                 Ok((client, new_cookies)) => {
-                    // Capture the account's own user id for per-account recheck (my_present).
-                    let user_no = login::fetch_user_no(&client, &Endpoints::derive(&base_url)).await;
+                    // The account's own identity for per-account recheck (my_present) = its login username.
+                    let user_no = login::user_no_from_username(&meta.username);
                     emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": meta.id, "state": "online" }));
                     refreshed.push((meta.id.clone(), new_cookies));
                     monitor_accounts.push(monitor::Account {
