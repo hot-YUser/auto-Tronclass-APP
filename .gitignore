@@ -27,3 +27,4 @@
 .idea/
 *.user
 .DS_Store
+/core/generated/

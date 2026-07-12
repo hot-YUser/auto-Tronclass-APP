@@ -4,9 +4,11 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
 
-    let out = "../ui/Interop/NativeMethods.g.cs";
+    // The UI lives in a separate sibling repo (…-UI) that consumes the core as a black box, so we
+    // emit the bindings into the core's own tree; sync-core.ps1 (UI side) copies this into ui/Interop.
+    let out = "generated/NativeMethods.g.cs";
     if let Some(dir) = std::path::Path::new(out).parent() {
-        std::fs::create_dir_all(dir).expect("create ui/Interop");
+        std::fs::create_dir_all(dir).expect("create core/generated");
     }
 
     csbindgen::Builder::default()

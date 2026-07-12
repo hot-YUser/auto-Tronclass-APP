@@ -51,13 +51,12 @@ LLM endpoint; no real NIM calls in tests.
   `src/config.rs` (metadata + typed settings + operating hours), `src/secrets.rs` (vault),
   `src/keystore.rs` (unlock layer), `src/redaction.rs` (single audited event/log chokepoint),
   `src/login.rs` (feature detection + captcha), `src/protocol.rs` (commands), `src/fake.rs` (fake
-  server). `build.rs` runs csbindgen → `ui/Interop/NativeMethods.g.cs`.
-- `ui/` — .NET MAUI app (net11.0 android + windows). `Interop/Core.cs` is the whole C# side of the
-  seam; dumb-view screens in `Pages/` (Unlock → Accounts → AddAccount → Dashboard);
-  `Platforms/Android/CoreForegroundService.cs` is the keepalive service.
+  server). `build.rs` runs csbindgen → `core/generated/NativeMethods.g.cs` (handed to the UI repo).
+- **The UI is a separate sibling repo** — `../auto-tronclass-rollcall-answer-UI` (the .NET MAUI app).
+  It consumes this core ONLY as a prebuilt binary (its `native/`); its `sync-core.ps1` pulls the
+  dll/.so + FFI bindings from here. **No UI source lives in this repo** — the core is a black box.
 - `smoke/` — headless C# console that drives the account+login flow over P/Invoke (CI-able, no GUI).
 - `build-core.ps1` — builds the native core (Windows dll / all four Android ABIs).
-- `package-windows.ps1` — Windows distribution: portable exe and/or signed MSIX.
 
 ## Prereqs
 
@@ -75,9 +74,11 @@ cargo test --manifest-path core/Cargo.toml
 cargo run --manifest-path core/Cargo.toml --features fakeserver --bin fake_tronclass   # terminal A
 dotnet run --project smoke -- http://127.0.0.1:8779                                      # terminal B → SEAM SMOKE PASS
 
-# 3. Windows app — portable
-pwsh ./build-core.ps1                        # builds tronclass_core.dll
-dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0
+# 3. The app UI lives in the sibling repo ../auto-tronclass-rollcall-answer-UI:
+pwsh ./build-core.ps1                        # builds tronclass_core.dll here
+#   then, in ../auto-tronclass-rollcall-answer-UI:
+#     ./sync-core.ps1                         # pull the fresh dll/.so + bindings
+#     dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0
 ```
 
 **Using it (the slice-1 flow):** launch → *Create vault* (set a master password) → *Add account*
