@@ -219,17 +219,20 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
     Some(PublicCloudForm { action: public_cloud_email_url(page_url, &next), fields })
 }
 
-/// The public-cloud email login POST URL: `{origin}/login?login=email` (+ `next` when set).
+/// The public-cloud email login POST URL: `{origin}/login?login=email` (+ `next` when set). Built on
+/// `reqwest::Url` so the query is percent-encoded for us (v1 order: `next` before `login`).
 fn public_cloud_email_url(page_url: &str, next: &str) -> String {
-    let origin = reqwest::Url::parse(page_url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| format!("{}://{}", u.scheme(), h)))
-        .unwrap_or_default();
-    if next.is_empty() {
-        format!("{origin}/login?login=email")
-    } else {
-        format!("{origin}/login?next={}&login=email", urlencode(next))
+    let Ok(mut u) = reqwest::Url::parse(page_url).and_then(|b| b.join("/login")) else {
+        return "/login?login=email".to_string();
+    };
+    {
+        let mut q = u.query_pairs_mut();
+        if !next.is_empty() {
+            q.append_pair("next", next);
+        }
+        q.append_pair("login", "email");
     }
+    u.into()
 }
 
 /// One `?key=` value from a URL. ponytail: a tiny scan — enough for the single `next` param.
@@ -255,25 +258,15 @@ fn attr_value(html: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Minimal HTML entity unescape for attribute values (`&amp;` last to avoid double-decoding).
+/// Unescape the entities that can appear in an HTML **attribute** value (`&amp;` + the quote forms);
+/// `<`/`>` don't need escaping in attributes, so they're intentionally omitted. `&amp;` goes last so a
+/// literal `&amp;quot;` isn't double-decoded.
 fn html_unescape(s: &str) -> String {
-    s.replace("&quot;", "\"").replace("&#34;", "\"")
-        .replace("&#39;", "'").replace("&apos;", "'")
-        .replace("&lt;", "<").replace("&gt;", ">")
-        .replace("&#x2F;", "/").replace("&#47;", "/")
+    s.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
         .replace("&amp;", "&")
-}
-
-/// Percent-encode a query value (RFC 3986 unreserved pass through).
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// The captcha image URL: an `<img>` whose `src` looks like a captcha, else the first `<img>` that

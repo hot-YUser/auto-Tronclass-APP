@@ -198,11 +198,10 @@ pub fn missing_subjects(subjects: &[Value], answers: &std::collections::HashMap<
 /// The real exam distribute puts the question in `description`; reading only `content` gave an EMPTY
 /// stem (the LLM saw options with no question and answered nothing) — confirmed live 2026-07.
 fn subject_stem(subject: &Value) -> &str {
-    subject
-        .get("description")
-        .or_else(|| subject.get("content"))
-        .or_else(|| subject.get("stem"))
-        .and_then(Value::as_str)
+    // v1 `description or content or stem` — a null/empty field falls through (not "present but blank").
+    ["description", "content", "stem"]
+        .iter()
+        .find_map(|k| subject.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()))
         .unwrap_or("")
 }
 
@@ -345,12 +344,10 @@ pub fn exam_subject_entry(subject: &Value, answer: &Answer) -> Value {
     e
 }
 
-/// A subject's `parent_id` as a string whether the server sent it as a number or a string; `None` when
-/// absent/null (a top-level subject).
+/// A subject's `parent_id` int-or-string; `None` when absent/null (a top-level subject).
 fn parent_id_str(subject: &Value) -> Option<String> {
-    subject
-        .get("parent_id")
-        .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+    let s = json_id_string(subject.get("parent_id"));
+    (!s.is_empty()).then_some(s)
 }
 
 /// `[{sort:i, content}]` — 0-based per-blank (first pass; the resubmit overlay preserves the review's raw sort).
