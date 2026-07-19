@@ -1074,7 +1074,9 @@ fn on_quiz_prepared(
     }
     emit_quiz_prepared(cb, q);
     let conflicts: usize = q.conflicts.values().map(|s| s.len()).sum();
-    if conflicts == 0 {
+    // Same `held` gate as on_quiz_set_answer: a re-prepare (R3c retry) of a quiz the user already held
+    // must not re-arm the auto-submit countdown behind their back.
+    if conflicts == 0 && !q.held {
         q.countdown_deadline = Some(Instant::now() + Duration::from_secs(cfg.countdown_secs));
     }
 }
@@ -1143,7 +1145,10 @@ fn on_quiz_set_answer(
     emit(cb, &json!({ "id": null, "event": "AnswerUpdated", "quiz_id": quiz_id,
                       "account_id": account_id, "subject_id": subject_id, "source": "user", "conflict": false }));
     let conflicts: usize = q.conflicts.values().map(|s| s.len()).sum();
-    if conflicts == 0 && q.countdown_deadline.is_none() && !q.acted && !q.discarded {
+    // `held` gates the re-arm: once the user held this quiz, resolving a conflict must NOT restart the
+    // auto-submit countdown (only an explicit SubmitNow may). Without this, hold-then-resolve silently
+    // re-armed and auto-submitted — overriding the user's decision on the one path that acts for them.
+    if conflicts == 0 && q.countdown_deadline.is_none() && !q.held && !q.acted && !q.discarded {
         q.countdown_deadline = Some(Instant::now() + Duration::from_secs(cfg.countdown_secs));
     }
 }
@@ -1453,5 +1458,87 @@ mod tests {
         assert!(!exam_answerable(&json!({"end_time": "2099-01-01T00:00:00Z"}), now));
         // absent end_time → not past → answerable.
         assert!(exam_answerable(&json!({"is_started": true}), now));
+    }
+
+    extern "C" fn noop_cb(_: *const u8, _: usize) {}
+
+    fn cfg_countdown(secs: u64) -> MonitorConfig {
+        MonitorConfig {
+            countdown_secs: secs,
+            gate_percent: 15.0,
+            llm_endpoint: String::new(),
+            llm_model: String::new(),
+            llm_key: None,
+            llm_max_tokens: 0,
+            max_answer_reask: 0,
+            prepare_retry_budget_secs: 0,
+            autoanswer_types: vec![],
+            enable_llm_tools: false,
+            max_tool_iterations: 0,
+            resubmit_for_correct: false,
+            radar_strategy: vec![],
+            number_concurrency: 1,
+            number_min_concurrency: 1,
+            number_cooldown_ms: 0,
+            number_max_cooldowns: 0,
+            poll_idle_secs: 5,
+            quiz_detect_secs: 45,
+            operating: crate::config::Operating::default(),
+            tz_offset_minutes: 0,
+        }
+    }
+
+    /// A single-account quiz with one unresolved conflict and no live countdown — the exact state
+    /// after a user holds a paper that still has a conflict.
+    fn quiz_with_conflict() -> (HashMap<ActivityKey, QuizActivity>, ActivityKey) {
+        let key = ("http://x".to_string(), "quiz:exam".to_string(), "act1".to_string());
+        let mut conflicts: Map<String, HashSet<String>> = Map::new();
+        conflicts.insert("acc1".to_string(), HashSet::from(["subj1".to_string()]));
+        let q = QuizActivity {
+            source: Source::Exam,
+            course: String::new(),
+            course_id: String::new(),
+            activity_id: "act1".to_string(),
+            stem: String::new(),
+            participants: HashSet::from(["acc1".to_string()]),
+            detect_at: None,
+            prepare_started: true,
+            prepare_deadline: None,
+            instance_id: String::new(),
+            subjects: vec![],
+            shared: Map::new(),
+            overrides: Map::new(),
+            conflicts,
+            allow_retake: false,
+            reveal: false,
+            countdown_deadline: None,
+            held: false,
+            discarded: false,
+            acted: false,
+            submitted: HashSet::new(),
+        };
+        let mut quizzes = HashMap::new();
+        quizzes.insert(key.clone(), q);
+        (quizzes, key)
+    }
+
+    #[test]
+    fn held_quiz_does_not_rearm_countdown_when_conflict_resolves() {
+        let (mut quizzes, key) = quiz_with_conflict();
+        quizzes.get_mut(&key).unwrap().held = true; // user held while a conflict was still open
+        let cfg = cfg_countdown(15);
+        on_quiz_set_answer(&mut quizzes, &cfg, noop_cb, "act1", "acc1", "subj1", json!("x"));
+        let q = quizzes.get(&key).unwrap();
+        assert!(q.conflicts.is_empty(), "the conflict is resolved");
+        assert!(q.countdown_deadline.is_none(), "a HELD quiz must not re-arm auto-submit — only SubmitNow may");
+    }
+
+    #[test]
+    fn unheld_quiz_rearms_countdown_when_conflict_resolves() {
+        let (mut quizzes, key) = quiz_with_conflict(); // held = false
+        let cfg = cfg_countdown(15);
+        on_quiz_set_answer(&mut quizzes, &cfg, noop_cb, "act1", "acc1", "subj1", json!("x"));
+        let q = quizzes.get(&key).unwrap();
+        assert!(q.countdown_deadline.is_some(), "an un-held quiz re-arms once its last conflict clears");
     }
 }
