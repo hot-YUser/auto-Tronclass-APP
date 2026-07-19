@@ -4,12 +4,12 @@ Cross-platform TronClass client (rollcall + LLM-assisted answering). Rust core (
 logic) + .NET MAUI dumb view, joined by one in-process FFI seam. See `docs/` for the spec and
 `AGENTS.md` for the ground rules. Licensed AGPL-3.0-or-later.
 
-## Status: slice 4 — core feature-complete (Phase A done)
+## Status: core feature-complete + MAUI UI in-repo (Phase C)
 
 Slices 0–3 are done (FFI seam on .NET **MAUI 11** preview; vault; registry; accounts; real login;
 multi-account monitoring; four rollcall types; the whole auto-answer subsystem + LLM). Slice 4 is the
 last stop of Phase A — filling the miscellaneous gaps that make the core feature-complete, still
-**headless / command-driven** (UI paused until a later phase):
+**headless / command-driven** (the MAUI UI in `ui/` now drives it — see Layout below):
 
 - **settings system** — every tuning knob is typed in `Settings`, runtime-patchable via `UpdateConfig`,
   persisted: `llm_max_tokens` (`0` → safe 16384), the radar strategy chain, number brute-force
@@ -51,10 +51,11 @@ LLM endpoint; no real NIM calls in tests.
   `src/config.rs` (metadata + typed settings + operating hours), `src/secrets.rs` (vault),
   `src/keystore.rs` (unlock layer), `src/redaction.rs` (single audited event/log chokepoint),
   `src/login.rs` (feature detection + captcha), `src/protocol.rs` (commands), `src/fake.rs` (fake
-  server). `build.rs` runs csbindgen → `core/generated/NativeMethods.g.cs` (handed to the UI repo).
-- **The UI is a separate sibling repo** — `../auto-tronclass-rollcall-answer-UI` (the .NET MAUI app).
-  It consumes this core ONLY as a prebuilt binary (its `native/`); its `sync-core.ps1` pulls the
-  dll/.so + FFI bindings from here. **No UI source lives in this repo** — the core is a black box.
+  server). `build.rs` runs csbindgen → `ui/Interop/NativeMethods.g.cs`.
+- `ui/` — the .NET MAUI app (Windows + Android heads), calling the core over the P/Invoke seam
+  (`Interop/`: `ICore` the seam · `NativeCore` real FFI · `MockCore` design-time fake · `NativeMethods.g.cs`).
+  `Ui.csproj` references the native library from `core/target` + `core/jniLibs`; design-time preview
+  runs entirely on `MockCore`, no native library needed.
 - `smoke/` — headless C# console that drives the account+login flow over P/Invoke (CI-able, no GUI).
 - `build-core.ps1` — builds the native core (Windows dll / all four Android ABIs).
 
@@ -74,11 +75,9 @@ cargo test --manifest-path core/Cargo.toml
 cargo run --manifest-path core/Cargo.toml --features fakeserver --bin fake_tronclass   # terminal A
 dotnet run --project smoke -- http://127.0.0.1:8779                                      # terminal B → SEAM SMOKE PASS
 
-# 3. The app UI lives in the sibling repo ../auto-tronclass-rollcall-answer-UI:
-pwsh ./build-core.ps1                        # builds tronclass_core.dll here
-#   then, in ../auto-tronclass-rollcall-answer-UI:
-#     ./sync-core.ps1                         # pull the fresh dll/.so + bindings
-#     dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0
+# 3. Build the native core, then the MAUI Windows head (design-time MockCore preview needs neither):
+pwsh ./build-core.ps1                                      # → core/target/release/tronclass_core.dll
+dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0
 ```
 
 **Using it (the slice-1 flow):** launch → *Create vault* (set a master password) → *Add account*
@@ -111,24 +110,24 @@ Then double-click `Ui_1.0.0.0_x64.msix`. Without the trust step the install fail
 ### Android — runtime-proven keepalive
 
 ```sh
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-pwsh ./build-core.ps1 -Head android          # cargo-ndk → core/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}/libtronclass_core.so
+rustup target add aarch64-linux-android x86_64-linux-android
+pwsh ./build-core.ps1 -Head android          # cargo-ndk → core/jniLibs/{arm64-v8a,x86_64}/libtronclass_core.so
 # .NET 11 preview's android workload compiles against API 37, which isn't in the default SDK channel:
 dotnet build ui/Ui.csproj -t:InstallAndroidDependencies -f net11.0-android -p:AcceptAndroidSDKLicenses=true
 # Build a directly-installable APK (Debug uses fast-deployment, so embed assemblies for adb install):
 dotnet build ui/Ui.csproj -f net11.0-android -c Debug -p:EmbedAssembliesIntoApk=true
-adb install -r -g ui/bin/Debug/net11.0-android/com.tronclass.skeleton-Signed.apk
-adb shell monkey -p com.tronclass.skeleton -c android.intent.category.LAUNCHER 1
+adb install -r -g ui/bin/Debug/net11.0-android/com.autotronclass.app-Signed.apk
+adb shell monkey -p com.autotronclass.app -c android.intent.category.LAUNCHER 1
 adb shell input keyevent KEYCODE_HOME                # background it
 adb shell dumpsys battery unplug && adb shell dumpsys deviceidle force-idle   # force Doze
 adb logcat -s tronclass                              # heartbeat ticks keep coming → process held alive
 ```
 
-The APK packages **all four ABIs** (arm64-v8a / armeabi-v7a / x86_64 / x86). .NET 11 preview's
-CoreCLR-on-Android only ships 64-bit runtime packs, so the csproj sets `UseMonoRuntime=true` to
-include the 32-bit ABIs; revisit at GA. Verified on an API-36 x86_64 emulator: the heartbeat keeps
-ticking (1/s) while backgrounded **and** under forced deep Doze, same pid throughout — the foreground
-service holds the process. Use `10.0.2.2` as the base_url host from an emulator to reach the fake server.
+The APK packages **arm64-v8a + x86_64** (64-bit only). .NET 11 dropped the Mono-on-Android runtime
+(NETSDK1242) and CoreCLR-on-Android ships 64-bit packs only; 32-bit Android is effectively dead
+(Google Play has required 64-bit since 2019). Verified on an API-36 x86_64 emulator: the heartbeat
+keeps ticking (1/s) while backgrounded **and** under forced deep Doze, same pid throughout — the
+foreground service holds the process. Use `10.0.2.2` as the base_url host from an emulator to reach the fake server.
 
 > Honesty ceiling: emulator + forced Doze proves the *mechanism*. Real all-day survival on a
 > physical device under OEM battery-killers is not proven here — and API 35+ caps `dataSync`

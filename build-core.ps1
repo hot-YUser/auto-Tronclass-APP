@@ -28,10 +28,10 @@ else {
             $ndk = Get-ChildItem $ndkBase -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
             if ($ndk) { $env:ANDROID_NDK_HOME = $ndk.FullName }
         }
-        # All four Android ABIs. cargo-ndk writes jniLibs/<abi>/libtronclass_core.so — the
-        # layout AndroidNativeLibrary wants. arm64-v8a/x86_64 = modern; armeabi-v7a/x86 = legacy.
-        cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 -o jniLibs build --release
-        Write-Host "android: core/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}/libtronclass_core.so ready"
+        # Both 64-bit ABIs — exactly what Ui.csproj packages. .NET 11 is 64-bit-only on Android
+        # (Mono dropped, NETSDK1242). cargo-ndk writes jniLibs/<abi>/libtronclass_core.so.
+        cargo ndk -t arm64-v8a -t x86_64 -o jniLibs build --release
+        Write-Host "android: core/jniLibs/{arm64-v8a,x86_64}/libtronclass_core.so ready"
     }
     finally { Pop-Location }
 }

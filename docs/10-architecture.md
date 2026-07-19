@@ -125,10 +125,10 @@ Rust core 對每個平台都出**同一份**領域邏輯；沒有平台專屬功
 
 | 平台 | 架構 | 備註 |
 |---|---|---|
-| Android | **arm64-v8a / armeabi-v7a / x86_64 / x86**（四種全出） | cargo-ndk 交叉編譯；模擬器用 x86_64、實機多為 arm64 |
+| Android | **arm64-v8a / x86_64**（64-bit） | cargo-ndk 交叉編譯；模擬器用 x86_64、實機多為 arm64 |
 | Desktop（Windows / macOS / Linux） | x64 + arm64 | **x86 桌面不做** |
 | iOS | arm64 | 需 Mac build host |
 | Linux | x64 + arm64（armv7 視需要） | Avalonia backend head |
 
-註（.NET 11 preview 現況）：其 Android 執行階段預設 CoreCLR，只出 64-bit runtime pack；32-bit（armeabi-v7a/x86）
-需 `UseMonoRuntime=true`。Rust core 四種 ABI 皆已實編；APK 以 Mono 打包四種。GA 後 CoreCLR 若補上 32-bit 再回切。
+註（.NET 11 現況）：Android 執行階段＝CoreCLR，只出 64-bit runtime pack；.NET 11 已移除 Mono-on-Android
+（NETSDK1242），故只打包 arm64-v8a（實機）＋x86_64（模擬器）。32-bit Android 實質已死（Google Play 自 2019 要求 64-bit）。

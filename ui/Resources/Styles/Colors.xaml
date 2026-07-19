@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- 清爽 teal 色票。鍵名沿用 MAUI 模板(Styles.xaml 依賴),值全部換新。
+     語意色(成功/警示/危險)在 C# Theme.cs,這裡只放原生控件鉻件需要的底色。 -->
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml">
+
+    <Color x:Key="Primary">#0D9488</Color>
+    <Color x:Key="PrimaryDark">#2DD4BF</Color>
+    <Color x:Key="PrimaryDarkText">#053B36</Color>
+    <Color x:Key="Secondary">#CCFBF1</Color>
+    <Color x:Key="SecondaryDarkText">#8ADAD1</Color>
+    <Color x:Key="Tertiary">#115E59</Color>
+
+    <Color x:Key="White">White</Color>
+    <Color x:Key="Black">Black</Color>
+    <Color x:Key="Magenta">#0D9488</Color>
+    <Color x:Key="MidnightBlue">#134E4A</Color>
+    <Color x:Key="OffBlack">#161719</Color>
+
+    <!-- 頁面底/卡片底(深淺各一套) -->
+    <Color x:Key="PageBgLight">#F4F6F7</Color>
+    <Color x:Key="PageBgDark">#161719</Color>
+    <Color x:Key="BarBgLight">#FFFFFF</Color>
+    <Color x:Key="BarBgDark">#1B1D20</Color>
+
+    <Color x:Key="Gray100">#E1E1E1</Color>
+    <Color x:Key="Gray200">#C8C8C8</Color>
+    <Color x:Key="Gray300">#ACACAC</Color>
+    <Color x:Key="Gray400">#919191</Color>
+    <Color x:Key="Gray500">#6E6E6E</Color>
+    <Color x:Key="Gray600">#404040</Color>
+    <Color x:Key="Gray900">#212121</Color>
+    <Color x:Key="Gray950">#141414</Color>
+
+    <SolidColorBrush x:Key="PrimaryBrush" Color="{StaticResource Primary}"/>
+    <SolidColorBrush x:Key="SecondaryBrush" Color="{StaticResource Secondary}"/>
+    <SolidColorBrush x:Key="TertiaryBrush" Color="{StaticResource Tertiary}"/>
+    <SolidColorBrush x:Key="WhiteBrush" Color="{StaticResource White}"/>
+    <SolidColorBrush x:Key="BlackBrush" Color="{StaticResource Black}"/>
+
+    <SolidColorBrush x:Key="Gray100Brush" Color="{StaticResource Gray100}"/>
+    <SolidColorBrush x:Key="Gray200Brush" Color="{StaticResource Gray200}"/>
+    <SolidColorBrush x:Key="Gray300Brush" Color="{StaticResource Gray300}"/>
+    <SolidColorBrush x:Key="Gray400Brush" Color="{StaticResource Gray400}"/>
+    <SolidColorBrush x:Key="Gray500Brush" Color="{StaticResource Gray500}"/>
+    <SolidColorBrush x:Key="Gray600Brush" Color="{StaticResource Gray600}"/>
+    <SolidColorBrush x:Key="Gray900Brush" Color="{StaticResource Gray900}"/>
+    <SolidColorBrush x:Key="Gray950Brush" Color="{StaticResource Gray950}"/>
+</ResourceDictionary>
