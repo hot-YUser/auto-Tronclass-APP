@@ -392,12 +392,12 @@ public sealed class AppState : ObservableObject
     public async Task<bool> SetLlmKey(string key) => OkReply(await Send("SetLlmKey", ("key", key)));
 
     public async Task<bool> SaveConfig(int countdownSecs, double thresholdPct, bool thresholdEnabled) =>
-        // ponytail: patch 鍵名為暫定,docs/20-contract.md 未列 schema,待與 core 對齊(Mock 一律回 ok)
+        // 鍵名對齊 core Settings(config.rs)。core 只有單一 attendance_gate_percent:停用門檻 = 送 0%
+        // (全班簽到率永遠 ≥ 0 → 門檻永遠通過),不需 core 端另加 enabled 欄位。
         OkReply(await Send("UpdateConfig", ("patch", new Dictionary<string, object?>
         {
             ["countdown_secs"] = countdownSecs,
-            ["rollcall_threshold_pct"] = thresholdPct,
-            ["rollcall_threshold_enabled"] = thresholdEnabled,
+            ["attendance_gate_percent"] = thresholdEnabled ? thresholdPct : 0.0,
         })));
 
     /// <summary>統一送命令:Reply 失敗與例外一律 Toast+Logs(錯誤永不吞)。回 null 表示丟例外。</summary>

@@ -26,8 +26,6 @@ public sealed class SettingsPage : ContentPage
                 SettingRow("防假點名門檻(%)", "全班簽到率低於此值不出手", threshold),
                 Theme.Divider(),
                 SettingRow("啟用門檻", "關閉後任何點名都會處理", thresholdOn),
-                Theme.Text("這些設定的 UpdateConfig 欄位名尚未與核心對齊(契約未定 schema);接上真核心前,儲存結果僅供預覽。",
-                    11.5, Theme.FontRegular, Theme.WarnL, Theme.WarnD),
                 Theme.Primary("儲存設定", async () =>
                 {
                     if (!int.TryParse(countdown.Text, out var secs) || secs < 0 ||
@@ -37,7 +35,7 @@ public sealed class SettingsPage : ContentPage
                         return;
                     }
                     if (await state.SaveConfig(secs, pct, thresholdOn.IsToggled))
-                        state.Notify("info", "已送出設定 · 核心 schema 待對齊");
+                        state.Notify("info", "設定已儲存");
                 }),
             },
         });
