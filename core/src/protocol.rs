@@ -9,17 +9,12 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Command {
-    /// Load registry + config from `data_dir`; emit Providers/Accounts/VaultState/Caps.
+    /// Load registry + config from `data_dir`; the vault auto-unlocks with the device key here, then
+    /// emit Providers/Accounts/VaultState/Caps.
     Init { id: u64, data_dir: String },
-    /// First run: create the encrypted vault under this master password.
-    CreateVault { id: u64, master_password: String },
-    /// Unlock an existing vault with the master password.
-    Unlock { id: u64, master_password: String },
-    /// Unlock the vault with the platform keystore's stored key (passwordless/biometric). Fails if
-    /// no key is stored (the UI then falls back to a master-password `Unlock`).
-    UnlockWithKeystore { id: u64 },
-    /// Lock the vault: zeroize the in-memory key and drop it (the keystore's stored copy remains).
-    LockVault { id: u64 },
+    /// Idempotent no-ops: the vault auto-unlocks at Init (no master password). Kept for wire back-compat.
+    CreateVault { id: u64 },
+    Unlock { id: u64 },
     /// Add an account; its password goes straight into the vault, never the config.
     AddAccount {
         id: u64,
@@ -72,10 +67,8 @@ impl Command {
     pub fn id(&self) -> u64 {
         match self {
             Command::Init { id, .. }
-            | Command::CreateVault { id, .. }
-            | Command::Unlock { id, .. }
-            | Command::UnlockWithKeystore { id }
-            | Command::LockVault { id }
+            | Command::CreateVault { id }
+            | Command::Unlock { id }
             | Command::AddAccount { id, .. }
             | Command::SwitchAccount { id, .. }
             | Command::DeleteAccount { id, .. }

@@ -11,18 +11,21 @@ fn tmp(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn vault_roundtrip_and_wrong_password() {
+fn vault_roundtrip_and_wrong_key() {
     let path = tmp("vault");
-    let mut v = VaultFile::create(&path, "hunter2").unwrap();
+    let key = [7u8; 32];
+    let mut v = VaultFile::create_with_key(&path, key).unwrap();
     v.set("acc1", AccountSecret { password: "s3cret".into(), cookies: String::new() }).unwrap();
     drop(v);
 
-    // correct password → decrypts, secret intact
-    let v2 = VaultFile::unlock(&path, "hunter2").unwrap();
+    // correct device key → decrypts, secret intact
+    let v2 = VaultFile::unlock_with_key(&path, key).unwrap();
     assert_eq!(v2.get("acc1").unwrap().password, "s3cret");
 
-    // wrong password → AEAD auth failure, never a partial/garbage read
-    assert!(VaultFile::unlock(&path, "nope").is_err());
+    // wrong key → AEAD auth failure, never a partial/garbage read
+    let mut bad = key;
+    bad[0] ^= 0xff;
+    assert!(VaultFile::unlock_with_key(&path, bad).is_err());
 
     let _ = std::fs::remove_file(&path);
 }
@@ -30,7 +33,7 @@ fn vault_roundtrip_and_wrong_password() {
 #[test]
 fn vault_never_reuses_a_nonce() {
     let path = tmp("nonce");
-    let mut v = VaultFile::create(&path, "pw").unwrap();
+    let mut v = VaultFile::create_with_key(&path, [1u8; 32]).unwrap();
     // Writing the *same* data twice must still change the on-disk nonce (bytes 16..40).
     v.set("a", AccountSecret { password: "x".into(), cookies: String::new() }).unwrap();
     let first = std::fs::read(&path).unwrap();

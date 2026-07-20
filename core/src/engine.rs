@@ -4,7 +4,6 @@
 //! does the network round-trip, then re-locks to cache cookies. Secrets never enter an event.
 
 use crate::config::{new_id, AccountMeta, Config};
-use crate::keystore::{KeyStore, MemKeyStore};
 use crate::login::{self, LoginOutcome};
 use crate::monitor::{self, MonitorConfig};
 use crate::protocol::Command;
@@ -37,8 +36,22 @@ impl CoreState {
     fn config_path(&self) -> PathBuf {
         self.data_dir.join("config.json")
     }
-    fn vault_path(&self) -> PathBuf {
-        self.data_dir.join("vault.bin")
+}
+
+/// Open (or first-run create) the vault with the persistent device key — auto-unlock, no master
+/// password (user decision 2026-07: "no lock password"). Returns (vault, reset): reset=true when a
+/// pre-existing vault couldn't be opened with the device key (an old password vault, or a lost
+/// device.key) and was recreated empty — the caller then tells the user to re-add accounts.
+fn open_vault_auto(dir: &std::path::Path) -> Result<(VaultFile, bool), String> {
+    let key = crate::secrets::load_or_create_device_key(&dir.join("device.key"))?;
+    let vault_path = dir.join("vault.bin");
+    if VaultFile::exists(&vault_path) {
+        match VaultFile::unlock_with_key(&vault_path, key) {
+            Ok(v) => Ok((v, false)),
+            Err(_) => VaultFile::create_with_key(&vault_path, key).map(|v| (v, true)),
+        }
+    } else {
+        VaultFile::create_with_key(&vault_path, key).map(|v| (v, false))
     }
 }
 
@@ -46,9 +59,6 @@ pub struct Core {
     rt: Runtime,
     cb: EventCb,
     state: Arc<Mutex<Option<CoreState>>>,
-    /// Optional unlock layer: holds the vault's one key for passwordless unlock. In-memory stub this
-    /// slice; real Keychain/Keystore/DPAPI → Phase B (docs 10 unlock layer).
-    keystore: Box<dyn KeyStore>,
 }
 
 /// All events cross the seam through the single audited redaction pass (docs 90 §4).
@@ -79,7 +89,7 @@ pub fn init(cb: EventCb) -> Box<Core> {
     });
 
     emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "starting" }));
-    Box::new(Core { rt, cb, state: Arc::new(Mutex::new(None)), keystore: Box::new(MemKeyStore::default()) })
+    Box::new(Core { rt, cb, state: Arc::new(Mutex::new(None)) })
 }
 
 pub fn send(core: &Core, json_bytes: &[u8]) {
@@ -113,74 +123,36 @@ fn handle_sync(core: &Core, cmd: Command) {
             let _ = std::fs::create_dir_all(&dir);
             let registry = Registry::load_or_seed(&dir.join("providers.json"));
             let config = Config::load(&dir.join("config.json"));
-            let vault_exists = VaultFile::exists(&dir.join("vault.bin"));
             crate::redaction::set_level(&config.settings.log_level);
-            *guard = Some(CoreState { data_dir: dir, registry, config, vault: None, monitor: None, pending_captcha: HashMap::new() });
+            // Auto-unlock: the vault opens with a persistent per-device key — no master password.
+            let (vault, reset) = match open_vault_auto(&dir) {
+                Ok((v, r)) => (Some(v), r),
+                Err(e) => {
+                    emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                                      "code": "vault_open_failed", "message": e }));
+                    (None, false)
+                }
+            };
+            let unlocked = vault.is_some();
+            *guard = Some(CoreState { data_dir: dir, registry, config, vault, monitor: None, pending_captcha: HashMap::new() });
             let st = guard.as_ref().unwrap();
             emit_providers(cb, st);
             emit_accounts(cb, st);
-            emit(cb, &json!({ "id": null, "event": "VaultState", "exists": vault_exists, "unlocked": false }));
-            emit_caps(cb, core.keystore.available());
+            if reset {
+                emit(cb, &json!({ "id": null, "event": "LogLine", "level": "warn",
+                                  "text": "先前的本機資料無法自動解鎖，已重新建立；請重新加入帳號。" }));
+            }
+            emit(cb, &json!({ "id": null, "event": "VaultState", "exists": unlocked, "unlocked": unlocked }));
+            emit_caps(cb);
             emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
             reply(cb, id, true, None);
         }
 
-        Command::CreateVault { master_password, .. } => {
-            let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
-            if VaultFile::exists(&st.vault_path()) {
-                return reply(cb, id, false, Some("vault already exists".into()));
-            }
-            match VaultFile::create(&st.vault_path(), &master_password) {
-                Ok(v) => {
-                    // Hand the vault key to the keystore so subsequent unlocks can be passwordless.
-                    if let Some(k) = v.key_bytes() {
-                        let _ = core.keystore.store(&k);
-                    }
-                    st.vault = Some(v);
-                    emit(cb, &json!({ "id": null, "event": "VaultState", "exists": true, "unlocked": true }));
-                    reply(cb, id, true, None);
-                }
-                Err(e) => reply(cb, id, false, Some(e)),
-            }
-        }
-
-        Command::Unlock { master_password, .. } => {
-            let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
-            match VaultFile::unlock(&st.vault_path(), &master_password) {
-                Ok(v) => {
-                    if let Some(k) = v.key_bytes() {
-                        let _ = core.keystore.store(&k);
-                    }
-                    st.vault = Some(v);
-                    emit(cb, &json!({ "id": null, "event": "VaultState", "exists": true, "unlocked": true }));
-                    reply(cb, id, true, None);
-                }
-                Err(e) => reply(cb, id, false, Some(e)),
-            }
-        }
-
-        Command::UnlockWithKeystore { .. } => {
-            let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
-            match core.keystore.load() {
-                Some(key) => match VaultFile::unlock_with_key(&st.vault_path(), key) {
-                    Ok(v) => {
-                        st.vault = Some(v);
-                        emit(cb, &json!({ "id": null, "event": "VaultState", "exists": true, "unlocked": true }));
-                        reply(cb, id, true, None);
-                    }
-                    Err(e) => reply(cb, id, false, Some(e)),
-                },
-                None => reply(cb, id, false, Some("no stored key in keystore".into())),
-            }
-        }
-
-        Command::LockVault { .. } => {
-            let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
-            if let Some(mut v) = st.vault.take() {
-                v.lock(); // zeroize the in-memory key; the keystore's stored copy remains
-            }
-            emit(cb, &json!({ "id": null, "event": "VaultState", "exists": true, "unlocked": false }));
-            reply(cb, id, true, None);
+        // The vault auto-unlocks with the device key at Init (no master password), so CreateVault and
+        // Unlock are idempotent no-ops now — kept only for wire back-compat. Reply ok iff it is open.
+        Command::CreateVault { .. } | Command::Unlock { .. } => {
+            let ready = guard.as_ref().is_some_and(|st| st.vault.is_some());
+            reply(cb, id, ready, (!ready).then(|| "vault not ready".into()));
         }
 
         Command::AddAccount { label, school, username, password, is_teacher, course_id, .. } => {
@@ -642,14 +614,11 @@ fn emit_accounts(cb: EventCb, st: &CoreState) {
                       "accounts": st.config.accounts }));
 }
 
-fn emit_caps(cb: EventCb, biometric_unlock: bool) {
-    // `biometric_unlock` reflects a real, persistent platform keystore. The in-memory stub reports
-    // false, so this stays false until a Keychain/Keystore/DPAPI backend lands (Phase B). Captcha is
-    // human-in-loop this slice (no OCR), so `ocr_captcha` also stays false.
+fn emit_caps(cb: EventCb) {
+    // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false.
     emit(cb, &json!({ "id": null, "event": "Caps", "caps": {
         "background_monitoring": true,
         "self_update": true,
-        "biometric_unlock": biometric_unlock,
         "qr_teacher_assist": false,
         "ocr_captcha": false
     }}));

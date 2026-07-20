@@ -128,28 +128,6 @@ fn leveled_logging_drops_debug_at_normal() {
     crate::redaction::set_level("normal"); // restore
 }
 
-#[test]
-fn vault_unlock_with_platform_key_roundtrip() {
-    use crate::secrets::{AccountSecret, VaultFile};
-    let path = std::env::temp_dir().join(format!("tron-slice4-vault-{}", new_id()));
-
-    let mut v = VaultFile::create(&path, "master-pw").unwrap();
-    v.set("acc1", AccountSecret { password: "s3cret".into(), cookies: String::new() }).unwrap();
-    let key = v.key_bytes().expect("key while unlocked");
-    drop(v);
-
-    // Unlock with the stored key (no password) → data intact.
-    let v2 = VaultFile::unlock_with_key(&path, key).expect("key unlock");
-    assert_eq!(v2.get("acc1").unwrap().password, "s3cret");
-
-    // A wrong key fails AEAD authentication cleanly.
-    let mut bad = key;
-    bad[0] ^= 0xff;
-    assert!(VaultFile::unlock_with_key(&path, bad).is_err(), "wrong key rejected");
-
-    let _ = std::fs::remove_file(&path);
-}
-
 // ===================== e2e over the FFI (serialized via SEQ) =====================
 
 static SEQ: Mutex<()> = Mutex::new(());
@@ -428,52 +406,22 @@ fn schedule_closed_suppresses_monitoring() {
 }
 
 #[test]
-fn keystore_unlock_flow() {
+fn vault_auto_unlocks_without_a_password() {
     let _g = SEQ.lock().unwrap();
     let mut hz = Harness::new();
-    let dir = data_dir("keystore");
+    let dir = data_dir("autounlock");
 
+    // No CreateVault, no master password: Init auto-unlocks the vault with the persistent device key.
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
     wait_for(reply_ok(i), 10);
-    // Create the vault (auto-stores the key in the keystore) and add a secret.
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
-    wait_for(reply_ok(i), 5);
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"g","school":"http://x","username":"g","password":"secret"}}"#));
-    wait_for(reply_ok(i), 5);
-
-    // Lock the vault, then unlock it with the stored platform key (no password).
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"LockVault"}}"#));
-    wait_for(reply_ok(i), 5);
-    assert!(
-        wait_for(|v| v["event"] == "VaultState" && v["unlocked"] == false, 3).is_some(),
-        "vault reports locked"
-    );
-
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UnlockWithKeystore"}}"#));
-    let r = wait_for(reply_ok(i), 5).expect("reply");
-    assert_eq!(r["ok"], true, "keystore unlock succeeds (AEAD confirms the key)");
     assert!(
         wait_for(|v| v["event"] == "VaultState" && v["unlocked"] == true, 3).is_some(),
-        "vault reports unlocked again"
+        "vault auto-unlocks at Init — no password step"
     );
-}
 
-#[test]
-fn keystore_unlock_without_stored_key_errors() {
-    let _g = SEQ.lock().unwrap();
-    let mut hz = Harness::new(); // fresh Core → fresh empty MemKeyStore
-    let dir = data_dir("keystore-empty");
-
+    // The vault is already open, so a secret can be stored straight away.
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
-    wait_for(reply_ok(i), 10);
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UnlockWithKeystore"}}"#));
-    let r = wait_for(reply_ok(i), 5).expect("reply");
-    assert_eq!(r["ok"], false, "no stored key → error");
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"g","school":"http://x","username":"g","password":"secret"}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).unwrap()["ok"], true, "AddAccount works with no unlock step");
 }

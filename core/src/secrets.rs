@@ -1,16 +1,14 @@
-//! Encrypted secret vault (docs 10 SecretStore; docs 90 §7 security boundary — NOT simplified).
+//! Encrypted secret vault, auto-unlocked with a per-device key — secrets stay encrypted at rest with
+//! no master password (user decision 2026-07: "no lock password").
 //!
-//! File layout: `salt(16) || nonce(24) || XChaCha20-Poly1305(ciphertext)`.
-//! - The **salt is fixed** for the vault's life so unlocking re-derives the same Argon2id key
-//!   without re-running the KDF's cost each time.
-//! - Every single write generates a **FRESH random 24-byte nonce**. A nonce is NEVER reused:
-//!   reuse under a fixed key breaks XChaCha20-Poly1305 confidentiality *and* integrity (the
-//!   Poly1305 one-time key becomes recoverable, enabling forgery). XChaCha's 192-bit nonce is
-//!   wide enough that random selection is collision-safe — no counter needed.
-//!
-//! Secrets never leave via events or logs; they are withheld at the source.
+//! File layout: `salt(16) || nonce(24) || XChaCha20-Poly1305(ciphertext)`. The salt is vestigial (the
+//! key comes from `device.key`, not a KDF) but kept so the on-disk layout is fixed.
+//! - Every write generates a **FRESH random 24-byte nonce**. A nonce is NEVER reused: reuse under a
+//!   fixed key breaks XChaCha20-Poly1305 confidentiality *and* integrity (the Poly1305 one-time key
+//!   becomes recoverable, enabling forgery). XChaCha's 192-bit nonce is wide enough that random
+//!   selection is collision-safe — no counter needed.
+//! - Secrets never leave via events or logs; they are withheld at the source.
 
-use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
@@ -22,12 +20,6 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 /// Reserved vault entry id for the LLM API key (accounts use random hex ids, so no collision).
 const LLM_KEY_ID: &str = "__llm__";
-
-// Argon2id cost. Moderate on purpose: high memory cost OOMs/hangs low-end phones (armv7).
-// ponytail: fixed here; lift to a config knob if a device needs it. m=19 MiB, t=2, p=1.
-const ARGON_M_COST: u32 = 19_456;
-const ARGON_T_COST: u32 = 2;
-const ARGON_P_COST: u32 = 1;
 
 /// A string secret whose `Debug`/`Display` are masked, so a stray `{:?}`/log of a struct holding it
 /// (e.g. the monitor's `Account`, which carries a password for session re-login) never leaks it. The
@@ -76,38 +68,19 @@ impl VaultFile {
         path.exists()
     }
 
-    /// Create a brand-new empty vault protected by `master_pw`.
-    pub fn create(path: &Path, master_pw: &str) -> Result<VaultFile, String> {
+    /// Create a brand-new empty vault encrypted under a raw 32-byte key — the auto-unlock path (a
+    /// device key, no master password / Argon2). The salt is vestigial for a raw-key vault but kept
+    /// so the on-disk layout (salt||nonce||ct) is identical to a password vault.
+    pub fn create_with_key(path: &Path, key: [u8; 32]) -> Result<VaultFile, String> {
         let mut salt = [0u8; SALT_LEN];
         getrandom::getrandom(&mut salt).map_err(|e| e.to_string())?;
-        let key = derive_key(master_pw, &salt)?;
-        let vault = VaultFile {
-            path: path.to_path_buf(),
-            salt,
-            key: Some(key),
-            data: BTreeMap::new(),
-        };
+        let vault = VaultFile { path: path.to_path_buf(), salt, key: Some(key), data: BTreeMap::new() };
         vault.persist()?;
         Ok(vault)
     }
 
-    /// Unlock an existing vault. A wrong password fails AEAD authentication → clean error.
-    pub fn unlock(path: &Path, master_pw: &str) -> Result<VaultFile, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("read vault: {e}"))?;
-        if bytes.len() < SALT_LEN + NONCE_LEN {
-            return Err("vault file corrupt".into());
-        }
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(&bytes[..SALT_LEN]);
-        let nonce = &bytes[SALT_LEN..SALT_LEN + NONCE_LEN];
-        let ciphertext = &bytes[SALT_LEN + NONCE_LEN..];
-
-        let key = derive_key(master_pw, &salt)?;
-        Self::open_with_key(path, salt, key, nonce, ciphertext, "wrong master password")
-    }
-
-    /// Unlock using a raw 32-byte key from the platform keystore (docs 10 unlock layer), bypassing
-    /// the Argon2id KDF. A wrong key fails the AEAD authentication tag → clean error, no partial read.
+    /// Unlock using the raw 32-byte device key. A wrong key fails the AEAD authentication tag → clean
+    /// error, no partial read.
     pub fn unlock_with_key(path: &Path, key: [u8; 32]) -> Result<VaultFile, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("read vault: {e}"))?;
         if bytes.len() < SALT_LEN + NONCE_LEN {
@@ -136,12 +109,6 @@ impl VaultFile {
             .map_err(|_| err.to_string())?;
         let data = serde_json::from_slice(&plaintext).map_err(|e| e.to_string())?;
         Ok(VaultFile { path: path.to_path_buf(), salt, key: Some(key), data })
-    }
-
-    /// The current vault key, to hand to the platform keystore after a master-password unlock/create
-    /// so subsequent unlocks can be passwordless. `None` while locked.
-    pub fn key_bytes(&self) -> Option<[u8; 32]> {
-        self.key
     }
 
     /// Re-encrypt the whole map with a FRESH nonce and write it out. Called after every mutation.
@@ -199,13 +166,21 @@ impl Drop for VaultFile {
     }
 }
 
-fn derive_key(master_pw: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; 32], String> {
-    let params =
-        Params::new(ARGON_M_COST, ARGON_T_COST, ARGON_P_COST, Some(32)).map_err(|e| e.to_string())?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+/// Load the persistent 32-byte device key from `key_path`, generating + storing it on first run.
+/// This is what makes the vault auto-unlock with no master password: the key lives beside the vault.
+/// ponytail: a keyfile next to the vault protects a stolen vault.bin alone (a stray backup/sync of
+/// just that file), NOT a full-device compromise — bind to the OS keystore (Windows DPAPI / Android
+/// Keystore) for real device-binding when that Phase-B integration lands.
+pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
+    if let Ok(bytes) = std::fs::read(key_path) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
     let mut key = [0u8; 32];
-    argon
-        .hash_password_into(master_pw.as_bytes(), salt, &mut key)
-        .map_err(|e| e.to_string())?;
+    getrandom::getrandom(&mut key).map_err(|e| e.to_string())?;
+    std::fs::write(key_path, key).map_err(|e| format!("write device key: {e}"))?;
     Ok(key)
 }

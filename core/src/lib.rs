@@ -8,7 +8,6 @@ mod answer;
 mod config;
 mod course_context;
 mod engine;
-mod keystore;
 mod llm;
 mod login;
 mod monitor;

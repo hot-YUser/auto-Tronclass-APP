@@ -601,6 +601,24 @@ pub async fn sign_qr_with_teacher_data(
     }
 }
 
+/// Teacher side: read the rotating `data` from the teacher's OWN qr rollcall (the data source).
+pub async fn teacher_source_qr_data(
+    teacher: &Client,
+    ep: &Endpoints,
+    course_id: &str,
+    teacher_rollcall_id: &str,
+) -> Option<String> {
+    let v: Value = teacher
+        .get(ep.teacher_qr_code(course_id, teacher_rollcall_id))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    v.get("data").and_then(|d| d.as_str().map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,22 +657,4 @@ mod tests {
         assert_eq!(classify_response(403, ""), CodeResult::Fatal);
         assert_eq!(classify_response(429, ""), CodeResult::Transient);
     }
-}
-
-/// Teacher side: read the rotating `data` from the teacher's OWN qr rollcall (the data source).
-pub async fn teacher_source_qr_data(
-    teacher: &Client,
-    ep: &Endpoints,
-    course_id: &str,
-    teacher_rollcall_id: &str,
-) -> Option<String> {
-    let v: Value = teacher
-        .get(ep.teacher_qr_code(course_id, teacher_rollcall_id))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    v.get("data").and_then(|d| d.as_str().map(str::to_string))
 }
