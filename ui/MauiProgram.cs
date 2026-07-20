@@ -17,8 +17,9 @@ public static class MauiProgram
 				fonts.AddFont("OpenSans-Semibold.ttf", "OpenSansSemibold");
 			});
 
-		// The FFI seam. Swap MockCore → NativeCore to drive the real Rust core (the UI is unchanged).
-		builder.Services.AddSingleton<ICore, MockCore>();
+		// The FFI seam. NativeCore drives the real Rust core; swap to MockCore for design-time
+		// preview / hot-reload without a native build (the UI is identical either way).
+		builder.Services.AddSingleton<ICore, NativeCore>();
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<AppShell>();
 
