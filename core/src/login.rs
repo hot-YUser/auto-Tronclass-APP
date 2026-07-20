@@ -147,14 +147,23 @@ fn find_password_form(html: &str) -> Option<PasswordForm> {
             .map(|(n, ..)| n.clone())
             .unwrap_or_else(|| "username".to_string());
         // Echo EVERY other named input verbatim (hidden CSRF, visible theme tokens) — but not the three
-        // fields we fill ourselves (user, pass, captcha).
+        // fields we fill ourselves (user, pass, captcha). HTML-unescape values (a token may carry `&amp;`).
         let fields: Vec<(String, String)> = inputs
             .iter()
             .filter(|(n, ..)| *n != pass_field && *n != user_field && captcha_field.as_deref() != Some(n))
-            .map(|(n, _, v)| (n.clone(), v.clone()))
+            .map(|(n, _, v)| (n.clone(), html_unescape(v)))
             .collect();
 
-        let action = form_tag.attributes().get("action").flatten().map(|b| b.as_utf8_str().to_string()).unwrap_or_default();
+        // HTML-unescape the action: a Keycloak/CAS action joins its session_code/execution/client_id
+        // query params with `&amp;` in the markup. Posting the raw `&amp;` mangles every param after the
+        // first (`execution` becomes `amp;execution`), so the IdP rejects the login — this is why every
+        // Keycloak school (Tunghai/THU included) failed with "credentials rejected".
+        let action = form_tag
+            .attributes()
+            .get("action")
+            .flatten()
+            .map(|b| html_unescape(&b.as_utf8_str()))
+            .unwrap_or_default();
         return Some(PasswordForm { action, user_field, pass_field, fields, captcha_field });
     }
     None
@@ -481,5 +490,24 @@ mod tests {
     fn login_view_less_email_spa_still_defers() {
         // No <login-view> → the old browser-fallback path is unchanged.
         assert!(matches!(detect_login_kind(r#"<div id="app"></div>"#, "u"), LoginKind::EmailSpa));
+    }
+
+    #[test]
+    fn keycloak_form_action_ampersands_are_unescaped() {
+        // A Keycloak/CAS login form (Tunghai/THU): the action joins its query params with `&amp;`.
+        // The extracted action must decode them to `&`, or every param after session_code is mangled.
+        let html = r#"<html><body><form id="kc-form-login" method="post"
+            action="https://idp.example/auth/realms/x/login-actions/authenticate?session_code=SC&amp;execution=EX&amp;client_id=tronclass&amp;tab_id=TB">
+            <input name="username" type="text"><input name="password" type="password">
+            </form></body></html>"#;
+        let form = find_password_form(html).expect("password form");
+        assert_eq!(form.user_field, "username");
+        assert_eq!(form.pass_field, "password");
+        assert!(!form.action.contains("&amp;"), "action must be HTML-unescaped, got {}", form.action);
+        assert!(
+            form.action.contains("session_code=SC&execution=EX&client_id=tronclass&tab_id=TB"),
+            "all query params intact, got {}",
+            form.action
+        );
     }
 }
