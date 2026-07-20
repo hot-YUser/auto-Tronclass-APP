@@ -101,10 +101,46 @@ pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Optio
 /// Read the shared number code once from the roster. None → caller brute-forces.
 pub async fn read_number_code(client: &Client, ep: &Endpoints, id: &str) -> Option<String> {
     let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
-    v.get("student_rollcalls")
-        .and_then(Value::as_array)?
-        .iter()
-        .find_map(|e| e.get("number_code").and_then(|c| c.as_str().map(str::to_string)))
+    number_code_from_payload(&v)
+}
+
+/// Coerce one JSON value into a 4-digit code (v1 `coerce_number_code`). The real server exposes
+/// `number_code` as a STRING **or an INT** — an int `123` is the code `"0123"` — so reading it only as
+/// a string (the old code) returned None on every int tenant and fell to a needless brute-force.
+fn coerce_number_code(v: &Value) -> Option<String> {
+    let text = match v {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) if (0..=9999).contains(&i) => format!("{i:04}"),
+            Some(i) => i.to_string(),
+            None => return None,
+        },
+        _ => return None,
+    };
+    (text.len() == 4 && text.bytes().all(|b| b.is_ascii_digit())).then_some(text)
+}
+
+/// Pull a 4-digit `number_code` out of a student_rollcalls-style payload (v1 `parse_number_code_payload`).
+/// Robust to the observed shapes: top-level `{number_code}`, `{data:{number_code}}`, a
+/// `student_rollcalls`/`data` array of student items, or a bare list of them.
+fn number_code_from_payload(payload: &Value) -> Option<String> {
+    let in_item = |item: &Value| item.as_object()?.get("number_code").and_then(coerce_number_code);
+    if let Some(obj) = payload.as_object() {
+        if let Some(c) = obj.get("number_code").and_then(coerce_number_code) {
+            return Some(c);
+        }
+        if let Some(c) = obj.get("data").and_then(|d| d.get("number_code")).and_then(coerce_number_code) {
+            return Some(c);
+        }
+        for key in ["student_rollcalls", "data"] {
+            if let Some(c) = obj.get(key).and_then(Value::as_array).and_then(|a| a.iter().find_map(in_item)) {
+                return Some(c);
+            }
+        }
+        None
+    } else {
+        payload.as_array()?.iter().find_map(in_item)
+    }
 }
 
 /// Confirm the account is actually marked present after a sign (v1 `confirmed_present`). Confirmed iff
@@ -562,6 +598,46 @@ pub async fn sign_qr_with_teacher_data(
         Ok(SignOutcome { method: "qr(teacher-assist)".into(), ..Default::default() })
     } else {
         Err("qr submitted but on_call_fine not set".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_code_read_from_every_observed_shape() {
+        // The real 55379 roster: the code sits at the TOP LEVEL, NOT inside student_rollcalls[] — the
+        // old code only looked in the array and so returned None on the live server (this bug).
+        let live = json!({"is_number": true, "number_code": "1234", "status": "in_progress",
+                          "student_rollcalls": [{"user_no": "a@b", "rollcall_status": "absent"}]});
+        assert_eq!(number_code_from_payload(&live).as_deref(), Some("1234"));
+
+        // int number_code → zero-padded 4-digit (a common contract variant).
+        assert_eq!(number_code_from_payload(&json!({"number_code": 123})).as_deref(), Some("0123"));
+        // data-wrapped, array container, and a bare list of student items.
+        assert_eq!(number_code_from_payload(&json!({"data": {"number_code": "0007"}})).as_deref(), Some("0007"));
+        assert_eq!(number_code_from_payload(&json!({"student_rollcalls": [{"number_code": "4321"}]})).as_deref(), Some("4321"));
+        assert_eq!(number_code_from_payload(&json!([{"number_code": 42}])).as_deref(), Some("0042"));
+    }
+
+    #[test]
+    fn number_code_rejects_non_codes() {
+        assert_eq!(number_code_from_payload(&json!({"status": "in_progress"})), None); // no code field
+        assert_eq!(coerce_number_code(&json!("not-a-code")), None);
+        assert_eq!(coerce_number_code(&json!(true)), None); // bool is not a code
+        assert_eq!(coerce_number_code(&json!("12")), None); // must be 4 digits
+        assert_eq!(coerce_number_code(&json!("１２３４")), None); // full-width digits are not ascii
+    }
+
+    #[test]
+    fn classify_number_2xx_defaults_to_success() {
+        // A real accept is `{"status":"on_call"}` with no success bool → Success (docs 30).
+        assert_eq!(classify_response(200, r#"{"id":1,"status":"on_call"}"#), CodeResult::Success);
+        assert_eq!(classify_response(200, ""), CodeResult::Success);
+        assert_eq!(classify_response(400, "wrong code"), CodeResult::Wrong);
+        assert_eq!(classify_response(403, ""), CodeResult::Fatal);
+        assert_eq!(classify_response(429, ""), CodeResult::Transient);
     }
 }
 
