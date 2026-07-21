@@ -13,7 +13,9 @@ https://github.com/user-attachments/assets/086eb1e9-c8f2-48e0-b0c5-1ad4e6d213d6
 
 # auto-Tronclass-APP
 
-<img src="assets/icon.png" alt="auto-Tronclass-APP" width="160">
+<div align="center">
+  <img src="ui/Resources/AppIcon/appicon.png" alt="auto-Tronclass-APP" width="240">
+</div>
 
 **TronClass 校園系統的自動點名工具** — 登入你的學校帳號後，它會在你設定的上課時段自動盯著課程，一偵測到點名就替你完成簽到，還能自動作答進行中的線上測驗。你不用一直盯著手機，也不用手忙腳亂找點名碼。
 
