@@ -21,9 +21,13 @@ if (-not (Test-Path $dotnet)) { $dotnet = "dotnet" }
 & (Join-Path $root "build-core.ps1")
 
 function Publish-Portable {
-    # WindowsAppSDKSelfContained bundles the Windows App Runtime so the unpackaged exe launches on a
-    # clean machine (else REGDB_E_CLASSNOTREG when the runtime isn't installed machine-wide).
-    & $dotnet publish $proj -f $tfm -c Release -p:PackageMode=portable -p:WindowsAppSDKSelfContained=true
+    # A portable build must carry BOTH runtimes or it dies on a clean machine:
+    #   --self-contained            → the .NET runtime (else it binds to whatever .NET is installed;
+    #                                 a build/runtime version skew crashes at startup)
+    #   WindowsAppSDKSelfContained  → the Windows App Runtime (else REGDB_E_CLASSNOTREG from
+    #                                 WinRT.ActivationFactory before the first window ever shows)
+    & $dotnet publish $proj -f $tfm -c Release -r win-x64 --self-contained `
+        -p:PackageMode=portable -p:WindowsAppSDKSelfContained=true
     Write-Host "portable -> ui/bin/Release/$tfm/win-x64/publish/"
 }
 

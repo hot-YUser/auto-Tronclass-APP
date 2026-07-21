@@ -5,9 +5,17 @@
 > 2. **此專案為 AI 主導生成**，請自行警覺。
 > 3. **穩定的 v1 版本在此** → https://github.com/hot-YUser/auto-rollcall-thu-tronclass
 
+## 示範影片
+
+<video src="https://github.com/hot-YUser/auto-Tronclass-APP/raw/main/assets/demo.mp4" controls muted width="100%"></video>
+
+> 影片沒自動播放？→ [直接開啟／下載示範影片](https://github.com/hot-YUser/auto-Tronclass-APP/raw/main/assets/demo.mp4)
+
 ---
 
-# Auto-Rollcall-thu-Tronclass
+# auto-Tronclass-APP
+
+<img src="assets/icon.png" alt="auto-Tronclass-APP" width="160">
 
 **TronClass 校園系統的自動點名工具** — 登入你的學校帳號後，它會在你設定的上課時段自動盯著課程，一偵測到點名就替你完成簽到，還能自動作答進行中的線上測驗。你不用一直盯著手機，也不用手忙腳亂找點名碼。
 
