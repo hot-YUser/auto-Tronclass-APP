@@ -7,9 +7,7 @@
 
 ## 示範影片
 
-<video src="https://github.com/hot-YUser/auto-Tronclass-APP/raw/main/assets/demo.mp4" controls muted width="100%"></video>
-
-> 影片沒自動播放？→ [直接開啟／下載示範影片](https://github.com/hot-YUser/auto-Tronclass-APP/raw/main/assets/demo.mp4)
+https://github.com/user-attachments/assets/086eb1e9-c8f2-48e0-b0c5-1ad4e6d213d6
 
 ---
 
