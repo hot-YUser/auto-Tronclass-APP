@@ -23,6 +23,9 @@
 *.pvk
 *.cer
 *.key
+*.keystore
+*.jks
+keystore.properties
 
 # Local runtime state / logs
 /state/
