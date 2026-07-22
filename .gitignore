@@ -31,6 +31,9 @@ keystore.properties
 /state/
 *.log
 
+# Local backup of this project's Claude memory (research notes + test-account refs) — never commit.
+Claude Memory/
+
 # IDE / OS
 .vs/
 .idea/
