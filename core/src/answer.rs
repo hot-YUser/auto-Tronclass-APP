@@ -40,8 +40,6 @@ const CORRECTION_PROMPT: &str = "Your previous reply could not be used as an ans
 pub struct Paper {
     pub instance_id: String,
     pub subjects: Vec<Value>,
-    pub allow_retake: bool,
-    pub reveal: bool,
 }
 
 /// A JSON id as a string whether the server sent it as a number or a string (ids like
@@ -74,8 +72,6 @@ pub async fn fetch_paper(client: &Client, ep: &Endpoints, source: Source, activi
         // submit then dropped the instance id. Accept int OR string (confirmed live 2026-07).
         instance_id: json_id_string(v.get("exam_paper_instance_id")),
         subjects: quiz::flatten_paper(&raw),
-        allow_retake: v.get("allow_retake_exam").and_then(Value::as_bool).unwrap_or(false),
-        reveal: v.get("announce_answer").and_then(Value::as_str) == Some("immediate"),
     })
 }
 
@@ -95,7 +91,7 @@ async fn fetch_vote_paper(client: &Client, ep: &Endpoints, activity_id: &str) ->
     let multi = v.pointer("/interaction/data/vote_type").and_then(Value::as_str).map(|t| t.contains("multi")).unwrap_or(false);
     let vtype = if multi { "multiple_selection" } else { "single_selection" };
     let subject = json!({ "id": activity_id, "type": vtype, "answer_type": "vote", "content": "Vote", "options": opts });
-    Ok(Paper { instance_id: String::new(), subjects: vec![subject], allow_retake: false, reveal: false })
+    Ok(Paper { instance_id: String::new(), subjects: vec![subject] })
 }
 
 /// homework: no distribute. Prefer the raw `stem`, else a **guarded** activity-detail GET (teacher-only
@@ -117,7 +113,7 @@ async fn homework_paper(client: &Client, ep: &Endpoints, activity_id: &str, stem
         prompt = "Please write a short response for this assignment.".to_string();
     }
     let subject = json!({ "id": activity_id, "type": "short_answer", "answer_type": "short_answer", "content": prompt });
-    Paper { instance_id: String::new(), subjects: vec![subject], allow_retake: false, reveal: false }
+    Paper { instance_id: String::new(), subjects: vec![subject] }
 }
 
 /// Decide every subject; for pending ones ask the LLM (streaming reasoning). Shared answers, run once

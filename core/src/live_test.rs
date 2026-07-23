@@ -216,8 +216,7 @@ async fn live_exam_answer() {
     let (client, ep, _) = authed(&base, &env("TRON_USER"), &env("TRON_PASS")).await;
 
     let paper = answer::fetch_paper(&client, &ep, Source::Exam, &exam, "").await.expect("fetch_paper");
-    println!("exam subjects={} instance_id={:?} retake={} reveal={}",
-        paper.subjects.len(), paper.instance_id, paper.allow_retake, paper.reveal);
+    println!("exam subjects={} instance_id={:?}", paper.subjects.len(), paper.instance_id);
     assert!(!paper.subjects.is_empty(), "no subjects — exam not open / not distributed?");
 
     let cfg = LlmConfig {

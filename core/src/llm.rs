@@ -68,6 +68,11 @@ pub async fn answer_question(
     subject_id: &str,
     tools: Option<&ToolCtx<'_>>,
 ) -> Option<String> {
+    // No API key → skip the round-trip (an empty bearer just 401s). The subject stays "missing" and the
+    // monitor fails the paper fast with a clear "LLM 金鑰未設" message instead of burning the retry budget.
+    if cfg.api_key.trim().is_empty() {
+        return None;
+    }
     let mut full = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
     full.extend(messages.iter().cloned());
     match tools {

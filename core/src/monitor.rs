@@ -69,7 +69,7 @@ pub enum MonitorMsg {
     Defer { rollcall_id: String },
     // --- quiz (slice 3) ---
     QuizDetected { account_id: String, base_url: String, source: String, course: String, course_id: String, activity_id: String, stem: String },
-    QuizPrepared { key: ActivityKey, instance_id: String, subjects: Vec<Value>, shared: Map<String, Answer>, existing: Map<String, Map<String, Answer>>, allow_retake: bool, reveal: bool },
+    QuizPrepared { key: ActivityKey, instance_id: String, subjects: Vec<Value>, shared: Map<String, Answer>, existing: Map<String, Map<String, Answer>> },
     /// R3c all-or-nothing gate: prepare could NOT fully answer the paper (or a re-fetch failed / found
     /// the activity gone). `gone` → the activity closed (silent done); else re-prepare with `partial`
     /// carried, until `missing` clears or the retry budget deadline is hit.
@@ -568,8 +568,8 @@ async fn actor(
                     MonitorMsg::Defer { rollcall_id } => on_defer(&mut activities, cb, &rollcall_id),
                     MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
                         on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, course_id, activity_id, account_id, stem),
-                    MonitorMsg::QuizPrepared { key, instance_id, subjects, shared, existing, allow_retake, reveal } =>
-                        on_quiz_prepared(&mut quizzes, &cfg, cb, key, instance_id, subjects, shared, existing, allow_retake, reveal),
+                    MonitorMsg::QuizPrepared { key, instance_id, subjects, shared, existing } =>
+                        on_quiz_prepared(&mut quizzes, &cfg, cb, key, instance_id, subjects, shared, existing),
                     MonitorMsg::QuizPrepareRetry { key, partial, missing, gone } =>
                         on_quiz_prepare_retry(&mut quizzes, &cfg, cb, key, partial, missing, gone),
                     MonitorMsg::QuizSetAnswer { quiz_id, account_id, subject_id, answer } =>
@@ -983,8 +983,6 @@ struct QuizActivity {
     shared: Map<String, Answer>,                 // subject_id -> shared LLM/replay answer
     overrides: Map<String, Map<String, Answer>>, // account -> subject -> answer
     conflicts: Map<String, HashSet<String>>,     // account -> unresolved conflict subjects
-    allow_retake: bool,
-    reveal: bool,
     countdown_deadline: Option<Instant>,
     held: bool,
     discarded: bool,
@@ -1023,8 +1021,6 @@ fn on_quiz_detected(
         shared: Map::new(),
         overrides: Map::new(),
         conflicts: Map::new(),
-        allow_retake: false,
-        reveal: false,
         countdown_deadline: None,
         held: false,
         discarded: false,
@@ -1050,15 +1046,11 @@ fn on_quiz_prepared(
     subjects: Vec<Value>,
     shared: Map<String, Answer>,
     existing: Map<String, Map<String, Answer>>,
-    allow_retake: bool,
-    reveal: bool,
 ) {
     let Some(q) = quizzes.get_mut(&key) else { return };
     q.instance_id = instance_id;
     q.subjects = subjects;
     q.shared = shared;
-    q.allow_retake = allow_retake;
-    q.reveal = reveal;
     q.conflicts.clear();
     for (acc, ex) in existing {
         let mut cset = HashSet::new();
@@ -1204,7 +1196,7 @@ fn dispatch_quiz_submits(
     q.acted = true;
     q.countdown_deadline = None;
     let (source, instance_id, subjects) = (q.source, q.instance_id.clone(), q.subjects.clone());
-    let (allow_retake, reveal, resubmit) = (q.allow_retake, q.reveal, cfg.resubmit_for_correct);
+    let resubmit = cfg.resubmit_for_correct;
     let activity_id = q.activity_id.clone();
     for acc_id in q.participants.iter().cloned().collect::<Vec<_>>() {
         let Some(acc) = accounts.get(&acc_id).cloned() else { continue };
@@ -1214,7 +1206,7 @@ fn dispatch_quiz_submits(
                 answers.insert(k.clone(), v.clone());
             }
         }
-        spawn_quiz_submit(acc, source, activity_id.clone(), instance_id.clone(), subjects.clone(), answers, allow_retake, reveal, resubmit, tx.clone(), key.clone());
+        spawn_quiz_submit(acc, source, activity_id.clone(), instance_id.clone(), subjects.clone(), answers, resubmit, tx.clone(), key.clone());
     }
 }
 
@@ -1251,6 +1243,15 @@ fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_
         let shared = answer::shared_answers(&lead.client, &llm, cb, &activity_id, &course_id, &lead.base_url, &paper.subjects, max_reask, &prior).await;
         let missing = answer::missing_subjects(&paper.subjects, &shared);
         if !missing.is_empty() {
+            // No LLM key → the missing subjects can never be answered by retrying; fail fast with a clear
+            // message instead of spinning the retry budget for minutes. (Leak-answered subjects already
+            // fill `shared` WITHOUT the LLM, so a fully-leaked paper never reaches this branch.)
+            if llm.api_key.trim().is_empty() {
+                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error", "code": "llm_key_missing",
+                    "message": format!("{activity_id}：尚未設定 LLM 金鑰，無法自動作答（請至 設定 → 儲存金鑰）") }));
+                tx.send(MonitorMsg::QuizPrepareRetry { key, partial: shared, missing, gone: true }).ok();
+                return;
+            }
             // All-or-nothing: never submit a half-paper — carry the partial answers and retry.
             tx.send(MonitorMsg::QuizPrepareRetry { key, partial: shared, missing, gone: false }).ok();
             return;
@@ -1277,15 +1278,13 @@ fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_
             subjects: paper.subjects,
             shared,
             existing,
-            allow_retake: paper.allow_retake,
-            reveal: paper.reveal,
         })
         .ok();
     });
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, instance_id: String, subjects: Vec<Value>, answers: Map<String, Answer>, _allow_retake: bool, _reveal: bool, resubmit: bool, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
+fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, instance_id: String, subjects: Vec<Value>, answers: Map<String, Answer>, resubmit: bool, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
     tokio::spawn(async move {
         let ep = Endpoints::derive(&acc.base_url);
         let result: Result<String, String> = match source {
@@ -1509,8 +1508,6 @@ mod tests {
             shared: Map::new(),
             overrides: Map::new(),
             conflicts,
-            allow_retake: false,
-            reveal: false,
             countdown_deadline: None,
             held: false,
             discarded: false,

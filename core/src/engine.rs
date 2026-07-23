@@ -460,9 +460,9 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                                   "detail": if from_cache { "session restored from cache" } else { "logged in" } }));
             }
             Err(e) => {
+                // One report only: the correlated LoginResult(ok:false) already surfaces `reason` as a
+                // toast+log via AppState.Send's error path; a second id:null Error would double it.
                 emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "login_failed" }));
-                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
-                                  "code": "login_failed", "message": e.clone() }));
                 emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": e }));
             }
         }
@@ -572,6 +572,12 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                     emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
                                       "code": "no_accounts_online", "message": "no account could authenticate" }));
                 } else {
+                    // Fail-fast heads-up: with a monitored account but no LLM key, auto-answer can't run —
+                    // say so up front instead of only after a quiz spins out 300s later. Rollcall is fine.
+                    if cfg.llm_key.as_deref().is_none_or(|k| k.trim().is_empty()) {
+                        emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn", "code": "llm_key_missing",
+                            "message": "尚未設定 LLM 金鑰：自動答題需要金鑰（設定 → 儲存金鑰）；點名不受影響。" }));
+                    }
                     st.monitor = Some(monitor::start(cb, monitor_accounts, cfg)); // start() only spawns; no await under lock
                 }
             }
