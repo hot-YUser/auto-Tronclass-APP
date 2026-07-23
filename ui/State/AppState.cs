@@ -39,12 +39,6 @@ public sealed class AppState : ObservableObject
         _ => "閒置",
     };
 
-    bool _vaultExists, _vaultUnlocked;
-    public bool VaultExists { get => _vaultExists; private set => Set(ref _vaultExists, value); }
-    public bool VaultUnlocked { get => _vaultUnlocked; private set => Set(ref _vaultUnlocked, value); }
-    /// <summary>兩個欄位都更新完才發,ModalCoordinator 聽這個。</summary>
-    public event Action? VaultStateChanged;
-
     string? _activeAccountId;
     public string? ActiveAccountId { get => _activeAccountId; private set => Set(ref _activeAccountId, value); }
 
@@ -86,7 +80,6 @@ public sealed class AppState : ObservableObject
             case "Caps" when e.TryGetProperty("caps", out var c):
                 Caps.BackgroundMonitoring = Bool(c, "background_monitoring");
                 Caps.SelfUpdate = Bool(c, "self_update");
-                Caps.BiometricUnlock = Bool(c, "biometric_unlock");
                 Caps.QrTeacherAssist = Bool(c, "qr_teacher_assist");
                 Caps.OcrCaptcha = Bool(c, "ocr_captcha");
                 break;
@@ -109,11 +102,8 @@ public sealed class AppState : ObservableObject
                 }
                 break;
 
-            case "VaultState":
-                VaultExists = Bool(e, "exists");
-                VaultUnlocked = Bool(e, "unlocked");
-                VaultStateChanged?.Invoke();
-                break;
+            // VaultState：核心以 device-key 自動解鎖（無主密碼），使用者不需介入；
+            // 硬失敗會另以 Error 事件呈現，故此處不需處理。
 
             case "CaptchaChallenge": OnCaptcha(e); break;
 
@@ -346,11 +336,6 @@ public sealed class AppState : ObservableObject
 
     public Task StartMonitoring() => Send("StartMonitoring");
     public Task StopMonitoring() => Send("StopMonitoring");
-
-    public Task CreateVault(string pw) => Send("CreateVault", ("master_password", pw));
-    public Task Unlock(string pw) => Send("Unlock", ("master_password", pw));
-    public Task UnlockWithKeystore() => Send("UnlockWithKeystore");
-    public Task LockVault() => Send("LockVault");
 
     public async Task<bool> AddAccount(string label, string school, string username, string password) =>
         OkReply(await Send("AddAccount", ("label", label), ("school", school), ("username", username), ("password", password)));

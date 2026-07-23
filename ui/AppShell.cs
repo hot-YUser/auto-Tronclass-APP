@@ -2,8 +2,8 @@ namespace Ui;
 
 /// <summary>
 /// 四分頁 Shell(tab 樣式交給 MAUI 原生自動適配)+ 單一堆疊的 modal 協調:
-/// 同時只掛一個 modal;vault 鎖定與驗證碼會**搶佔**當前彈窗(把它退回佇列稍後重顯),
-/// 一般英雄彈窗則排隊;驗證碼同帳號去重(更新圖不疊窗)。vault 只由 VaultState 解鎖收掉、且不被搶佔。
+/// 同時只掛一個 modal;驗證碼會**搶佔**當前彈窗(把它退回佇列稍後重顯),
+/// 一般英雄彈窗則排隊;驗證碼同帳號去重(更新圖不疊窗)。
 /// </summary>
 public sealed class AppShell : Shell
 {
@@ -12,7 +12,6 @@ public sealed class AppShell : Shell
     readonly SemaphoreSlim _lock = new(1, 1);
     readonly ShellContent _tabRollcall, _tabQuiz;
     ContentPage? _current;
-    VaultModalPage? _vault;
     bool _booted;
 
     public AppShell(AppState state)
@@ -27,7 +26,6 @@ public sealed class AppShell : Shell
         tabs.Items.Add(Tab("帳號", "tab_accounts.png", () => new AccountsPage(state)));
         Items.Add(tabs);
 
-        state.VaultStateChanged += SyncVault;
         state.HeroRollcall += vm => _ = ShowModal(new HeroRollcallPage(state, vm, CloseModal, () => OpenRollcallDetail(vm)));
         state.HeroQuiz += vm => _ = ShowModal(new HeroQuizPage(state, vm, CloseModal, () => OpenQuizDetail(vm)));
         state.CaptchaRequested += OnCaptcha;
@@ -58,13 +56,6 @@ public sealed class AppShell : Shell
 
     // ---------------- modal 協調 ----------------
 
-    void SyncVault()
-    {
-        _vault ??= new VaultModalPage(_state);
-        if (!_state.VaultUnlocked) _ = ShowModal(_vault, preempt: true); // 鎖定 → 蓋到最上(搶佔一般彈窗)
-        else _ = CloseModal(_vault);                                     // 解鎖 → 收掉並重顯被搶佔者
-    }
-
     void OnCaptcha(string accountId, ImageSource img)
     {
         // 去重:同帳號的驗證碼已在顯示或排隊 → 更新圖、不疊窗
@@ -84,13 +75,13 @@ public sealed class AppShell : Shell
         await _lock.WaitAsync();
         try
         {
-            if (ReferenceEquals(_current, page) || _queue.Contains(page)) return; // 已在場(vault 重入保護)
+            if (ReferenceEquals(_current, page) || _queue.Contains(page)) return; // 已在場(重入保護)
             if (_current is null)
             {
                 _current = page;
                 await Navigation.PushModalAsync(page);
             }
-            else if (preempt && _current is not VaultModalPage)
+            else if (preempt)
             {
                 var displaced = _current; // 被搶佔者退回佇列前端,稍後重顯
                 _current = page;
@@ -100,7 +91,7 @@ public sealed class AppShell : Shell
             }
             else
             {
-                if (preempt) _queue.Insert(0, page); else _queue.Add(page); // preempt 但當前是 vault → 排 vault 之後
+                _queue.Add(page);
             }
         }
         finally { _lock.Release(); }

@@ -97,8 +97,17 @@ pub fn send(core: &Core, json_bytes: &[u8]) {
     let cmd: Command = match serde_json::from_slice(json_bytes) {
         Ok(c) => c,
         Err(e) => {
-            emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
-                              "code": "bad_command", "message": e.to_string() }));
+            // Recover the correlation id from the raw JSON so the awaiting UI call always completes
+            // (never hangs/leaks) — a Reply(ok:false) surfaces as an error toast. Only when the id is
+            // unreadable (truly malformed JSON) do we fall back to an uncorrelated Error event.
+            match serde_json::from_slice::<Value>(json_bytes)
+                .ok()
+                .and_then(|v| v.get("id").and_then(Value::as_u64))
+            {
+                Some(id) => reply(cb, id, false, Some(format!("未知或格式錯誤的命令：{e}"))),
+                None => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                                         "code": "bad_command", "message": e.to_string() })),
+            }
             return;
         }
     };

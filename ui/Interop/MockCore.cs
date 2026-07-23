@@ -35,10 +35,11 @@ public sealed class MockCore : ICore
     public Task BootAsync(string dataDir)
     {
         Emit(new { id = (object?)null, @event = "Caps", caps = new {
-            background_monitoring = true, self_update = true, biometric_unlock = false,
-            qr_teacher_assist = true, ocr_captcha = false } });
+            background_monitoring = true, self_update = true,
+            qr_teacher_assist = false, ocr_captcha = false } });
         Emit(new { id = (object?)null, @event = "StateChanged", state = "idle" });
-        Emit(new { id = (object?)null, @event = "VaultState", exists = true, unlocked = false });
+        // 核心以 device-key 自動解鎖：Init 後即 unlocked（使用者不需輸入主密碼）。
+        Emit(new { id = (object?)null, @event = "VaultState", exists = true, unlocked = true });
         Emit(new { id = (object?)null, @event = "Providers", default_key = "thu", schools = new[] {
             new { key = "thu", label = "Tunghai University iLearn", base_url = BaseUrl },
             new { key = "tronclass", label = "TronClass Public Cloud", base_url = "https://www.tronclass.com.tw" } } });
@@ -58,15 +59,6 @@ public sealed class MockCore : ICore
 
         switch (cmd)
         {
-            case "CreateVault":
-            case "Unlock":
-            case "UnlockWithKeystore":
-                Emit(new { id = (object?)null, @event = "VaultState", exists = true, unlocked = true });
-                break;
-            case "LockVault":
-                Emit(new { id = (object?)null, @event = "VaultState", exists = true, unlocked = false });
-                break;
-
             case "AddAccount":
                 _accounts.Add(($"a{_nextId++}", Str("label") ?? "新帳號", Str("username") ?? "", Str("school") ?? "thu"));
                 EmitAccounts();

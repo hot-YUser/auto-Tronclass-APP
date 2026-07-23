@@ -44,7 +44,13 @@ public sealed class NativeCore : ICore
         _handle = NativeMethods.core_init(&OnEvent);
     }
 
-    public Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
+    // A generous safety net. Every command the core RECEIVES now replies — even unknown/malformed ones
+    // (see engine::send's id recovery) — so this only ever trips if the native side is truly lost (a
+    // crash or a dropped event). It is longer than the core's 180s captcha-login window, so a slow
+    // interactive login never trips it; without it, a lost reply would leak the pending entry forever.
+    private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(300);
+
+    public async Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
     {
         var id = (ulong)Interlocked.Increment(ref _nextId);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -53,8 +59,23 @@ public sealed class NativeCore : ICore
         var dict = new Dictionary<string, object?> { ["id"] = id, ["cmd"] = cmd };
         foreach (var (k, v) in fields) dict[k] = v;
         Send(JsonSerializer.Serialize(dict));
-        return tcs.Task;
+
+        using var cts = new CancellationTokenSource(CommandTimeout);
+        using var reg = cts.Token.Register(() =>
+        {
+            if (Pending.TryRemove(id, out var t))
+                t.TrySetResult(TimeoutReply(id, cmd));
+        });
+        return await tcs.Task;
     }
+
+    private static JsonElement TimeoutReply(ulong id, string cmd) => JsonSerializer.SerializeToElement(new
+    {
+        id,
+        @event = "Reply",
+        ok = false,
+        error = $"命令逾時：核心未在 {CommandTimeout.TotalSeconds:0} 秒內回覆（{cmd}）",
+    });
 
     private unsafe void Send(string json)
     {

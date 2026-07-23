@@ -20,7 +20,6 @@ public sealed class AccountsPage : ContentPage
 
         var settingsRow = NavRow("設定", "倒數秒數、防假點名門檻、LLM 金鑰",
             () => Navigation.PushAsync(new SettingsPage(state)));
-        var lockRow = NavRow("鎖定保險庫", "回到主密碼畫面", state.LockVault);
 
         Content = new ScrollView
         {
@@ -38,7 +37,7 @@ public sealed class AccountsPage : ContentPage
                     Theme.Card(new VerticalStackLayout
                     {
                         Spacing = 10,
-                        Children = { settingsRow, Theme.Divider(), lockRow },
+                        Children = { settingsRow },
                     }),
                 },
             },

@@ -28,10 +28,9 @@ public interface ICountdownVm : INotifyPropertyChanged
 
 public sealed class CapsVm : ObservableObject
 {
-    bool _bg, _selfUpdate, _bio, _qr, _ocr;
+    bool _bg, _selfUpdate, _qr, _ocr;
     public bool BackgroundMonitoring { get => _bg; set { if (Set(ref _bg, value)) Raise(nameof(ForegroundOnly)); } }
     public bool SelfUpdate { get => _selfUpdate; set => Set(ref _selfUpdate, value); }
-    public bool BiometricUnlock { get => _bio; set => Set(ref _bio, value); }
     public bool QrTeacherAssist { get => _qr; set => Set(ref _qr, value); }
     public bool OcrCaptcha { get => _ocr; set => Set(ref _ocr, value); }
     public bool ForegroundOnly => !BackgroundMonitoring;

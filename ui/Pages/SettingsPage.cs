@@ -125,7 +125,6 @@ public sealed class SettingsPage : ContentPage
         {
             ("背景監控", caps.BackgroundMonitoring),
             ("應用內自動更新", caps.SelfUpdate),
-            ("生物辨識解鎖", caps.BiometricUnlock),
             ("教師帳號 QR 輔助", caps.QrTeacherAssist),
             ("驗證碼本地辨識", caps.OcrCaptcha),
         })
