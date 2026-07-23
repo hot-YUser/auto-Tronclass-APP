@@ -147,6 +147,7 @@ fn handle_sync(core: &Core, cmd: Command) {
             let st = guard.as_ref().unwrap();
             emit_providers(cb, st);
             emit_accounts(cb, st);
+            emit_settings(cb, st);
             if reset {
                 emit(cb, &json!({ "id": null, "event": "LogLine", "level": "warn",
                                   "text": "先前的本機資料無法自動解鎖，已重新建立；請重新加入帳號。" }));
@@ -254,12 +255,16 @@ fn handle_sync(core: &Core, cmd: Command) {
 
         Command::SetLlmKey { key, .. } => {
             let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
-            match st.vault.as_mut() {
-                Some(v) => match v.set_llm_key(key) {
-                    Ok(()) => reply(cb, id, true, None),
-                    Err(e) => reply(cb, id, false, Some(e)),
-                },
-                None => reply(cb, id, false, Some("vault is locked".into())),
+            let result = match st.vault.as_mut() {
+                Some(v) => v.set_llm_key(key),
+                None => Err("vault is locked".into()),
+            };
+            match result {
+                Ok(()) => {
+                    emit_settings(cb, st); // has_llm_key flips true → the Settings screen updates
+                    reply(cb, id, true, None);
+                }
+                Err(e) => reply(cb, id, false, Some(e)),
             }
         }
 
@@ -344,6 +349,7 @@ fn handle_sync(core: &Core, cmd: Command) {
                 }
             }
             let _ = st.config.save(&st.config_path());
+            emit_settings(cb, st); // echo the applied settings so the UI reflects the saved values
             reply(cb, id, true, None);
         }
 
@@ -636,6 +642,27 @@ fn emit_caps(cb: EventCb) {
         "self_update": true,
         "qr_teacher_assist": false,
         "ocr_captcha": false
+    }}));
+}
+
+/// The current user-facing settings, so a Settings screen reflects what is actually saved (not just
+/// defaults). The LLM key itself is a secret and NEVER crosses the seam — only a `has_llm_key` bool does.
+fn emit_settings(cb: EventCb, st: &CoreState) {
+    let s = &st.config.settings;
+    let has_llm_key = st
+        .vault
+        .as_ref()
+        .and_then(|v| v.get_llm_key())
+        .is_some_and(|k| !k.trim().is_empty());
+    emit(cb, &json!({ "id": null, "event": "Settings", "settings": {
+        "countdown_secs": s.countdown_secs,
+        "attendance_gate_percent": s.attendance_gate_percent,
+        "llm_endpoint": s.llm_endpoint,
+        "llm_model": s.llm_model,
+        "llm_max_tokens": s.llm_max_tokens,
+        "resubmit_for_correct": s.resubmit_for_correct,
+        "enable_llm_tools": s.enable_llm_tools,
+        "has_llm_key": has_llm_key,
     }}));
 }
 

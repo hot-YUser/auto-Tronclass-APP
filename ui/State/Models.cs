@@ -36,6 +36,13 @@ public sealed class CapsVm : ObservableObject
     public bool ForegroundOnly => !BackgroundMonitoring;
 }
 
+/// <summary>核心目前生效的設定快照,讓設定頁反映「已存的值」而非只有預設。
+/// api_key 是機密、永不過縫——只帶 <see cref="HasLlmKey"/> 布林表示是否已設定。</summary>
+public sealed record SettingsSnapshot(
+    int CountdownSecs, double AttendanceGatePercent,
+    string LlmEndpoint, string LlmModel, int LlmMaxTokens,
+    bool ResubmitForCorrect, bool EnableLlmTools, bool HasLlmKey);
+
 public sealed class AccountVm : ObservableObject
 {
     public required string Id { get; init; }

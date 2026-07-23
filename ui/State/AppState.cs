@@ -45,6 +45,11 @@ public sealed class AppState : ObservableObject
     NextClassVm? _nextClass;
     public NextClassVm? NextClass { get => _nextClass; private set => Set(ref _nextClass, value); }
 
+    SettingsSnapshot? _settings;
+    /// <summary>核心目前生效的設定;設定頁據此填入現值(null = 尚未收到)。</summary>
+    public SettingsSnapshot? CurrentSettings { get => _settings; private set => Set(ref _settings, value); }
+    public event Action? SettingsChanged;
+
     public CapsVm Caps { get; } = new();
     public List<SchoolVm> Schools { get; } = [];
     public string? DefaultSchoolKey { get; private set; }
@@ -114,6 +119,14 @@ public sealed class AppState : ObservableObject
                         DateTimeOffset.TryParse(Str(e, "start_time"), out var st) ? st : DateTimeOffset.Now,
                         Str(e, "location") ?? "")
                     : null;
+                break;
+
+            case "Settings" when e.TryGetProperty("settings", out var s):
+                CurrentSettings = new SettingsSnapshot(
+                    Int(s, "countdown_secs"), Dbl(s, "attendance_gate_percent"),
+                    Str(s, "llm_endpoint") ?? "", Str(s, "llm_model") ?? "", Int(s, "llm_max_tokens"),
+                    Bool(s, "resubmit_for_correct"), Bool(s, "enable_llm_tools"), Bool(s, "has_llm_key"));
+                SettingsChanged?.Invoke();
                 break;
 
             case "LogLine": AddLog(Str(e, "level") ?? "info", Str(e, "text") ?? ""); break;
@@ -383,6 +396,17 @@ public sealed class AppState : ObservableObject
         {
             ["countdown_secs"] = countdownSecs,
             ["attendance_gate_percent"] = thresholdEnabled ? thresholdPct : 0.0,
+        })));
+
+    /// <summary>LLM 連線與答題偏好(端點/模型/max_tokens/更正/教材工具)。金鑰另走 SetLlmKey(保險庫)。</summary>
+    public async Task<bool> SaveLlmSettings(string endpoint, string model, int maxTokens, bool resubmit, bool tools) =>
+        OkReply(await Send("UpdateConfig", ("patch", new Dictionary<string, object?>
+        {
+            ["llm_endpoint"] = endpoint,
+            ["llm_model"] = model,
+            ["llm_max_tokens"] = maxTokens,
+            ["resubmit_for_correct"] = resubmit,
+            ["enable_llm_tools"] = tools,
         })));
 
     /// <summary>統一送命令:Reply 失敗與例外一律 Toast+Logs(錯誤永不吞)。回 null 表示丟例外。</summary>

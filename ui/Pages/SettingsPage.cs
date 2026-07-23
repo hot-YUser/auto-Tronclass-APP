@@ -1,10 +1,30 @@
+using System.ComponentModel;
+
 namespace Ui;
 
-/// <summary>設定(帳號分頁入口):監控參數、LLM 金鑰、核心能力、日誌。</summary>
+/// <summary>設定(帳號分頁入口):監控參數、LLM 連線/答題偏好、LLM 金鑰、核心能力、日誌。
+/// 所有欄位以核心推來的 <see cref="AppState.CurrentSettings"/> 現值填入(非只有預設),
+/// 並訂閱 <see cref="AppState.SettingsChanged"/> 隨儲存後回填。金鑰本身不過縫,只顯示「已/未設定」。</summary>
 public sealed class SettingsPage : ContentPage
 {
     readonly AppState _state;
     readonly VerticalStackLayout _capsRows = new() { Spacing = 8 };
+
+    // 監控
+    readonly Entry _countdown = NumEntry();
+    readonly Entry _threshold = NumEntry();
+    readonly Switch _thresholdOn = new() { IsToggled = true };
+    // LLM
+    readonly Label _keyStatus = Theme.Dim("", 12.5);
+    readonly Entry _llmKey = new() { Placeholder = "API 金鑰", IsPassword = true };
+    readonly Entry _endpoint = new() { Placeholder = "https://…/v1/chat/completions" };
+    readonly Entry _model = new() { Placeholder = "模型名稱" };
+    readonly Entry _maxTokens = NumEntry();
+    readonly Switch _resubmit = new();
+    readonly Switch _tools = new();
+
+    readonly Action _onSettings;
+    readonly PropertyChangedEventHandler _onCaps;
 
     public SettingsPage(AppState state)
     {
@@ -12,58 +32,82 @@ public sealed class SettingsPage : ContentPage
         Title = "設定";
 
         // --- 監控參數 ---
-        var countdown = new Entry { Text = "15", Keyboard = Keyboard.Numeric, WidthRequest = 72, HorizontalTextAlignment = TextAlignment.End };
-        var threshold = new Entry { Text = "15", Keyboard = Keyboard.Numeric, WidthRequest = 72, HorizontalTextAlignment = TextAlignment.End };
-        var thresholdOn = new Switch { IsToggled = true };
-
         var monitorCard = Theme.Card(new VerticalStackLayout
         {
             Spacing = 10,
             Children =
             {
-                SettingRow("倒數秒數", "自動簽到/送出前的反悔窗", countdown),
+                SettingRow("倒數秒數", "自動簽到/送出前的反悔窗", _countdown),
                 Theme.Divider(),
-                SettingRow("防假點名門檻(%)", "全班簽到率低於此值不出手", threshold),
+                SettingRow("防假點名門檻(%)", "全班簽到率低於此值不出手", _threshold),
                 Theme.Divider(),
-                SettingRow("啟用門檻", "關閉後任何點名都會處理", thresholdOn),
-                Theme.Primary("儲存設定", async () =>
+                SettingRow("啟用門檻", "關閉後任何點名都會處理", _thresholdOn),
+                Theme.Primary("儲存監控設定", async () =>
                 {
-                    if (!int.TryParse(countdown.Text, out var secs) || secs < 0 ||
-                        !double.TryParse(threshold.Text, out var pct) || pct is < 0 or > 100)
+                    if (!int.TryParse(_countdown.Text, out var secs) || secs < 0 ||
+                        !double.TryParse(_threshold.Text, out var pct) || pct is < 0 or > 100)
                     {
                         state.Notify("error", "數值格式不正確");
                         return;
                     }
-                    if (await state.SaveConfig(secs, pct, thresholdOn.IsToggled))
-                        state.Notify("info", "設定已儲存");
+                    if (await state.SaveConfig(secs, pct, _thresholdOn.IsToggled))
+                        state.Notify("info", "監控設定已儲存");
                 }),
             },
         });
 
-        // --- LLM ---
-        var llmKey = new Entry { Placeholder = "API 金鑰", IsPassword = true };
-        var llmCard = Theme.Card(new VerticalStackLayout
+        // --- LLM 金鑰(存保險庫,與其他 LLM 設定分開) ---
+        var keyCard = Theme.Card(new VerticalStackLayout
         {
             Spacing = 10,
             Children =
             {
-                Theme.Dim("答題由 LLM 產生答案;金鑰加密存於保險庫。", 12.5),
-                llmKey,
+                Theme.Dim("答題由 LLM 產生答案;金鑰加密存於保險庫,不寫入設定檔。", 12.5),
+                _keyStatus,
+                _llmKey,
                 Theme.Primary("儲存金鑰", async () =>
                 {
-                    var key = llmKey.Text?.Trim() ?? "";
+                    var key = _llmKey.Text?.Trim() ?? "";
                     if (key.Length == 0) { state.Notify("error", "請輸入金鑰"); return; }
                     if (await state.SetLlmKey(key))
                     {
-                        llmKey.Text = "";
+                        _llmKey.Text = "";
                         state.Notify("info", "金鑰已儲存");
                     }
                 }),
             },
         });
 
+        // --- LLM 連線與答題偏好 ---
+        var llmCard = Theme.Card(new VerticalStackLayout
+        {
+            Spacing = 10,
+            Children =
+            {
+                SettingRow("端點", "LLM chat-completions 網址", _endpoint),
+                Theme.Divider(),
+                SettingRow("模型", "如 minimaxai/minimax-m3", _model),
+                Theme.Divider(),
+                SettingRow("最大 tokens", "0 = 使用安全預設(16384)", _maxTokens),
+                Theme.Divider(),
+                SettingRow("作答後更正拿滿分", "可重考時交卷→讀正解→再交", _resubmit),
+                Theme.Divider(),
+                SettingRow("允許讀取課程教材", "題目缺背景時讓 LLM 查教材/PDF", _tools),
+                Theme.Primary("儲存 LLM 設定", async () =>
+                {
+                    var endpoint = _endpoint.Text?.Trim() ?? "";
+                    var model = _model.Text?.Trim() ?? "";
+                    if (endpoint.Length == 0 || model.Length == 0) { state.Notify("error", "端點與模型不可空白"); return; }
+                    if (!int.TryParse(_maxTokens.Text, out var mt) || mt < 0) { state.Notify("error", "最大 tokens 格式不正確"); return; }
+                    if (await state.SaveLlmSettings(endpoint, model, mt, _resubmit.IsToggled, _tools.IsToggled))
+                        state.Notify("info", "LLM 設定已儲存");
+                }),
+            },
+        });
+
         // --- 能力(core 判定,UI 只呈現) ---
-        state.Caps.PropertyChanged += (_, _) => BuildCaps();
+        _onCaps = (_, _) => BuildCaps();
+        state.Caps.PropertyChanged += _onCaps;
         BuildCaps();
 
         // --- 日誌 ---
@@ -80,6 +124,11 @@ public sealed class SettingsPage : ContentPage
         state.Logs.CollectionChanged += (_, _) => SyncLogEmpty();
         SyncLogEmpty();
 
+        // 以核心現值回填(現在 + 每次 SettingsChanged)。
+        _onSettings = () => MainThread.BeginInvokeOnMainThread(Populate);
+        state.SettingsChanged += _onSettings;
+        Populate();
+
         Content = new ScrollView
         {
             Content = new VerticalStackLayout
@@ -91,7 +140,9 @@ public sealed class SettingsPage : ContentPage
                     new StatusBanner(state),
                     Theme.Section("監控"),
                     monitorCard,
-                    Theme.Section("LLM"),
+                    Theme.Section("LLM 金鑰"),
+                    keyCard,
+                    Theme.Section("LLM 連線與答題"),
                     llmCard,
                     Theme.Section("此裝置的能力(由核心偵測)"),
                     Theme.Card(_capsRows),
@@ -101,6 +152,31 @@ public sealed class SettingsPage : ContentPage
             },
         };
     }
+
+    /// <summary>以核心現值填入所有欄位(修正舊版「開啟設定頁只顯示預設、不反映已存值」)。</summary>
+    void Populate()
+    {
+        var s = _state.CurrentSettings;
+        if (s is null) return;
+        _countdown.Text = s.CountdownSecs.ToString();
+        _thresholdOn.IsToggled = s.AttendanceGatePercent > 0;
+        _threshold.Text = (s.AttendanceGatePercent > 0 ? s.AttendanceGatePercent : 15).ToString("0.#");
+        _endpoint.Text = s.LlmEndpoint;
+        _model.Text = s.LlmModel;
+        _maxTokens.Text = s.LlmMaxTokens.ToString();
+        _resubmit.IsToggled = s.ResubmitForCorrect;
+        _tools.IsToggled = s.EnableLlmTools;
+        _keyStatus.Text = s.HasLlmKey ? "金鑰狀態:已設定" : "金鑰狀態:尚未設定";
+    }
+
+    protected override void OnDisappearing()
+    {
+        base.OnDisappearing();
+        _state.SettingsChanged -= _onSettings;
+        _state.Caps.PropertyChanged -= _onCaps;
+    }
+
+    static Entry NumEntry() => new() { Keyboard = Keyboard.Numeric, WidthRequest = 140, HorizontalTextAlignment = TextAlignment.End };
 
     static Grid SettingRow(string title, string sub, View control)
     {

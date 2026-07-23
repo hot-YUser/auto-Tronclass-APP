@@ -32,6 +32,19 @@ public sealed class MockCore : ICore
     private string _active = "a1";
     private int _nextId = 3;
 
+    // 目前生效的設定;UpdateConfig/SetLlmKey 後更新並重發,讓設定頁的預覽是活的。
+    private readonly Dictionary<string, object?> _settings = new()
+    {
+        ["countdown_secs"] = 15,
+        ["attendance_gate_percent"] = 15.0,
+        ["llm_endpoint"] = "https://integrate.api.nvidia.com/v1/chat/completions",
+        ["llm_model"] = "minimaxai/minimax-m3",
+        ["llm_max_tokens"] = 16384,
+        ["resubmit_for_correct"] = true,
+        ["enable_llm_tools"] = true,
+        ["has_llm_key"] = false,
+    };
+
     public Task BootAsync(string dataDir)
     {
         Emit(new { id = (object?)null, @event = "Caps", caps = new {
@@ -48,6 +61,7 @@ public sealed class MockCore : ICore
         // Emit null instead to preview the "no upcoming class → card hidden" state.
         Emit(new { id = (object?)null, @event = "NextClass", account_id = "a1", course = "行銷管理",
             start_time = DateTime.Now.AddHours(2).ToString("yyyy-MM-ddTHH:mm:sszzz"), location = "管院 A203" });
+        EmitSettings();
         return Task.CompletedTask;
     }
 
@@ -111,10 +125,21 @@ public sealed class MockCore : ICore
             case "HoldAnswer":
                 Emit(new { id = (object?)null, @event = "LogLine", level = "info", text = $"quiz {Str("quiz_id")} 已暫緩，停止自動送出" });
                 break;
-            // UpdateConfig / SetLlmKey / Shutdown: no event needed — the Reply below is the whole response.
+            case "UpdateConfig":
+                if (f.TryGetValue("patch", out var p) && p is IDictionary<string, object?> patch)
+                    foreach (var kv in patch) _settings[kv.Key] = kv.Value;
+                EmitSettings();
+                break;
+            case "SetLlmKey":
+                _settings["has_llm_key"] = true;
+                EmitSettings();
+                break;
+            // Shutdown: no event needed — the Reply below is the whole response.
         }
         return Task.FromResult(Json(new { id = 0, @event = "Reply", ok = true, error = (object?)null }));
     }
+
+    private void EmitSettings() => Emit(new { id = (object?)null, @event = "Settings", settings = _settings });
 
     /// One pass of the time-limited flows: a radar rollcall (detect → 15s countdown → sign each account),
     /// then an exam (prepared per-account with 1 conflict → LLM reasoning stream → 15s countdown → submit).
