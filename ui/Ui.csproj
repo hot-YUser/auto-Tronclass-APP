@@ -40,7 +40,7 @@
 
 		<!-- Versions -->
 		<ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
-		<ApplicationVersion>1</ApplicationVersion>
+		<ApplicationVersion>2</ApplicationVersion>
 
 		<!-- Windows distribution mode: 'portable' (unpackaged exe, default) or 'msix' (signed installer).
 		     package-windows.ps1 sets -p:PackageMode=msix -p:CertThumbprint=... for the MSIX build. -->

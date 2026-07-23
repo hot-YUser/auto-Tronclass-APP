@@ -8,6 +8,7 @@
 /ui/AppPackages/
 
 # Build artifacts — shipped via GitHub Release, never committed
+/dist/
 *.apk
 *.aab
 *.msix
