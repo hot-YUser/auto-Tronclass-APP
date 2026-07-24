@@ -43,10 +43,11 @@ fakeserver = []
 name = "fake_tronclass"
 required-features = ["fakeserver"]
 
-# 信條「小巧」：為體積最佳化 release 產物（dll / .so）。cdylib 的 panic 不得跨 FFI，abort 反而正確。
+# 信條優先級「速度 ＞ 小巧」：opt-level=3 走速度優先；strip/lto/panic=abort 不犧牲速度也能大幅縮小。
+# cdylib 的 panic 不得跨 FFI，abort 反而正確。
 [profile.release]
-opt-level = "z"     # 為大小最佳化
-lto = true          # link-time optimization
-codegen-units = 1   # 更佳最佳化、更小
-strip = true        # 去除符號
-panic = "abort"     # 無 unwinding 表 → 更小（panic 不跨 FFI，abort 正確）
+opt-level = 3       # 速度優先（信條：速度 ＞ 小巧）
+lto = true          # link-time optimization：速度與大小通常都更好
+codegen-units = 1   # 更佳最佳化
+strip = true        # 去除符號 → 純大小 win、零速度成本
+panic = "abort"     # 無 unwinding 表 → 更小、且 panic 不跨 FFI 故 abort 正確
