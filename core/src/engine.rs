@@ -230,6 +230,11 @@ fn handle_sync(core: &Core, cmd: Command) {
                     }
                 }
             }
+            // The actor emits `idle` when it breaks on Stop, but the abort() above can cancel it before
+            // it gets there — so emit `idle` here too (idempotent) to GUARANTEE the UI leaves the
+            // "monitoring" state. Without this the toggle stays stuck on 停止監控 and monitoring can
+            // never be re-started (the reported "停不下來" bug).
+            emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
             reply(cb, id, true, None);
         }
 
