@@ -14,7 +14,8 @@
 param(
     [Parameter(Mandatory)] [string]$Tag,   # 例 v2.0.0-alpha.4
     [switch]$SkipAndroid,
-    [switch]$SkipWindows
+    [switch]$SkipWindows,
+    [switch]$SkipInstaller                 # 只出 portable zip，不建 Inno 安裝檔
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -31,6 +32,7 @@ $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
 
 $winTfm  = "net11.0-windows10.0.19041.0"
 $winName = "AutoTronclass-$Tag-windows-x64-portable"
+$setupName = "AutoTronclass-$Tag-windows-x64-setup"
 $apkName = "AutoTronclass-$Tag-android.apk"
 $dist = Join-Path $root "dist"; New-Item -ItemType Directory -Force $dist | Out-Null
 function Step($m){ Write-Host "`n=== $m ===" -ForegroundColor Cyan }
@@ -79,6 +81,23 @@ if (-not $SkipWindows) {
     [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $stage), (Join-Path $dist "$winName.zip"), [System.IO.Compression.CompressionLevel]::Optimal, $true)
     [System.IO.Directory]::Delete((Resolve-Path $stage),$true)
     Write-Host ("  ✓ dist\$winName.zip ({0:N0} MB)" -f ((Get-Item $zip).Length/1MB)) -ForegroundColor Green
+
+    # ── 3b. Inno per-user 安裝檔（免 UAC、免任何憑證；未簽 → 首次 SmartScreen 提示）──
+    #    打包同一個 $pub（self-contained，無 .portable 標記 → 安裝版走 %LOCALAPPDATA%）。
+    if (-not $SkipInstaller) {
+        $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+                  "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+                  "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $iscc) { throw "找不到 ISCC.exe（Inno Setup 未裝）— 用 -SkipInstaller 略過，或 winget install JRSoftware.InnoSetup" }
+        Step "build Inno per-user installer"
+        $pubAbs = (Resolve-Path $pub).Path
+        & $iscc /Qp "/DMyAppVersion=$Tag" "/DPubDir=$pubAbs" "/DOutDir=$dist" (Join-Path $root "installer\AutoTronclass.iss")
+        if ($LASTEXITCODE -ne 0) { throw "Inno 安裝檔建置失敗" }
+        $setup = Join-Path $dist "$setupName.exe"
+        if (-not (Test-Path $setup)) { throw "沒產出 setup.exe" }
+        Write-Host ("  ✓ dist\$setupName.exe ({0:N0} MB)" -f ((Get-Item $setup).Length/1MB)) -ForegroundColor Green
+    }
 }
 
 # ── 4. 簽章 Android APK（keystore.properties；keystore 傳絕對路徑，否則 XA4310）──
@@ -98,7 +117,10 @@ if (-not $SkipAndroid) {
 # ── 完成：資產備妥，尚未發布 ──
 Step "資產備妥於 dist\（尚未發布）"
 Get-ChildItem $dist -Filter "*$Tag*" -File | ForEach-Object { "  {0}  {1:N0} MB" -f $_.Name, ($_.Length/1MB) }
+# 自 dist\ 撈本次 tag 的所有資產（排除 RELEASE_NOTES .md），組出上傳清單。
+$assets = (Get-ChildItem $dist -Filter "*$Tag*" -File | Where-Object { $_.Extension -ne '.md' } |
+           ForEach-Object { "dist/$($_.Name)" }) -join " "
 Write-Host "`n下一步（使用者決定後）：" -ForegroundColor Yellow
 Write-Host "  gh release create $Tag --repo hot-YUser/auto-Tronclass-APP --prerelease --target main ``"
 Write-Host "    --title `"$Tag`" --notes-file dist/RELEASE_NOTES-$Tag.md ``"
-Write-Host "    dist/$winName.zip dist/$apkName"
+Write-Host "    $assets"
