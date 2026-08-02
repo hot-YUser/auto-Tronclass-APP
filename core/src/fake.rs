@@ -71,6 +71,7 @@ struct Rollcall {
     hide_code: bool,   // number_code null in the roster → forces a brute-force
     number_fatal: bool, // number answer returns 403 → the code must abort the whole round
     throttle: u32,     // first N number answers return 429 → transient/cooldown path
+    number_attempts: u32, // count of number-code PUTs (test asserts read-not-brute: 1, not thousands)
     use_beacon: bool,       // radar: lite advertises a beacon → answer must carry radarSignal
     beacon_nonce: String,   // radar: beacon nonce fed to the radarSignal md5
     scope_radius_m: f64,    // radar: a submitted coord within this of the target signs
@@ -314,11 +315,17 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             hide_code: v["hide_code"].as_bool().unwrap_or(false),
             number_fatal: v["number_fatal"].as_bool().unwrap_or(false),
             throttle: v["throttle"].as_u64().unwrap_or(0) as u32,
+            number_attempts: 0,
             use_beacon: v["use_beacon"].as_bool().unwrap_or(false),
             beacon_nonce: v["beacon_nonce"].as_str().unwrap_or("nonce-abc").to_string(),
             scope_radius_m: v["scope_radius"].as_f64().unwrap_or(100.0),
         });
         return json(200, r#"{"ok":true}"#);
+    }
+    if let Some(id) = request_line.strip_prefix("GET /_test/number_attempts/").and_then(|s| s.split_whitespace().next()) {
+        let st = state.lock().unwrap();
+        let n = st.rollcalls.iter().find(|r| r.id == id).map_or(0, |r| r.number_attempts);
+        return json(200, &format!(r#"{{"attempts":{n}}}"#));
     }
 
     // --- fake LLM + quiz test-control (no TronClass session needed) ---
@@ -704,6 +711,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
 
     // number: real servers return distinguishable codes + a body success flag (docs 30 classifier).
     if kind == "number" {
+        r.number_attempts += 1; // test counts these: a manual override must READ the code (1), not brute-force
         if r.number_fatal {
             return json(403, r#"{"error":"forbidden"}"#); // session invalid → fatal, abort the round
         }

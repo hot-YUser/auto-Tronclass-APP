@@ -95,6 +95,7 @@ struct Activity {
     gate_pending: bool,
     countdown_deadline: Option<Instant>,
     acted: bool,
+    sign_pending: bool,                   // manual override waiting on a number code-read before it can sign
     signed: HashSet<String>,
     needs_resign: HashSet<String>,        // accounts whose sign hit a dead session → re-sign after re-login
     resign_attempts: HashMap<String, u32>, // per-account auth-lost re-sign count (bounds a permanent 403)
@@ -562,9 +563,17 @@ async fn actor(
                     MonitorMsg::Stop => break,
                     MonitorMsg::Detected(d) => on_detected(&mut activities, &accounts, &self_tx, cb, d),
                     MonitorMsg::GateResult { key, rate } => on_gate(&mut activities, &accounts, &self_tx, cb, &cfg, key, rate),
-                    MonitorMsg::CodeRead { key, code } => { if let Some(a) = activities.get_mut(&key) { a.number_code = code; a.code_requested = true; } }
+                    MonitorMsg::CodeRead { key, code } => {
+                        // A manual override may be waiting on this code (below-gate number: gate held before
+                        // the code-read step). Record it, then sign now if an override was pending.
+                        let dispatch = match activities.get_mut(&key) {
+                            Some(a) => { a.number_code = code; a.code_requested = true; std::mem::take(&mut a.sign_pending) }
+                            None => false,
+                        };
+                        if dispatch { dispatch_signs(&mut activities, &accounts, &self_tx, &cfg, cb, &key); }
+                    }
                     MonitorMsg::SignResult { key, account_id, result } => on_sign_result(&mut activities, &self_tx, cb, key, account_id, result),
-                    MonitorMsg::SignNow { rollcall_id } => { if let Some(key) = find_key(&activities, &rollcall_id) { dispatch_signs(&mut activities, &accounts, &self_tx, &cfg, cb, &key); } }
+                    MonitorMsg::SignNow { rollcall_id } => on_sign_now(&mut activities, &accounts, &self_tx, &cfg, cb, &rollcall_id),
                     MonitorMsg::Defer { rollcall_id } => on_defer(&mut activities, cb, &rollcall_id),
                     MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
                         on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, course_id, activity_id, account_id, stem),
@@ -624,6 +633,7 @@ fn on_detected(
         gate_pending: true,
         countdown_deadline: None,
         acted: false,
+        sign_pending: false,
         signed: HashSet::new(),
         needs_resign: HashSet::new(),
         resign_attempts: HashMap::new(),
@@ -698,6 +708,52 @@ fn on_tick(
                 spawn_gate_check(accounts, tx, &key, &acc_id);
             }
         }
+    }
+}
+
+/// Manual override ("立即簽到"): sign the held rollcall NOW, bypassing the anti-fake gate. For a NUMBER
+/// rollcall whose shared code hasn't been read yet (the gate held BEFORE the code-read step ran), read
+/// the code first and sign the instant it lands — NEVER brute-force 0000–9999 against the real server
+/// when the roster exposes the code. Fixes the reported「簽到率未達門檻時立即簽到沒反應」: a held number
+/// rollcall silently brute-forced (thousands of PUTs, rate-limits, no timely sign) instead of signing.
+fn on_sign_now(
+    activities: &mut HashMap<ActivityKey, Activity>,
+    accounts: &HashMap<String, Arc<Account>>,
+    tx: &UnboundedSender<MonitorMsg>,
+    cfg: &MonitorConfig,
+    cb: EventCb,
+    rollcall_id: &str,
+) {
+    let Some(key) = find_key(activities, rollcall_id) else { return };
+    // Decide under a scoped borrow, then act once it ends (dispatch_signs re-borrows `activities`).
+    enum Act {
+        None,
+        ReadCode(Option<String>),
+        Dispatch,
+    }
+    let act = {
+        let Some(a) = activities.get_mut(&key) else { return };
+        if a.acted {
+            Act::None
+        } else if a.kind == RollcallKind::Number && a.number_code.is_none() {
+            // Held number without its code: read it, then sign on CodeRead (see the CodeRead arm).
+            a.gate_pending = false;
+            a.countdown_deadline = None;
+            a.sign_pending = true;
+            if a.code_requested {
+                Act::ReadCode(None) // a read is already in flight; sign_pending fires when it lands
+            } else {
+                a.code_requested = true;
+                Act::ReadCode(a.participants.iter().next().cloned())
+            }
+        } else {
+            Act::Dispatch
+        }
+    };
+    match act {
+        Act::None | Act::ReadCode(None) => {}
+        Act::ReadCode(Some(acc_id)) => spawn_code_read(accounts, tx, &key, &acc_id),
+        Act::Dispatch => dispatch_signs(activities, accounts, tx, cfg, cb, &key),
     }
 }
 

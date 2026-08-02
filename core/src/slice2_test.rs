@@ -80,6 +80,18 @@ fn open_rollcall(base_url: &str, body: &str) {
     let _ = s.read_to_string(&mut buf);
 }
 
+/// Read the fake's count of number-code PUTs for a rollcall (dev `_test` endpoint).
+fn number_attempts(base_url: &str, id: &str) -> u32 {
+    let addr = base_url.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    let req = format!("GET /_test/number_attempts/{id} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    let body = buf.rsplit("\r\n\r\n").next().unwrap_or("");
+    serde_json::from_str::<Value>(body).ok().and_then(|v| v["attempts"].as_u64()).unwrap_or(0) as u32
+}
+
 fn signed(rollcall_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let account = account.to_string();
     let rollcall_id = rollcall_id.to_string();
@@ -168,6 +180,25 @@ fn slice2_multi_account_monitoring_and_four_types() {
     // --- 15% gate blocks a near-empty rollcall ---
     open_rollcall(&base_a, r#"{"id":"RC9","kind":"self_registration","attendance_rate":5}"#);
     assert!(none_for(|v| v["event"] == "SignedIn" && v["rollcall_id"] == "RC9", 4), "below-15% rollcall must NOT be signed");
+
+    // --- below-gate held → SignNow override signs anyway (the reported「簽到率未達門檻時立即簽到沒反應」路徑）---
+    let i = next();
+    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","rollcall_id":"RC9"}}"#));
+    assert!(wait_for(signed("RC9", &alice), 10).is_some(), "SignNow must override the gate and sign the held RC9");
+
+    // --- below-gate NUMBER: manual override must READ the roster code, NOT brute-force 0000–9999 ---
+    // Root cause of「立即簽到沒反應」: the code-read only ran on the gate-PASS path, so a held number
+    // rollcall had number_code=None → SignNow brute-forced (thousands of PUTs, rate-limits, no timely sign).
+    open_rollcall(&base_a, r#"{"id":"RC8","kind":"number","number_code":"4242","attendance_rate":5}"#);
+    assert!(wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC8", 10).is_some(), "RC8 detected");
+    assert!(none_for(signed("RC8", &alice), 3), "below-gate number must not auto-sign");
+    let i = next();
+    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","rollcall_id":"RC8"}}"#));
+    assert!(wait_for(signed("RC8", &alice), 10).is_some(), "SignNow on the held number signs");
+    // Read-not-brute: one PUT per participant (alice/bob/teacher on base_a share the read code) ≈ a few,
+    // NEVER the thousands a 0000–9999 brute-force would make against the real server.
+    let attempts = number_attempts(&base_a, "RC8");
+    assert!(attempts <= 5, "manual override READ the code ({attempts} PUTs ≈ participants), not brute-forced");
 
     // --- defer → PendingSignIn → no auto-sign → SignNow → signs ---
     open_rollcall(&base_a, r#"{"id":"RC5","kind":"self_registration","attendance_rate":100}"#);
