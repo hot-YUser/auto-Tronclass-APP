@@ -46,7 +46,7 @@ public class CoreForegroundService : Service
         {
             _core.EventReceived -= OnCoreEvent; // dedup: OnStartCommand can run again (e.g. activity restart)
             _core.EventReceived += OnCoreEvent;
-            _ = _core.BootAsync(FileSystem.AppDataDirectory);
+            _ = _core.BootAsync(DataPaths.Resolve()); // Android → 沙盒；與 UI 端同一決策點
         }
 
         return StartCommandResult.Sticky;

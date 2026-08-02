@@ -70,6 +70,10 @@ if (-not $SkipWindows) {
     $stage = Join-Path $dist $winName
     if(Test-Path $stage){ [System.IO.Directory]::Delete((Resolve-Path $stage),$true) }
     Copy-Item $pub $stage -Recurse -Force
+    # 真 portable 標記：App 見到 exe 旁有 .portable 就把資料(帳號/設定/金鑰)寫在本資料夾 Data\ 內，
+    # 而非系統 → 刪掉整個資料夾即零殘留。安裝版(Inno)不含此檔，故用 %LOCALAPPDATA%。
+    Set-Content -Path (Join-Path $stage ".portable") -Encoding UTF8 `
+        -Value "此檔存在＝真 portable：資料存在本資料夾的 Data\ 內（非系統）。刪掉整個資料夾即完全清除，不留系統殘留。"
     $zip = Join-Path $dist "$winName.zip"
     if(Test-Path $zip){ [System.IO.File]::Delete((Resolve-Path $zip).Path) }
     [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $stage), (Join-Path $dist "$winName.zip"), [System.IO.Compression.CompressionLevel]::Optimal, $true)

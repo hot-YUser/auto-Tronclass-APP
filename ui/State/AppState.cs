@@ -19,7 +19,7 @@ public sealed class AppState : ObservableObject
         core.EventReceived += e => MainThread.BeginInvokeOnMainThread(() => Route(e));
     }
 
-    public Task BootAsync() => _core.BootAsync(FileSystem.AppDataDirectory);
+    public Task BootAsync() => _core.BootAsync(DataPaths.Resolve());
 
     // ---------------- 標量 ----------------
 
