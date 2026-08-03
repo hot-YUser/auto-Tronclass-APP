@@ -224,10 +224,7 @@ fn handle_sync(core: &Core, cmd: Command) {
         Command::StopMonitoring { .. } => {
             if let Some(st) = guard.as_mut() {
                 if let Some(h) = st.monitor.take() {
-                    let _ = h.tx.send(monitor::MonitorMsg::Stop);
-                    for t in h.tasks {
-                        t.abort();
-                    }
+                    stop_monitor(h);
                 }
             }
             // The actor emits `idle` when it breaks on Stop, but the abort() above can cancel it before
@@ -363,7 +360,7 @@ fn handle_sync(core: &Core, cmd: Command) {
         Command::Shutdown { .. } => {
             if let Some(st) = guard.as_mut() {
                 if let Some(h) = st.monitor.take() {
-                    let _ = h.tx.send(monitor::MonitorMsg::Stop);
+                    stop_monitor(h);
                 }
                 if let Some(v) = st.vault.as_mut() {
                     v.lock();
@@ -386,6 +383,19 @@ fn route_to_monitor(cb: EventCb, state: Option<&CoreState>, id: u64, msg: monito
         }
         None => reply(cb, id, false, Some("not monitoring".into())),
     }
+}
+
+fn stop_monitor(h: monitor::MonitorHandle) {
+    for poller in h.pollers {
+        poller.abort();
+    }
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+    if h.tx.send(monitor::MonitorMsg::Stop { ack: ack_tx }).is_ok() {
+        let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(4));
+    }
+    // The actor has either acknowledged after bounded QR cleanup or exceeded that bound. Aborting the
+    // handle in both cases guarantees no monitor-scoped task is detached when the handle is dropped.
+    h.actor.abort();
 }
 
 /// Login: snapshot (base_url, username, password, cached cookies) under the lock, release it, do
@@ -657,7 +667,7 @@ fn emit_accounts(cb: EventCb, st: &CoreState) {
 
 fn emit_caps(cb: EventCb) {
     // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false. QR teacher-assist IS implemented
-    // (monitor::spawn_qr_teacher_assist) — the build supports it; it just needs a teacher account added.
+    // (monitor::run_qr_teacher_assist) — the build supports it; it just needs a teacher account added.
     emit(cb, &json!({ "id": null, "event": "Caps", "caps": {
         "background_monitoring": true,
         "self_update": true,

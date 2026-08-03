@@ -5,7 +5,7 @@
 //! portable `data`, which a student then applies to *their own* rollcall id.
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -137,6 +137,14 @@ struct FakeState {
     sign_expired: bool,     // R4.1 #2: ONLY the PUT answer_* (sign) routes expire; poll/detect stay healthy
     sign_expire_user: String, // R4.1 #2: expire only this user's signs (empty = all) → per-account double-sign test
     down: bool,             // R4.1 stale-offline: the poll canary gets a 503 (transient blip, NOT auth-lost)
+    rollcall_polls: HashMap<String, u32>,
+    teacher_create_payloads: Vec<Value>,
+    teacher_starts: u32,
+    teacher_token_fetches: u32,
+    teacher_stops: u32,
+    qr_answers: u32,
+    teacher_token_status: u16,
+    qr_deny_confirmation: bool,
 }
 
 pub async fn bind_ephemeral() -> (u16, TcpListener) {
@@ -280,7 +288,11 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         let st = state.lock().unwrap();
         (st.expired && raw_user.is_some(), st.expire_mode.clone())
     };
-    if expired && (request_line.starts_with("GET /api") || request_line.starts_with("PUT /api")) {
+    if expired
+        && (request_line.starts_with("GET /api")
+            || request_line.starts_with("PUT /api")
+            || request_line.starts_with("POST /api"))
+    {
         match mode.as_str() {
             "401" => return response(401, "application/json", "", r#"{"error":"unauthorized"}"#),
             "redirect" => return redirect("/login"),
@@ -326,6 +338,27 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         let st = state.lock().unwrap();
         let n = st.rollcalls.iter().find(|r| r.id == id).map_or(0, |r| r.number_attempts);
         return json(200, &format!(r#"{{"attempts":{n}}}"#));
+    }
+    if request_line.starts_with("POST /_test/teacher_token_status") {
+        let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
+        state.lock().unwrap().teacher_token_status = v["status"].as_u64().unwrap_or(0) as u16;
+        return json(200, r#"{"ok":true}"#);
+    }
+    if request_line.starts_with("POST /_test/qr_deny_confirmation") {
+        let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
+        state.lock().unwrap().qr_deny_confirmation = v["enabled"].as_bool().unwrap_or(true);
+        return json(200, r#"{"ok":true}"#);
+    }
+    if request_line.starts_with("GET /_test/qr_stats") {
+        let st = state.lock().unwrap();
+        return json(200, &json!({
+            "rollcall_polls": st.rollcall_polls,
+            "teacher_create_payloads": st.teacher_create_payloads,
+            "teacher_starts": st.teacher_starts,
+            "teacher_token_fetches": st.teacher_token_fetches,
+            "teacher_stops": st.teacher_stops,
+            "qr_answers": st.qr_answers,
+        }).to_string());
     }
 
     // --- fake LLM + quiz test-control (no TronClass session needed) ---
@@ -443,7 +476,8 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     let Some(user) = user else { return html(200, "", LOGIN_PAGE) };
 
     if request_line.starts_with("GET /api/radar/rollcalls") {
-        let st = state.lock().unwrap();
+        let mut st = state.lock().unwrap();
+        *st.rollcall_polls.entry(user.clone()).or_insert(0) += 1;
         if st.down {
             return response(503, "application/json", "", r#"{"error":"service unavailable"}"#); // transient blip
         }
@@ -616,12 +650,23 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
 
     // --- teacher QR: source the portable data ---
     if request_line.starts_with("POST /api/course/") && request_line.contains("/rollcall") && !request_line.contains("qr_code") {
+        state.lock().unwrap().teacher_create_payloads.push(serde_json::from_str(body.trim()).unwrap_or(Value::Null));
         return json(200, r#"{"rollcall_id":"teacher-qr-1"}"#);
     }
     if request_line.contains("/qr_code") {
+        let mut st = state.lock().unwrap();
+        st.teacher_token_fetches += 1;
+        if st.teacher_token_status != 0 {
+            return response(st.teacher_token_status, "application/json", "", "{\"error\":\"scripted\"}");
+        }
         return json(200, &format!(r#"{{"data":"{QR_TOKEN}"}}"#));
     }
-    if request_line.contains("/start-rollcall") || request_line.contains("/stop_qr_rollcall") {
+    if request_line.contains("/start-rollcall") {
+        state.lock().unwrap().teacher_starts += 1;
+        return json(200, r#"{"ok":true}"#);
+    }
+    if request_line.contains("/stop_qr_rollcall") {
+        state.lock().unwrap().teacher_stops += 1;
         return json(200, r#"{"ok":true}"#);
     }
 
@@ -707,6 +752,10 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
     if kind == "radar" && body.contains("radarSignal") {
         st.saw_radar_signal = true; // beacon test: the answer carried a radarSignal
     }
+    if kind == "qrcode" {
+        st.qr_answers += 1;
+    }
+    let qr_deny_confirmation = st.qr_deny_confirmation;
     let Some(r) = st.rollcalls.iter_mut().find(|r| r.id == id) else { return json(404, "{}") };
 
     // number: real servers return distinguishable codes + a body success flag (docs 30 classifier).
@@ -761,7 +810,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
         "qrcode" => v["data"].as_str() == Some(QR_TOKEN), // teacher-sourced portable data
         _ => false,
     };
-    if signed_now {
+    if signed_now && !qr_deny_confirmation {
         r.signed.insert(user.to_string());
     }
     json(200, r#"{"ok":true}"#)

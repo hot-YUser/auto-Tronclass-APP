@@ -41,6 +41,7 @@ fakeserver = []
 
 [[bin]]
 name = "fake_tronclass"
+path = "src/fake_bin.rs"
 required-features = ["fakeserver"]
 
 # 信條：小巧＝一般情況的最高宗旨，只有「真衝突」才讓給速度/清晰。此核心 I/O-bound，

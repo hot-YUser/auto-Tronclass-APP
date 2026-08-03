@@ -588,35 +588,44 @@ pub async fn sign_qr_with_teacher_data(
     data: &str,
     user_no: &str,
 ) -> Result<SignOutcome, String> {
-    student
+    let resp = student
         .put(ep.answer_qr(student_rollcall_id))
         .json(&json!({ "deviceId": device_id, "data": data }))
         .send()
         .await
         .map_err(|e| format!("qr: {e}"))?;
-    if recheck_on_call_fine(student, ep, student_rollcall_id, user_no).await {
+    let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
+    let body = resp.text().await.unwrap_or_default();
+    if response_auth_lost(status, &rurl, &body) {
+        return Err(format!("qr: {SESSION_INVALID}"));
+    }
+    if matches!(status, 408 | 425 | 429) || (500..600).contains(&status) {
+        return Err("qr: transient HTTP failure".into());
+    }
+    if !(200..300).contains(&status) {
+        return Err("qr: HTTP failure".into());
+    }
+
+    let recheck = student.get(ep.student_rollcalls(student_rollcall_id)).send().await
+        .map_err(|_| "qr: transient roster recheck".to_string())?;
+    let (status, rurl) = (recheck.status().as_u16(), recheck.url().clone());
+    let body = recheck.text().await.unwrap_or_default();
+    if response_auth_lost(status, &rurl, &body) {
+        return Err(format!("qr: {SESSION_INVALID}"));
+    }
+    if matches!(status, 408 | 425 | 429) || (500..600).contains(&status) {
+        return Err("qr: transient roster recheck".into());
+    }
+    if !(200..300).contains(&status) {
+        return Err("qr: roster recheck failed".into());
+    }
+    let v: Value = serde_json::from_str(body.trim()).map_err(|_| "qr: invalid roster response".to_string())?;
+    let (present, total) = roster_stats(&v);
+    if my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v) {
         Ok(SignOutcome { method: "qr(teacher-assist)".into(), ..Default::default() })
     } else {
         Err("qr submitted but on_call_fine not set".into())
     }
-}
-
-/// Teacher side: read the rotating `data` from the teacher's OWN qr rollcall (the data source).
-pub async fn teacher_source_qr_data(
-    teacher: &Client,
-    ep: &Endpoints,
-    course_id: &str,
-    teacher_rollcall_id: &str,
-) -> Option<String> {
-    let v: Value = teacher
-        .get(ep.teacher_qr_code(course_id, teacher_rollcall_id))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    v.get("data").and_then(|d| d.as_str().map(str::to_string))
 }
 
 #[cfg(test)]
