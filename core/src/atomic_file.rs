@@ -15,6 +15,20 @@ pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write(path, bytes, true)
 }
 
+pub fn remove(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            sync_parent(parent)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn write(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
     let parent = path
         .parent()

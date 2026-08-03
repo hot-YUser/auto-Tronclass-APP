@@ -13,6 +13,7 @@ mod http;
 mod llm;
 mod login;
 mod monitor;
+mod persistence;
 mod protocol;
 mod providers;
 mod quiz;

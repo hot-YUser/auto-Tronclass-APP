@@ -6,6 +6,7 @@
 use crate::config::{new_id, AccountMeta, Config};
 use crate::login::{self, LoginOutcome};
 use crate::monitor::{self, MonitorConfig};
+use crate::persistence::{AccountJournal, AccountMutation};
 use crate::protocol::Command;
 use crate::providers::{Endpoints, Registry};
 use crate::secrets::{AccountSecret, VaultFile};
@@ -124,6 +125,30 @@ fn open_vault_auto(dir: &std::path::Path) -> Result<VaultFile, String> {
     }
 }
 
+fn recover_account_transaction(
+    dir: &std::path::Path,
+    config: &Config,
+    vault: &mut VaultFile,
+) -> Result<Option<String>, String> {
+    let Some(journal) = AccountJournal::load(dir)? else {
+        return Ok(None);
+    };
+    let account_exists = config.account(&journal.account_id).is_some();
+    // In either ordered transaction, an absent config record means the durable end state must not
+    // retain a secret: rollback an unfinished Add or roll forward an already-configured Delete.
+    if !account_exists {
+        vault.delete(&journal.account_id)?;
+    }
+    AccountJournal::complete(dir)?;
+    Ok(Some(format!(
+        "已恢復未完成的帳號{}交易",
+        match journal.mutation {
+            AccountMutation::Add => "新增",
+            AccountMutation::Delete => "刪除",
+        }
+    )))
+}
+
 pub struct Core {
     rt: Runtime,
     cb: EventCb,
@@ -201,8 +226,8 @@ fn handle_sync(core: &Core, cmd: Command) {
             let _ = std::fs::create_dir_all(&dir);
             let registry = Registry::load_or_seed(&dir.join("providers.json"));
             let config_path = dir.join("config.json");
-            let config = match Config::load(&config_path) {
-                Ok(config) => config,
+            let (config, config_healthy) = match Config::load(&config_path) {
+                Ok(config) => (config, true),
                 Err(error) => {
                     let recovery = match Config::quarantine(&config_path) {
                         Ok(path) => format!(
@@ -213,12 +238,12 @@ fn handle_sync(core: &Core, cmd: Command) {
                     };
                     emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
                         "code": "config_corrupt", "message": format!("{error}{recovery}") }));
-                    Config::default()
+                    (Config::default(), false)
                 }
             };
             crate::redaction::set_level(&config.settings.log_level);
             // Auto-unlock: the vault opens with a persistent per-device key — no master password.
-            let vault = match open_vault_auto(&dir) {
+            let mut vault = match open_vault_auto(&dir) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
@@ -226,6 +251,17 @@ fn handle_sync(core: &Core, cmd: Command) {
                     None
                 }
             };
+            if config_healthy {
+                if let Some(vault) = vault.as_mut() {
+                    match recover_account_transaction(&dir, &config, vault) {
+                        Ok(Some(message)) => emit(cb, &json!({ "id": null, "event": "LogLine",
+                            "level": "warn", "text": message })),
+                        Ok(None) => {}
+                        Err(error) => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                            "code": "account_transaction_recovery_failed", "message": error })),
+                    }
+                }
+            }
             let unlocked = vault.is_some();
             *guard = Some(CoreState {
                 data_dir: dir,
@@ -269,16 +305,36 @@ fn handle_sync(core: &Core, cmd: Command) {
                 course_id,
             };
             let acc_id = account.id.clone();
+            if let Err(error) = AccountJournal::begin(&st.data_dir, AccountMutation::Add, &acc_id) {
+                return reply(cb, id, false, Some(error));
+            }
             if let Err(e) = st.vault.as_mut().unwrap().set(
                 &acc_id,
                 AccountSecret { password, cookies: String::new() },
             ) {
+                let _ = AccountJournal::complete(&st.data_dir);
                 return reply(cb, id, false, Some(e));
             }
+            let previous_config = st.config.clone();
             st.config.accounts.push(account);
-            st.config.active_account.get_or_insert(acc_id);
+            st.config.active_account.get_or_insert(acc_id.clone());
             if let Err(e) = st.config.save(&st.config_path()) {
-                return reply(cb, id, false, Some(e));
+                st.config = previous_config;
+                let rollback = st.vault.as_mut().unwrap().delete(&acc_id);
+                if rollback.is_ok() {
+                    let _ = AccountJournal::complete(&st.data_dir);
+                }
+                let error = match rollback {
+                    Ok(()) => e,
+                    Err(rollback_error) => format!(
+                        "{e}; vault rollback failed and will retry on restart: {rollback_error}"
+                    ),
+                };
+                return reply(cb, id, false, Some(error));
+            }
+            if let Err(error) = AccountJournal::complete(&st.data_dir) {
+                emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
+                    "code": "account_transaction_cleanup_failed", "message": error }));
             }
             emit_accounts(cb, st);
             reply(cb, id, true, None);
@@ -289,22 +345,58 @@ fn handle_sync(core: &Core, cmd: Command) {
             if st.config.account(&account_id).is_none() {
                 return reply(cb, id, false, Some("no such account".into()));
             }
+            let previous = st.config.active_account.clone();
             st.config.active_account = Some(account_id);
-            let _ = st.config.save(&st.config_path());
+            if let Err(error) = st.config.save(&st.config_path()) {
+                st.config.active_account = previous;
+                return reply(cb, id, false, Some(error));
+            }
             emit_accounts(cb, st);
             reply(cb, id, true, None);
         }
 
         Command::DeleteAccount { account_id, .. } => {
             let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
+            if st.config.account(&account_id).is_none() {
+                return reply(cb, id, false, Some("no such account".into()));
+            }
+            if st.vault.is_none() {
+                return reply(cb, id, false, Some("vault is locked".into()));
+            }
+            if let Err(error) = AccountJournal::begin(&st.data_dir, AccountMutation::Delete, &account_id) {
+                return reply(cb, id, false, Some(error));
+            }
+            let previous_config = st.config.clone();
             st.config.accounts.retain(|a| a.id != account_id);
             if st.config.active_account.as_deref() == Some(account_id.as_str()) {
                 st.config.active_account = st.config.accounts.first().map(|a| a.id.clone());
             }
-            if let Some(v) = st.vault.as_mut() {
-                let _ = v.delete(&account_id);
+            if let Err(error) = st.config.save(&st.config_path()) {
+                st.config = previous_config;
+                let _ = AccountJournal::complete(&st.data_dir);
+                return reply(cb, id, false, Some(error));
             }
-            let _ = st.config.save(&st.config_path());
+            if let Err(vault_error) = st.vault.as_mut().unwrap().delete(&account_id) {
+                let deleted_config = st.config.clone();
+                st.config = previous_config;
+                if let Err(config_error) = st.config.save(&st.config_path()) {
+                    st.config = deleted_config;
+                    return reply(
+                        cb,
+                        id,
+                        false,
+                        Some(format!(
+                            "delete vault entry failed: {vault_error}; config rollback failed and recovery journal remains: {config_error}"
+                        )),
+                    );
+                }
+                let _ = AccountJournal::complete(&st.data_dir);
+                return reply(cb, id, false, Some(format!("delete vault entry failed: {vault_error}")));
+            }
+            if let Err(error) = AccountJournal::complete(&st.data_dir) {
+                emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
+                    "code": "account_transaction_cleanup_failed", "message": error }));
+            }
             emit_accounts(cb, st);
             reply(cb, id, true, None);
         }
@@ -370,6 +462,7 @@ fn handle_sync(core: &Core, cmd: Command) {
 
         Command::UpdateConfig { patch, .. } => {
             let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
+            let previous_config = st.config.clone();
             let s = &mut st.config.settings;
             if let Some(v) = patch.get("countdown_secs").and_then(Value::as_u64) {
                 s.countdown_secs = v;
@@ -427,7 +520,6 @@ fn handle_sync(core: &Core, cmd: Command) {
             }
             if let Some(v) = patch.get("log_level").and_then(Value::as_str) {
                 s.log_level = v.to_string();
-                crate::redaction::set_level(&s.log_level);
             }
             if let Some(v) = patch.get("tz_offset_minutes").and_then(Value::as_i64) {
                 s.tz_offset_minutes = v;
@@ -437,7 +529,11 @@ fn handle_sync(core: &Core, cmd: Command) {
                     s.operating = o;
                 }
             }
-            let _ = st.config.save(&st.config_path());
+            if let Err(error) = st.config.save(&st.config_path()) {
+                st.config = previous_config;
+                return reply(cb, id, false, Some(error));
+            }
+            crate::redaction::set_level(&st.config.settings.log_level);
             push_config(st); // a running monitor adopts the change live (no stop/start)
             emit_settings(cb, st); // echo the applied settings so the UI reflects the saved values
             reply(cb, id, true, None);
@@ -567,16 +663,22 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
             Ok(from_cache) => {
                 let cookies = dump_cookies(&jar);
                 // Re-lock to cache the refreshed cookies into the vault.
-                if let Ok(mut guard) = state.lock() {
-                    if let Some(st) = guard.as_mut() {
-                        if let Some(v) = st.vault.as_mut() {
-                            let _ = v.set(&account_id, AccountSecret { password, cookies });
-                        }
-                    }
-                }
+                let persist_error = match state.lock() {
+                    Ok(mut guard) => match guard.as_mut().and_then(|st| st.vault.as_mut()) {
+                        Some(vault) => vault
+                            .set(&account_id, AccountSecret { password, cookies })
+                            .err(),
+                        None => Some("vault is locked".to_string()),
+                    },
+                    Err(_) => Some("core state lock poisoned".to_string()),
+                };
                 emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
-                emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": true,
-                                  "detail": if from_cache { "session restored from cache" } else { "logged in" } }));
+                match persist_error {
+                    Some(error) => emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": false,
+                        "reason": format!("login succeeded but session persistence failed: {error}") })),
+                    None => emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": true,
+                        "detail": if from_cache { "session restored from cache" } else { "logged in" } })),
+                }
             }
             Err(e) => {
                 // One report only: the correlated LoginResult(ok:false) already surfaces `reason` as a
@@ -707,7 +809,11 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                     for (aid, ck) in &refreshed {
                         if let Some(mut sec) = v.get(aid) {
                             sec.cookies = ck.clone();
-                            let _ = v.set(aid, sec);
+                            if let Err(error) = v.set(aid, sec) {
+                                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                                    "code": "session_persistence_failed",
+                                    "message": format!("{aid}: {error}") }));
+                            }
                         }
                     }
                 }
@@ -767,17 +873,29 @@ fn spawn_import_cookies(core: &Core, id: u64, account_id: String, cookies_json: 
     core.rt.spawn(async move {
         let endpoints = Endpoints::derive(&base_url);
         let (client, _jar) = build_client(&cookies_json);
-        let ok = login::verify_session(&client, &endpoints).await;
-        if let Ok(mut guard) = state.lock() {
-            if let Some(st) = guard.as_mut() {
-                if let Some(v) = st.vault.as_mut() {
-                    let _ = v.set(&account_id, AccountSecret { password, cookies: cookies_json });
-                }
+        let verified = login::verify_session(&client, &endpoints).await;
+        let persist_error = if verified {
+            match state.lock() {
+                Ok(mut guard) => match guard.as_mut().and_then(|st| st.vault.as_mut()) {
+                    Some(vault) => vault
+                        .set(&account_id, AccountSecret { password, cookies: cookies_json })
+                        .err(),
+                    None => Some("vault is locked".to_string()),
+                },
+                Err(_) => Some("core state lock poisoned".to_string()),
             }
-        }
+        } else {
+            None
+        };
+        let ok = verified && persist_error.is_none();
         emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
                           "state": if ok { "online" } else { "login_failed" } }));
-        reply(cb, id, ok, if ok { None } else { Some("imported cookies did not verify".into()) });
+        let error = if !verified {
+            Some("imported cookies did not verify".into())
+        } else {
+            persist_error.map(|error| format!("cookies verified but persistence failed: {error}"))
+        };
+        reply(cb, id, ok, error);
     });
 }
 
@@ -954,5 +1072,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn account_transaction_recovery_is_idempotent_for_add_and_delete() {
+        for (mutation, account_exists, expect_secret) in [
+            (AccountMutation::Add, false, false),
+            (AccountMutation::Add, true, true),
+            (AccountMutation::Delete, false, false),
+            (AccountMutation::Delete, true, true),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "tron-account-recovery-{}",
+                crate::config::new_id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let key = crate::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
+            let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
+            vault
+                .set(
+                    "acc",
+                    AccountSecret {
+                        password: "secret".into(),
+                        cookies: String::new(),
+                    },
+                )
+                .unwrap();
+            let mut config = Config::default();
+            if account_exists {
+                config.accounts.push(AccountMeta {
+                    id: "acc".into(),
+                    label: "account".into(),
+                    school_ref: "school".into(),
+                    username: "user".into(),
+                    device_id: "device".into(),
+                    is_teacher: false,
+                    course_id: None,
+                });
+            }
+            AccountJournal::begin(&dir, mutation, "acc").unwrap();
+
+            assert!(recover_account_transaction(&dir, &config, &mut vault)
+                .unwrap()
+                .is_some());
+            assert_eq!(vault.get("acc").is_some(), expect_secret);
+            assert!(AccountJournal::load(&dir).unwrap().is_none());
+            assert!(recover_account_transaction(&dir, &config, &mut vault)
+                .unwrap()
+                .is_none());
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
