@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountMeta {
@@ -278,17 +278,44 @@ pub struct Config {
     pub settings: Settings,
 }
 
+#[derive(Debug)]
+pub enum ConfigLoadError {
+    Read(String),
+    InvalidJson(String),
+}
+
+impl std::fmt::Display for ConfigLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "read config: {error}"),
+            Self::InvalidJson(error) => write!(formatter, "invalid config JSON: {error}"),
+        }
+    }
+}
+
 impl Config {
-    pub fn load(path: &Path) -> Config {
-        fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    pub fn load(path: &Path) -> Result<Config, ConfigLoadError> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Config::default())
+            }
+            Err(error) => return Err(ConfigLoadError::Read(error.to_string())),
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| ConfigLoadError::InvalidJson(error.to_string()))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(path, bytes).map_err(|e| e.to_string())
+        crate::atomic_file::replace(path, &bytes).map_err(|e| format!("write config: {e}"))
+    }
+
+    pub fn quarantine(path: &Path) -> Result<PathBuf, String> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let quarantined = parent.join(format!("config-broken-{}.json", new_id()));
+        fs::rename(path, &quarantined).map_err(|error| format!("quarantine config: {error}"))?;
+        Ok(quarantined)
     }
 
     pub fn account(&self, id: &str) -> Option<&AccountMeta> {

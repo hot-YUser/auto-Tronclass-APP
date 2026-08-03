@@ -138,11 +138,29 @@ fn config_account_crud_persists() {
     cfg.active_account = Some(id.clone());
     cfg.save(&path).unwrap();
 
-    let reloaded = Config::load(&path);
+    let reloaded = Config::load(&path).unwrap();
     assert_eq!(reloaded.active_account.as_deref(), Some(id.as_str()));
     assert_eq!(reloaded.account(&id).unwrap().username, "student");
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn corrupt_config_is_explicitly_quarantined_before_recovery() {
+    let path = tmp("corrupt-config.json");
+    let corrupt = b"{ definitely not json".to_vec();
+    std::fs::write(&path, &corrupt).unwrap();
+
+    assert!(Config::load(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    let quarantined = Config::quarantine(&path).unwrap();
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&quarantined).unwrap(), corrupt);
+
+    Config::default().save(&path).unwrap();
+    assert!(Config::load(&path).is_ok());
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(quarantined);
 }
 
 #[test]

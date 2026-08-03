@@ -244,7 +244,7 @@ fn settings_persist_over_the_seam() {
     assert!(wait_for(reply_ok(i), 5).unwrap()["ok"] == true);
 
     // Read the persisted config.json back and confirm every knob round-tripped.
-    let cfg = crate::config::Config::load(&PathBuf::from(&dir).join("config.json"));
+    let cfg = crate::config::Config::load(&PathBuf::from(&dir).join("config.json")).unwrap();
     let s = &cfg.settings;
     assert_eq!(s.llm_max_tokens, 32000);
     assert_eq!(s.number_concurrency, 4);

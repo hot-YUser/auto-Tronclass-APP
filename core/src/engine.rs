@@ -200,7 +200,22 @@ fn handle_sync(core: &Core, cmd: Command) {
             let dir = PathBuf::from(&data_dir);
             let _ = std::fs::create_dir_all(&dir);
             let registry = Registry::load_or_seed(&dir.join("providers.json"));
-            let config = Config::load(&dir.join("config.json"));
+            let config_path = dir.join("config.json");
+            let config = match Config::load(&config_path) {
+                Ok(config) => config,
+                Err(error) => {
+                    let recovery = match Config::quarantine(&config_path) {
+                        Ok(path) => format!(
+                            "；原檔已保留為 {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        Err(quarantine_error) => format!("；原檔未移動：{quarantine_error}"),
+                    };
+                    emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                        "code": "config_corrupt", "message": format!("{error}{recovery}") }));
+                    Config::default()
+                }
+            };
             crate::redaction::set_level(&config.settings.log_level);
             // Auto-unlock: the vault opens with a persistent per-device key — no master password.
             let vault = match open_vault_auto(&dir) {
