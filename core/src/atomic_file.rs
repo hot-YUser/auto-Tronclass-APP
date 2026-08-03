@@ -60,7 +60,7 @@ fn create_temp(path: &Path) -> io::Result<(PathBuf, File)> {
     for _ in 0..8 {
         let mut random = [0_u8; 8];
         getrandom::getrandom(&mut random)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let temp_path = parent.join(format!(".{name}.tmp-{suffix}"));
         let mut options = OpenOptions::new();
