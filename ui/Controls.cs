@@ -24,8 +24,8 @@ public sealed class EmptyState : ContentView
 }
 
 /// <summary>
-/// 狀態膠囊:文字 + 語意色隨 VM 狀態原地換色(不重建)。<paramref name="tone"/> 回傳當下的
-/// 標籤與色組;<paramref name="triggers"/> 是會改變它的屬性名(空 = 任何變動都重算)。
+/// 狀態膠囊:文字 + 語意色隨 VM 狀態原地換色(不重建)。<c>tone</c> 回傳當下的
+/// 標籤與色組;<c>triggers</c> 是會改變它的屬性名(空 = 任何變動都重算)。
 /// 訂閱綁 attach/detach,離開畫面即退訂。
 /// </summary>
 public sealed class StatusPill : ContentView
@@ -44,8 +44,8 @@ public sealed class StatusPill : ContentView
 }
 
 /// <summary>
-/// 逐帳號結果膠囊列(換行排列)。<paramref name="cell"/> 由每個項目算出(文字, 是否完成);完成＝綠、
-/// 未完成＝灰。集合變動、或項目的 <paramref name="triggers"/> 屬性變動時重建。訂閱綁 attach/detach。
+/// 逐帳號結果膠囊列(換行排列)。<c>cell</c> 由每個項目算出(文字, 是否完成);完成＝綠、
+/// 未完成＝灰。集合變動、或項目的 <c>triggers</c> 屬性變動時重建。訂閱綁 attach/detach。
 /// </summary>
 public sealed class ChipsView : ContentView
 {
