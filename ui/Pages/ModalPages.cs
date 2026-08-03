@@ -119,9 +119,9 @@ public sealed class HeroRollcallPage : ModalPageBase
         stack.Children.Add(big);
         stack.Children.Add(new CountdownView(vm, "自動簽到", showRate: false)); // 簽到率由上面的大字負責
         stack.Children.Add(chips);
-        stack.Children.Add(Theme.Primary("立即簽到", () => state.SignNow(vm.Id)));
+        stack.Children.Add(Theme.Primary("立即簽到", () => state.SignNow(vm)));
         stack.Children.Add(Row(
-            Theme.Ghost("暫緩", () => state.DeferSignIn(vm.Id)),
+            Theme.Ghost("暫緩", () => state.DeferSignIn(vm)),
             Theme.Ghost("詳細", async () => { await close(this); await goDetail(); })));
 
         void ShowSuccess()
@@ -194,7 +194,7 @@ public sealed class HeroQuizPage : ModalPageBase
             big.Text = vm.RemainingSecs?.ToString() ?? "";
         }
 
-        var submit = Theme.Primary("立即送出", () => state.SubmitNow(vm.Id));
+        var submit = Theme.Primary("立即送出", () => state.SubmitNow(vm));
         submit.SetBinding(IsEnabledProperty, nameof(QuizVm.CanSubmit));
 
         stack.Children.Add(Header("偵測到測驗", _collapse));

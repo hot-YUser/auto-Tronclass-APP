@@ -129,8 +129,8 @@ public sealed class RollcallDetailPage : ContentPage
         var actionRow = new Grid { ColumnSpacing = 8 };
         actionRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
         actionRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
-        actionRow.Add(Theme.Primary("立即簽到", () => state.SignNow(vm.Id)), 0, 0);
-        actionRow.Add(Theme.Ghost("暫緩", () => state.DeferSignIn(vm.Id)), 1, 0);
+        actionRow.Add(Theme.Primary("立即簽到", () => state.SignNow(vm)), 0, 0);
+        actionRow.Add(Theme.Ghost("暫緩", () => state.DeferSignIn(vm)), 1, 0);
 
         var countingCard = Theme.Card(new VerticalStackLayout
         {
@@ -145,7 +145,7 @@ public sealed class RollcallDetailPage : ContentPage
             Children =
             {
                 Theme.Text("已暫緩 — 這次點名還開著,隨時可以補簽。", 13, Theme.FontSemibold, Theme.WarnL, Theme.WarnD),
-                Theme.Primary("立即補簽", () => state.SignNow(vm.Id)),
+                Theme.Primary("立即補簽", () => state.SignNow(vm)),
             },
         }, Theme.WarnBgL, Theme.WarnBgD, Theme.WarnL, Theme.WarnD);
         pendingCard.SetBinding(IsVisibleProperty, nameof(RollcallVm.IsPending));

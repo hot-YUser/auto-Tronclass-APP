@@ -33,6 +33,17 @@ impl Source {
             _ => Source::Exam,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Exam => "exam",
+            Source::Vote => "vote",
+            Source::CoursewareQuiz => "courseware-quiz",
+            Source::ClassroomExam => "classroom-exam",
+            Source::Homework => "homework",
+            Source::Questionnaire => "questionnaire",
+        }
+    }
 }
 
 /// Re-ask correction (docs 31 R3b) — verbatim; sent as the user turn after threading the bad reply.
@@ -130,7 +141,7 @@ pub async fn shared_answers(
     client: &Client,
     cfg: &LlmConfig,
     cb: llm::EventCb,
-    quiz_id: &str,
+    activity_token: &str,
     course_id: &str,
     base_url: &str,
     subjects: &[Value],
@@ -169,7 +180,7 @@ pub async fn shared_answers(
                                 json!({ "role": "user", "content": CORRECTION_PROMPT }),
                             ]
                         };
-                        let reply = llm::answer_question(client, cfg, &messages, cb, quiz_id, &plan.subject_id, tool_ctx.as_ref()).await.unwrap_or_default();
+                        let reply = llm::answer_question(client, cfg, &messages, cb, activity_token, &plan.subject_id, tool_ctx.as_ref()).await.unwrap_or_default();
                         if !reply.is_empty() {
                             if let Some(a) = parse_answer(subject, &plan.qtype, &reply) {
                                 answers.insert(plan.subject_id.clone(), a);

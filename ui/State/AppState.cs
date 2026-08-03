@@ -11,7 +11,7 @@ namespace Ui;
 public sealed class AppState : ObservableObject
 {
     readonly ICore _core;
-    readonly Dictionary<string, string> _pendingAnswers = []; // "quiz|subject" → 剛送出的 SetAnswer 值(等 AnswerUpdated 才套用)
+    readonly Dictionary<(string ActivityToken, string SubjectId), string> _pendingReasoning = [];
 
     public AppState(ICore core)
     {
@@ -143,7 +143,7 @@ public sealed class AppState : ObservableObject
             case "RollcallDetected": OnRollcallDetected(e); break;
             // 門檻狀態:未達門檻沒有倒數,UI 改用即時簽到率填那個欄位(達標後 holding=false 讓回倒數)。
             case "RollcallGate":
-                if (FindRollcall(Str(e, "rollcall_id")) is { } gated)
+                if (FindRollcall(Str(e, "activity_token")) is { } gated)
                 {
                     if (e.TryGetProperty("rate", out var gr) && gr.ValueKind == JsonValueKind.Number)
                         gated.AttendanceRate = gr.GetDouble();
@@ -153,7 +153,7 @@ public sealed class AppState : ObservableObject
                 }
                 break;
             case "PendingSignIn":
-                if (FindRollcall(Str(e, "rollcall_id")) is { } pending)
+                if (FindRollcall(Str(e, "activity_token")) is { } pending)
                 {
                     pending.Status = "pending";
                     pending.RemainingSecs = null;
@@ -204,20 +204,25 @@ public sealed class AppState : ObservableObject
         }
     }
 
-    RollcallVm? FindRollcall(string? id) => Rollcalls.FirstOrDefault(r => r.Id == id);
-    QuizVm? FindQuiz(string? id) => Quizzes.FirstOrDefault(q => q.Id == id);
+    RollcallVm? FindRollcall(string? activityToken) => Rollcalls.FirstOrDefault(r => r.ActivityToken == activityToken);
+    QuizVm? FindQuiz(string? activityToken) => Quizzes.FirstOrDefault(q => q.ActivityToken == activityToken);
     string AccountLabel(string id) => Accounts.FirstOrDefault(a => a.Id == id)?.Label ?? id;
 
     void OnRollcallDetected(JsonElement e)
     {
+        var activityToken = Str(e, "activity_token");
+        if (string.IsNullOrWhiteSpace(activityToken))
+        {
+            ContractError("RollcallDetected 缺少 activity_token");
+            return;
+        }
         var id = Str(e, "rollcall_id") ?? "";
         var baseUrl = Str(e, "base_url") ?? "";
-        // 合併鍵 = base_url + 活動類型 + 活動ID(不同 base_url 不合併)
-        var vm = Rollcalls.FirstOrDefault(r => r.Id == id && r.BaseUrl == baseUrl);
-        // 新列,或上一輪已結束又被重新開放 → 都當一次新的待簽,重發英雄彈窗
-        var announce = vm is null || vm.IsDone;
-        if (vm is null) Rollcalls.Insert(0, vm = new RollcallVm { Id = id, BaseUrl = baseUrl });
-        if (vm.IsDone) { vm.Status = "counting"; foreach (var p in vm.Accounts) { p.Signed = false; p.Method = null; } }
+        // Core 的 opaque token 是活動實例唯一鍵；外部 ID 只供顯示，不能拿來路由命令。
+        var vm = FindRollcall(activityToken);
+        var announce = vm is null;
+        if (vm is null)
+            Rollcalls.Insert(0, vm = new RollcallVm { ActivityToken = activityToken, Id = id, BaseUrl = baseUrl });
         vm.Kind = Str(e, "kind") ?? vm.Kind;
         vm.Course = Str(e, "course") ?? vm.Course;
         // 首次偵測時 core 還沒查到簽到率(null)——別用 0 蓋掉 RollcallGate 已推來的活值。
@@ -236,7 +241,7 @@ public sealed class AppState : ObservableObject
 
     void OnSignedIn(JsonElement e)
     {
-        var vm = FindRollcall(Str(e, "rollcall_id"));
+        var vm = FindRollcall(Str(e, "activity_token"));
         if (vm is null) return;
         var accId = Str(e, "account_id") ?? "";
         var part = vm.Accounts.FirstOrDefault(x => x.AccountId == accId);
@@ -253,17 +258,17 @@ public sealed class AppState : ObservableObject
 
     void OnCountdown(JsonElement e)
     {
-        var id = Str(e, "id_");
+        var activityToken = Str(e, "activity_token");
         var secs = Int(e, "remaining_secs");
         // Hold/Defer/送出後 core 會停止倒數;此時若仍收到 Countdown(Mock 的計時迴圈不理會 Hold)一律忽略,
         // 否則會把使用者的暫緩/暫緩決定翻掉、繼續自動送。只在「進行中」狀態才渲染倒數。
         switch (Str(e, "scope"))
         {
-            case "rollcall" when FindRollcall(id) is { IsCounting: true } r:
+            case "rollcall" when FindRollcall(activityToken) is { IsCounting: true } r:
                 if (secs > r.TotalSecs) r.TotalSecs = secs; // 首發(最大值)當總長
                 r.RemainingSecs = secs;
                 break;
-            case "quiz" when FindQuiz(id) is { Status: "reviewing" } q:
+            case "quiz" when FindQuiz(activityToken) is { Status: "reviewing" } q:
                 if (secs > q.TotalSecs) q.TotalSecs = secs;
                 q.RemainingSecs = secs;
                 break;
@@ -272,23 +277,29 @@ public sealed class AppState : ObservableObject
 
     void OnQuizPrepared(JsonElement e)
     {
-        var id = Str(e, "quiz_id") ?? "";
-        var vm = FindQuiz(id);
-        // 新列,或上一輪已結束又重新備答 → 都當一次新的待決複閱,重置狀態並重發彈窗
-        var announce = vm is null || vm.Status is "done" or "discarded";
-        if (vm is null) Quizzes.Insert(0, vm = new QuizVm { Id = id });
-        if (vm.Status is "done" or "discarded")
+        if (Int(e, "schema_version") != 1)
         {
-            vm.Status = "reviewing"; vm.RemainingSecs = null;
-            foreach (var a in vm.PerAccount) a.SubmitResult = null;
-            vm.Reasoning.Clear(); // 新一輪複閱:別顯示上一輪的推理串流
+            ContractError("QuizPrepared schema_version 不受支援");
+            return;
         }
+        var activityToken = Str(e, "activity_token");
+        if (string.IsNullOrWhiteSpace(activityToken))
+        {
+            ContractError("QuizPrepared 缺少 activity_token");
+            return;
+        }
+        var id = Str(e, "quiz_id") ?? "";
+        var vm = FindQuiz(activityToken);
+        var announce = vm is null;
+        if (vm is null) Quizzes.Insert(0, vm = new QuizVm { ActivityToken = activityToken, Id = id });
         vm.Course = Str(e, "course") ?? vm.Course;
         // conflict_count 只作參考;送出閘門由逐題 QuestionVm.Conflict 推導(見 QuizVm.AnyConflict)
+        var seenAccounts = new HashSet<string>();
         if (e.TryGetProperty("per_account", out var perAcc))
             foreach (var a in perAcc.EnumerateArray())
             {
                 var accId = Str(a, "account_id") ?? "";
+                seenAccounts.Add(accId);
                 var accVm = vm.PerAccount.FirstOrDefault(x => x.AccountId == accId);
                 if (accVm is null) vm.PerAccount.Add(accVm = new QuizAccountVm { AccountId = accId });
                 accVm.Label = AccountLabel(accId);
@@ -299,16 +310,39 @@ public sealed class AppState : ObservableObject
                         var subjectId = Str(q, "subject_id") ?? "";
                         if (!vm.Reasoning.TryGetValue(subjectId, out var reasoning))
                             vm.Reasoning[subjectId] = reasoning = new ReasoningVm();
+                        AnswerWire? answer = null;
+                        if (q.TryGetProperty("answer", out var answerElement))
+                            answer = AnswerWire.FromJson(answerElement);
+                        if (answer is null)
+                            ContractError($"QuizPrepared 的 {subjectId} 缺少合法型別答案");
+                        var options = q.TryGetProperty("options", out var optionElements) && optionElements.ValueKind == JsonValueKind.Array
+                            ? optionElements.EnumerateArray()
+                                .Select(option => new QuestionOptionVm(Str(option, "id") ?? "", Str(option, "text") ?? ""))
+                                .ToArray()
+                            : [];
                         accVm.Questions.Add(new QuestionVm
                         {
                             SubjectId = subjectId,
                             Stem = Str(q, "stem") ?? "",
-                            Answer = Str(q, "answer") ?? "",
+                            QuestionType = Str(q, "type") ?? "",
+                            AnswerType = Str(q, "answer_type") ?? "",
+                            Options = options,
+                            AnswerPayload = answer,
                             Conflict = Bool(q, "conflict"),
+                            Source = Str(q, "source") ?? "llm",
                             Reasoning = reasoning,
                         });
                     }
             }
+        foreach (var gone in vm.PerAccount.Where(account => !seenAccounts.Contains(account.AccountId)).ToList())
+            vm.PerAccount.Remove(gone);
+        foreach (var pending in _pendingReasoning.Where(item => item.Key.ActivityToken == activityToken).ToList())
+        {
+            if (!vm.Reasoning.TryGetValue(pending.Key.SubjectId, out var reasoning))
+                vm.Reasoning[pending.Key.SubjectId] = reasoning = new ReasoningVm();
+            reasoning.Append(pending.Value);
+            _pendingReasoning.Remove(pending.Key);
+        }
         vm.RaiseProgress();
         vm.RaiseConflictState();   // 依剛建好的逐題旗標刷新閘門/警示
         Raise(nameof(Quizzes)); // 讓列表的題數等衍生值刷新
@@ -317,8 +351,14 @@ public sealed class AppState : ObservableObject
 
     void OnReasoningChunk(JsonElement e)
     {
-        if (FindQuiz(Str(e, "quiz_id")) is not { } vm) return;
+        var activityToken = Str(e, "activity_token") ?? "";
         var subjectId = Str(e, "subject_id") ?? "";
+        if (FindQuiz(activityToken) is not { } vm)
+        {
+            var key = (activityToken, subjectId);
+            _pendingReasoning[key] = _pendingReasoning.GetValueOrDefault(key) + (Str(e, "text") ?? "");
+            return;
+        }
         if (!vm.Reasoning.TryGetValue(subjectId, out var reasoning))
             vm.Reasoning[subjectId] = reasoning = new ReasoningVm();
         reasoning.Append(Str(e, "text") ?? "");
@@ -326,23 +366,27 @@ public sealed class AppState : ObservableObject
 
     void OnAnswerUpdated(JsonElement e)
     {
-        if (FindQuiz(Str(e, "quiz_id")) is not { } vm) return;
+        if (FindQuiz(Str(e, "activity_token")) is not { } vm) return;
         var accId = Str(e, "account_id");
         var subjectId = Str(e, "subject_id");
         var q = vm.PerAccount.FirstOrDefault(a => a.AccountId == accId)?
                   .Questions.FirstOrDefault(x => x.SubjectId == subjectId);
         if (q is null) return;
+        if (!e.TryGetProperty("answer", out var answerElement) || AnswerWire.FromJson(answerElement) is not { } answer)
+        {
+            ContractError("AnswerUpdated 缺少合法型別答案");
+            return;
+        }
+        q.AnswerPayload = answer;
         q.Source = Str(e, "source") ?? q.Source;
         q.Conflict = Bool(e, "conflict");
-        // AnswerUpdated 不帶答案值:使用者定案的值以送出時暫存的為準(絕不由 UI 自行猜)
-        if (q.Source == "user" && _pendingAnswers.Remove($"{vm.Id}|{accId}|{subjectId}", out var val)) q.Answer = val;
         // 閘門/警示由逐題旗標推導,conflict 兩個方向(清除或新增)都在此一次刷新
         vm.RaiseConflictState();
     }
 
     void OnQuizSubmitted(JsonElement e)
     {
-        if (FindQuiz(Str(e, "quiz_id")) is not { } vm) return;
+        if (FindQuiz(Str(e, "activity_token")) is not { } vm) return;
         var accVm = vm.PerAccount.FirstOrDefault(a => a.AccountId == Str(e, "account_id"));
         if (accVm is null) return;
         accVm.SubmitResult = Str(e, "result") ?? "已送出";
@@ -358,6 +402,12 @@ public sealed class AppState : ObservableObject
     {
         Logs.Insert(0, new LogEntry(DateTime.Now, level, text));
         while (Logs.Count > 200) Logs.RemoveAt(Logs.Count - 1);
+    }
+
+    void ContractError(string message)
+    {
+        AddLog("error", $"核心協議錯誤：{message}");
+        Toast?.Invoke("error", $"核心協議錯誤：{message}");
     }
 
     // ---------------- 命令(UI → core) ----------------
@@ -376,33 +426,30 @@ public sealed class AppState : ObservableObject
         OkReply(await Send("ImportCookies", ("account_id", id), ("cookies_json", cookiesJson)));
     public Task SubmitCaptcha(string id, string text) => Send("SubmitCaptcha", ("account_id", id), ("text", text));
 
-    public Task SignNow(string rollcallId) => Send("SignNow", ("rollcall_id", rollcallId));
-    public Task DeferSignIn(string rollcallId) => Send("DeferSignIn", ("rollcall_id", rollcallId));
+    public Task SignNow(RollcallVm rollcall) => Send("SignNow", ("activity_token", rollcall.ActivityToken));
+    public Task DeferSignIn(RollcallVm rollcall) => Send("DeferSignIn", ("activity_token", rollcall.ActivityToken));
 
-    public Task SubmitNow(string quizId) => Send("SubmitNow", ("quiz_id", quizId));
+    public Task SubmitNow(QuizVm quiz) => Send("SubmitNow", ("activity_token", quiz.ActivityToken));
 
     public async Task HoldAnswer(QuizVm quiz)
     {
         // 契約無獨立 Held 事件;命令由 id 對應的 Reply 完成(20-contract 信封),故 Reply ok 即「已停自動送」的確認,
         // 本地標記 held 契約上成立。若真核心其實沒停而仍自動送出,後續 QuizSubmitted → OnQuizSubmitted 會把 UI 校正為 done;
         // 故不另建影子確認機制(UI 一收到任何後續事件就回到真相)。
-        if (OkReply(await Send("HoldAnswer", ("quiz_id", quiz.Id))))
+        if (OkReply(await Send("HoldAnswer", ("activity_token", quiz.ActivityToken))))
             await MainThread.InvokeOnMainThreadAsync(() => { quiz.Status = "held"; quiz.RemainingSecs = null; });
     }
 
     public async Task DiscardAnswer(QuizVm quiz)
     {
-        if (OkReply(await Send("DiscardAnswer", ("quiz_id", quiz.Id))))
+        if (OkReply(await Send("DiscardAnswer", ("activity_token", quiz.ActivityToken))))
             await MainThread.InvokeOnMainThreadAsync(() => { quiz.Status = "discarded"; quiz.RemainingSecs = null; });
     }
 
     // account_id:衝突/答案是 per-account,使用者在答題詳細切到哪個帳號就定案哪個。
-    // docs/20-contract.md 的 SetAnswer 已補此欄(core 端待實作);真核心接上後行為一致。
-    public Task SetAnswer(string quizId, string accountId, string subjectId, string answer)
-    {
-        _pendingAnswers[$"{quizId}|{accountId}|{subjectId}"] = answer;
-        return Send("SetAnswer", ("quiz_id", quizId), ("account_id", accountId), ("subject_id", subjectId), ("answer", answer));
-    }
+    public Task SetAnswer(QuizVm quiz, string accountId, string subjectId, AnswerWire answer) =>
+        Send("SetAnswer", ("activity_token", quiz.ActivityToken), ("account_id", accountId),
+            ("subject_id", subjectId), ("answer", answer));
 
     public async Task<bool> SetLlmKey(string key) => OkReply(await Send("SetLlmKey", ("key", key)));
 

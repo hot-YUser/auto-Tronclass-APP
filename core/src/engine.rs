@@ -413,24 +413,30 @@ fn handle_sync(core: &Core, cmd: Command) {
             reply(cb, id, true, None);
         }
 
-        Command::SignNow { rollcall_id, .. } => {
-            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::SignNow { rollcall_id });
+        Command::SignNow { activity_token, .. } => {
+            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::SignNow { command_id: id, activity_token });
         }
-        Command::DeferSignIn { rollcall_id, .. } => {
-            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::Defer { rollcall_id });
+        Command::DeferSignIn { activity_token, .. } => {
+            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::Defer { command_id: id, activity_token });
         }
 
-        Command::SubmitNow { quiz_id, .. } => {
-            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizSubmitNow { quiz_id });
+        Command::SubmitNow { activity_token, .. } => {
+            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizSubmitNow { command_id: id, activity_token });
         }
-        Command::HoldAnswer { quiz_id, .. } => {
-            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizHold { quiz_id });
+        Command::HoldAnswer { activity_token, .. } => {
+            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizHold { command_id: id, activity_token });
         }
-        Command::DiscardAnswer { quiz_id, .. } => {
-            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizDiscard { quiz_id });
+        Command::DiscardAnswer { activity_token, .. } => {
+            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizDiscard { command_id: id, activity_token });
         }
-        Command::SetAnswer { quiz_id, account_id, subject_id, answer, .. } => {
-            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizSetAnswer { quiz_id, account_id, subject_id, answer });
+        Command::SetAnswer { activity_token, account_id, subject_id, answer, .. } => {
+            route_to_monitor(cb, guard.as_ref(), id, monitor::MonitorMsg::QuizSetAnswer {
+                command_id: id,
+                activity_token,
+                account_id,
+                subject_id,
+                answer,
+            });
         }
 
         Command::SetLlmKey { key, .. } => {
@@ -558,8 +564,9 @@ fn handle_sync(core: &Core, cmd: Command) {
 fn route_to_monitor(cb: EventCb, state: Option<&CoreState>, id: u64, msg: monitor::MonitorMsg) {
     match state.and_then(|s| s.monitor.running_handle()) {
         Some(h) => {
-            let _ = h.tx.send(msg);
-            reply(cb, id, true, None);
+            if h.tx.send(msg).is_err() {
+                reply(cb, id, false, Some("monitor actor is unavailable".into()));
+            }
         }
         None => reply(cb, id, false, Some("not monitoring".into())),
     }

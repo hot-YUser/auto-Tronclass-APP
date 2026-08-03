@@ -126,14 +126,22 @@ fn slice3_quiz_prepare_conflict_and_submit() {
 
     // Prepared with bob's conflict; reasoning streamed for the LLM subjects.
     let prepared = wait_for(|v| v["event"] == "QuizPrepared" && v["quiz_id"] == "EX1", 20).expect("QuizPrepared");
+    let activity_token = prepared["activity_token"].as_str().expect("quiz activity token");
     assert!(prepared["conflict_count"].as_u64().unwrap_or(0) >= 1, "bob has a conflict on s1");
-    assert!(wait_for(|v| v["event"] == "ReasoningChunk" && v["quiz_id"] == "EX1", 5).is_some(), "reasoning streamed");
+    assert!(
+        wait_for(
+            |v| v["event"] == "ReasoningChunk" && v["activity_token"] == activity_token,
+            5,
+        )
+        .is_some(),
+        "reasoning streamed"
+    );
     // alice (no conflict) should NOT auto-submit while bob's conflict is unresolved.
     assert!(wait_for(submitted("EX1", &alice), 4).is_none(), "no submit while a conflict is unresolved");
 
     // Resolve bob's conflict → countdown → both submit.
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SetAnswer","quiz_id":"EX1","account_id":"{bob}","subject_id":"s1","answer":{{"options":["o1"]}}}}"#));
+    send(h, &format!(r#"{{"id":{i},"cmd":"SetAnswer","activity_token":"{activity_token}","account_id":"{bob}","subject_id":"s1","answer":{{"kind":"options","option_ids":["o1"]}}}}"#));
     wait_for(reply_ok(i), 5);
     assert!(wait_for(submitted("EX1", &alice), 15).is_some(), "alice submits after resolution");
     assert!(wait_for(submitted("EX1", &bob), 15).is_some(), "bob submits after resolution");

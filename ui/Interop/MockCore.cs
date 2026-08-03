@@ -33,6 +33,8 @@ public sealed class MockCore : ICore
     };
     private string _active = "a1";
     private int _nextId = 4;
+    private string _rollcallToken = "";
+    private string _quizToken = "";
 
     // 目前生效的設定;UpdateConfig/SetLlmKey 後更新並重發,讓設定頁的預覽是活的。
     private readonly Dictionary<string, object?> _settings = new()
@@ -105,28 +107,39 @@ public sealed class MockCore : ICore
                 break;
 
             case "SignNow": // signs every participant of the activity (merge model)
+                if (Str("activity_token") != _rollcallToken) return Failed("unknown rollcall activity_token");
                 foreach (var a in new[] { "a1", "a2" })
                     Emit(new { id = (object?)null, @event = "SignedIn",
-                        rollcall_id = Str("rollcall_id"), account_id = a, course = "行銷管理", method = "radar" });
+                        activity_token = _rollcallToken, rollcall_id = "30558", account_id = a, course = "行銷管理", method = "radar" });
                 break;
             case "DeferSignIn":
-                Emit(new { id = (object?)null, @event = "PendingSignIn", rollcall_id = Str("rollcall_id") });
+                if (Str("activity_token") != _rollcallToken) return Failed("unknown rollcall activity_token");
+                Emit(new { id = (object?)null, @event = "PendingSignIn", activity_token = _rollcallToken, rollcall_id = "30558" });
                 break;
 
             case "SetAnswer": // user overrides one subject for ONE account → that account's conflict resolved
+                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
+                if (!f.TryGetValue("answer", out var answer) || answer is not Ui.AnswerWire wire)
+                    return Failed("answer payload is empty or malformed");
                 Emit(new { id = (object?)null, @event = "AnswerUpdated",
-                    quiz_id = Str("quiz_id"), account_id = Str("account_id") ?? _active, subject_id = Str("subject_id"), source = "user", conflict = false });
+                    activity_token = _quizToken, quiz_id = "32877", account_id = Str("account_id") ?? _active,
+                    subject_id = Str("subject_id"), answer = wire, display_answer = wire.Display, source = "user", conflict = false });
                 break;
             case "SubmitNow":
+                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
                 foreach (var a in new[] { "a1", "a2" })
                     Emit(new { id = (object?)null, @event = "QuizSubmitted",
-                        quiz_id = Str("quiz_id"), account_id = a, result = "submitted (score 60)" });
+                        activity_token = _quizToken, quiz_id = "32877", account_id = a, result = "submitted (score 60)" });
                 break;
             case "DiscardAnswer":
-                Emit(new { id = (object?)null, @event = "LogLine", level = "info", text = $"quiz {Str("quiz_id")} 答案已捨棄，不送出" });
+                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
+                Emit(new { id = (object?)null, @event = "LogLine", level = "info", activity_token = _quizToken,
+                    text = "quiz 32877 答案已捨棄，不送出" });
                 break;
             case "HoldAnswer":
-                Emit(new { id = (object?)null, @event = "LogLine", level = "info", text = $"quiz {Str("quiz_id")} 已暫緩，停止自動送出" });
+                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
+                Emit(new { id = (object?)null, @event = "LogLine", level = "info", activity_token = _quizToken,
+                    text = "quiz 32877 已暫緩，停止自動送出" });
                 break;
             case "UpdateConfig":
                 if (f.TryGetValue("patch", out var p) && p is IDictionary<string, object?> patch)
@@ -140,6 +153,9 @@ public sealed class MockCore : ICore
             // Shutdown: no event needed — the Reply below is the whole response.
         }
         return Task.FromResult(Json(new { id = 0, @event = "Reply", ok = true, error = (object?)null }));
+
+        static Task<JsonElement> Failed(string error) =>
+            Task.FromResult(Json(new { id = 0, @event = "Reply", ok = false, error }));
     }
 
     private void EmitSettings() => Emit(new { id = (object?)null, @event = "Settings", settings = _settings });
@@ -154,58 +170,70 @@ public sealed class MockCore : ICore
         await Task.Delay(2500);
 
         const string rc = "30558";
-        Emit(new { id = (object?)null, @event = "RollcallDetected", rollcall_id = rc, base_url = BaseUrl,
+        _rollcallToken = $"mock-rollcall-{Guid.NewGuid():N}";
+        Emit(new { id = (object?)null, @event = "RollcallDetected", activity_token = _rollcallToken,
+            rollcall_id = rc, base_url = BaseUrl,
             kind = "radar", course = "行銷管理", attendance_rate = (object?)null, accounts = new[] { "a1", "a2" } });
         // 未達門檻:core 不倒數,只每秒回報即時簽到率(UI 用它填倒數欄位)。爬過門檻才 holding=false → 開始倒數。
         var gate = Convert.ToDouble(_settings["attendance_gate_percent"]);
         foreach (var r in new[] { 3.7, 7.4, 11.1, 14.8 })
         {
-            Emit(new { id = (object?)null, @event = "RollcallGate", rollcall_id = rc, rate = r, gate_percent = gate, holding = true });
+            Emit(new { id = (object?)null, @event = "RollcallGate", activity_token = _rollcallToken,
+                rollcall_id = rc, rate = r, gate_percent = gate, holding = true });
             await Task.Delay(900);
         }
-        Emit(new { id = (object?)null, @event = "RollcallGate", rollcall_id = rc, rate = 42.0, gate_percent = gate, holding = false });
+        Emit(new { id = (object?)null, @event = "RollcallGate", activity_token = _rollcallToken,
+            rollcall_id = rc, rate = 42.0, gate_percent = gate, holding = false });
         for (var s = 15; s >= 0; s--)
         {
-            Emit(new { id = (object?)null, @event = "Countdown", scope = "rollcall", id_ = rc, remaining_secs = s });
+            Emit(new { id = (object?)null, @event = "Countdown", scope = "rollcall",
+                activity_token = _rollcallToken, external_id = rc, remaining_secs = s });
             await Task.Delay(700);
         }
         foreach (var a in new[] { "a1", "a2" })
-            Emit(new { id = (object?)null, @event = "SignedIn", rollcall_id = rc, account_id = a, course = "行銷管理", method = "radar" });
+            Emit(new { id = (object?)null, @event = "SignedIn", activity_token = _rollcallToken,
+                rollcall_id = rc, account_id = a, course = "行銷管理", method = "radar" });
         await Task.Delay(1500);
 
         const string qz = "32877";
         // BOTH accounts conflict on Q1 → conflict_count 2. Lets the UI preview the multi-account gate:
         // submit stays LOCKED until every account's conflict is resolved (resolve one → still locked;
         // resolve both → unlocks). Never silently overwrite a user's existing answer.
-        Emit(new { id = (object?)null, @event = "QuizPrepared", quiz_id = qz, course = "行銷管理", conflict_count = 2,
-            per_account = new[] {
-                new { account_id = "a1", questions = new[] {
-                    new { subject_id = "1", stem = "台灣最高的山是哪一座？", answer = "玉山", conflict = true },
-                    new { subject_id = "2", stem = "水的化學式是？", answer = "H2O", conflict = false } } },
-                new { account_id = "a2", questions = new[] {
-                    new { subject_id = "1", stem = "台灣最高的山是哪一座？", answer = "玉山", conflict = true },
-                    new { subject_id = "2", stem = "水的化學式是？", answer = "H2O", conflict = false } } } } });
+        await EmitQuizPreparedFixture();
         foreach (var chunk in new[] { "讓我想想，", "第一題問台灣最高峰，", "玉山 3952 公尺，", "所以答案是玉山。" })
         {
-            Emit(new { id = (object?)null, @event = "ReasoningChunk", quiz_id = qz, subject_id = "1", text = chunk });
+            Emit(new { id = (object?)null, @event = "ReasoningChunk", activity_token = _quizToken,
+                subject_id = "1", text = chunk });
             await Task.Delay(450);
         }
         for (var s = 15; s >= 0; s--)
         {
-            Emit(new { id = (object?)null, @event = "Countdown", scope = "quiz", id_ = qz, remaining_secs = s });
+            Emit(new { id = (object?)null, @event = "Countdown", scope = "quiz",
+                activity_token = _quizToken, external_id = qz, remaining_secs = s });
             await Task.Delay(700);
         }
         foreach (var a in new[] { "a1", "a2" })
-            Emit(new { id = (object?)null, @event = "QuizSubmitted", quiz_id = qz, account_id = a, result = "submitted (score 60)" });
+            Emit(new { id = (object?)null, @event = "QuizSubmitted", activity_token = _quizToken,
+                quiz_id = qz, account_id = a, result = "submitted (score 60)" });
+    }
+
+    private async Task EmitQuizPreparedFixture()
+    {
+        await using var stream = await FileSystem.OpenAppPackageFileAsync("contract/quiz_prepared_v1.json");
+        using var document = await JsonDocument.ParseAsync(stream);
+        var fixture = document.RootElement.Clone();
+        _quizToken = fixture.GetProperty("activity_token").GetString() ?? "";
+        Emit(fixture);
     }
 
     private void EmitAccounts() => Emit(new { id = (object?)null, @event = "Accounts", active = _active,
         accounts = _accounts.ConvertAll(a => new { id = a.id, label = a.label, username = a.user, school_ref = a.school,
             is_teacher = a.teacher, course_id = a.course }) });
 
-    private void Emit(object o)
+    private void Emit(object o) => Emit(Json(o));
+
+    private void Emit(JsonElement el)
     {
-        var el = Json(o);
         if (el.TryGetProperty("event", out var ev))
         {
             switch (ev.GetString())

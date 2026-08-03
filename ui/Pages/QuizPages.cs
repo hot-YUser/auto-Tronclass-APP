@@ -131,7 +131,7 @@ public sealed class QuizDetailPage : ContentPage
         var conflictCard = Theme.TintCard(conflictLabel, Theme.WarnBgL, Theme.WarnBgD, Theme.WarnL, Theme.WarnD);
         conflictCard.SetBinding(IsVisibleProperty, nameof(QuizVm.HasConflicts));
 
-        var submit = Theme.Primary("立即送出", () => state.SubmitNow(vm.Id));
+        var submit = Theme.Primary("立即送出", () => state.SubmitNow(vm));
         submit.SetBinding(IsEnabledProperty, nameof(QuizVm.CanSubmit));
         var actionRow = new Grid { ColumnSpacing = 8 };
         actionRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
@@ -336,9 +336,17 @@ sealed class QuestionCard : ContentView
             llmRow.Add(Theme.Text(_q.Answer, 16, Theme.FontSemibold, Theme.WarnL, Theme.WarnD), 1, 0);
             stack.Children.Add(llmRow);
 
-            stack.Children.Add(Theme.Primary("採用 LLM 建議", () => _state.SetAnswer(_quiz.Id, _accountId, _q.SubjectId, _q.Answer)));
+            if (_q.AnswerPayload is { } suggested)
+                stack.Children.Add(Theme.Primary("採用 LLM 建議", () => _state.SetAnswer(_quiz, _accountId, _q.SubjectId, suggested)));
 
-            var manual = new Entry { Placeholder = "或自行輸入最終答案" };
+            var placeholder = _q.AnswerPayload?.Kind switch
+            {
+                "options" => "輸入選項 ID，多選以逗號分隔",
+                "blanks" => "多個填空請以 ||| 分隔",
+                "vote" => "輸入選項字母，多選以逗號分隔",
+                _ => "或自行輸入最終答案",
+            };
+            var manual = new Entry { Placeholder = placeholder };
             var confirmRow = new Grid { ColumnSpacing = 8 };
             confirmRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
             confirmRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
@@ -346,7 +354,8 @@ sealed class QuestionCard : ContentView
             confirmRow.Add(Theme.Ghost("定案", async () =>
             {
                 var text = manual.Text?.Trim() ?? "";
-                if (text.Length > 0) await _state.SetAnswer(_quiz.Id, _accountId, _q.SubjectId, text);
+                if (text.Length > 0 && _q.AnswerPayload is { } current)
+                    await _state.SetAnswer(_quiz, _accountId, _q.SubjectId, current.FromManualInput(text));
             }), 1, 0);
             stack.Children.Add(confirmRow);
         }

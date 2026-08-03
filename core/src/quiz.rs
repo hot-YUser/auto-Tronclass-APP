@@ -24,6 +24,57 @@ pub enum Answer {
     Vote(Vec<String>),    // vote — option letters
 }
 
+pub fn validate_answer(subject: &Value, answer: &Answer, vote: bool) -> Result<(), String> {
+    let qtype = subject.get("type").and_then(Value::as_str).unwrap_or("");
+    if vote {
+        return match answer {
+            Answer::Vote(letters)
+                if !letters.is_empty()
+                    && letters.iter().all(|letter| subject_has_option(subject, letter)) =>
+            {
+                Ok(())
+            }
+            _ => Err("vote subject requires valid vote letters".to_string()),
+        };
+    }
+    match qtype {
+        "single_selection" | "multiple_selection" | "true_or_false" | "matching" => match answer {
+            Answer::Options(ids)
+                if !ids.is_empty() && ids.iter().all(|id| subject_has_option(subject, id)) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("subject {qtype} requires valid option_ids")),
+        },
+        qtype if BLANK_TYPES.contains(&qtype) => match answer {
+            Answer::Blanks(values)
+                if values.len() == blank_count(subject)
+                    && values.iter().all(|value| !value.trim().is_empty()) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!(
+                "subject {qtype} requires exactly {} non-empty blank values",
+                blank_count(subject)
+            )),
+        },
+        "paragraph_desc" | "media" | "analysis" => {
+            Err(format!("subject {qtype} is not answerable"))
+        }
+        _ => match answer {
+            Answer::Text(value) if !value.trim().is_empty() => Ok(()),
+            _ => Err(format!("subject {qtype} requires a non-empty text answer")),
+        },
+    }
+}
+
+fn subject_has_option(subject: &Value, id: &str) -> bool {
+    subject
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| options.iter().any(|option| option_id(option) == id))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     Replay(Answer), // server leaked the correct answer

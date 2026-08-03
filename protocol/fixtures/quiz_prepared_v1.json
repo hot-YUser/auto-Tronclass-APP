@@ -1,0 +1,81 @@
+{
+  "id": null,
+  "event": "QuizPrepared",
+  "schema_version": 1,
+  "activity_token": "fixture-quiz-prepared-v1",
+  "quiz_id": "32877",
+  "activity": {
+    "external_id": "32877",
+    "source": "exam",
+    "course_id": "55379",
+    "course": "行銷管理"
+  },
+  "course": "行銷管理",
+  "per_account": [
+    {
+      "account_id": "a1",
+      "instance_id": "attempt-a1",
+      "questions": [
+        {
+          "subject_id": "1",
+          "parent_id": null,
+          "type": "short_answer",
+          "answer_type": "short_answer",
+          "stem": "台灣最高的山是哪一座？",
+          "options": [],
+          "answer": { "kind": "text", "value": "玉山" },
+          "existing_answer": { "kind": "text", "value": "雪山" },
+          "display_answer": "玉山",
+          "source": "llm",
+          "conflict": true
+        },
+        {
+          "subject_id": "2",
+          "parent_id": null,
+          "type": "short_answer",
+          "answer_type": "short_answer",
+          "stem": "水的化學式是？",
+          "options": [],
+          "answer": { "kind": "text", "value": "H2O" },
+          "existing_answer": null,
+          "display_answer": "H2O",
+          "source": "llm",
+          "conflict": false
+        }
+      ]
+    },
+    {
+      "account_id": "a2",
+      "instance_id": "attempt-a2",
+      "questions": [
+        {
+          "subject_id": "1",
+          "parent_id": null,
+          "type": "short_answer",
+          "answer_type": "short_answer",
+          "stem": "台灣最高的山是哪一座？",
+          "options": [],
+          "answer": { "kind": "text", "value": "玉山" },
+          "existing_answer": { "kind": "text", "value": "雪山" },
+          "display_answer": "玉山",
+          "source": "llm",
+          "conflict": true
+        },
+        {
+          "subject_id": "2",
+          "parent_id": null,
+          "type": "short_answer",
+          "answer_type": "short_answer",
+          "stem": "水的化學式是？",
+          "options": [],
+          "answer": { "kind": "text", "value": "H2O" },
+          "existing_answer": null,
+          "display_answer": "H2O",
+          "source": "llm",
+          "conflict": false
+        }
+      ]
+    }
+  ],
+  "conflict_count": 2
+}

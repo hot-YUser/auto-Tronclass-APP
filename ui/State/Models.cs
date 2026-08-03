@@ -1,6 +1,8 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Ui;
 
@@ -116,6 +118,7 @@ public sealed record LogEntry(DateTime At, string Level, string Text)
 
 public sealed class RollcallVm : ObservableObject, IGateVm
 {
+    public required string ActivityToken { get; init; }
     public required string Id { get; init; }
     public string BaseUrl { get; set; } = "";
     public DateTime DetectedAt { get; } = DateTime.Now;
@@ -220,6 +223,7 @@ public sealed class RollcallAccountVm : ObservableObject
 
 public sealed class QuizVm : ObservableObject, ICountdownVm
 {
+    public required string ActivityToken { get; init; }
     public required string Id { get; init; }
     public DateTime DetectedAt { get; } = DateTime.Now;
     public ObservableCollection<QuizAccountVm> PerAccount { get; } = [];
@@ -295,11 +299,21 @@ public sealed class QuestionVm : ObservableObject
 {
     public required string SubjectId { get; init; }
     public string Stem { get; set; } = "";
+    public string QuestionType { get; set; } = "";
+    public string AnswerType { get; set; } = "";
+    public IReadOnlyList<QuestionOptionVm> Options { get; set; } = [];
     public ReasoningVm? Reasoning { get; set; }
 
-    string _answer = ""; bool _conflict; string _source = "llm";
+    AnswerWire? _answerPayload;
+    bool _conflict;
+    string _source = "llm";
 
-    public string Answer { get => _answer; set => Set(ref _answer, value); }
+    public AnswerWire? AnswerPayload
+    {
+        get => _answerPayload;
+        set { if (Set(ref _answerPayload, value)) Raise(nameof(Answer)); }
+    }
+    public string Answer => AnswerPayload?.Display ?? "";
     public bool Conflict { get => _conflict; set => Set(ref _conflict, value); }
     public string Source
     {
@@ -307,6 +321,96 @@ public sealed class QuestionVm : ObservableObject
         set { if (Set(ref _source, value)) Raise(nameof(SourceText)); }
     }
     public string SourceText => Source == "user" ? "你定案" : "LLM";
+}
+
+public sealed record QuestionOptionVm(string Id, string Text);
+
+/// <summary>
+/// UI ↔ core 的唯一答案 wire model。保留答案種類，避免把選項 ID、填空陣列與自由文字
+/// 壓成不可逆字串；屬性名稱直接對齊 Rust <c>AnswerWire</c>。
+/// </summary>
+public sealed record AnswerWire
+{
+    [JsonPropertyName("kind")]
+    public required string Kind { get; init; }
+
+    [JsonPropertyName("option_ids")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? OptionIds { get; init; }
+
+    [JsonPropertyName("values")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? Values { get; init; }
+
+    [JsonPropertyName("value")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Value { get; init; }
+
+    [JsonPropertyName("letters")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? Letters { get; init; }
+
+    [JsonIgnore]
+    public string Display => Kind switch
+    {
+        "options" => string.Join(", ", OptionIds ?? []),
+        "blanks" => string.Join(" ||| ", Values ?? []),
+        "vote" => string.Join(", ", Letters ?? []),
+        "text" => Value ?? "",
+        _ => "",
+    };
+
+    public static AnswerWire? FromJson(JsonElement element)
+    {
+        if (element.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return null;
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty("kind", out var kindElement) ||
+            kindElement.ValueKind != JsonValueKind.String)
+            return null;
+
+        var kind = kindElement.GetString() ?? "";
+        return kind switch
+        {
+            "options" => new AnswerWire { Kind = kind, OptionIds = StringArray(element, "option_ids") },
+            "blanks" => new AnswerWire { Kind = kind, Values = StringArray(element, "values") },
+            "text" => new AnswerWire { Kind = kind, Value = String(element, "value") },
+            "vote" => new AnswerWire { Kind = kind, Letters = StringArray(element, "letters") },
+            _ => null,
+        };
+    }
+
+    public AnswerWire FromManualInput(string input)
+    {
+        var trimmed = input.Trim();
+        return Kind switch
+        {
+            "options" => new AnswerWire { Kind = Kind, OptionIds = SplitList(trimmed) },
+            "blanks" => new AnswerWire
+            {
+                Kind = Kind,
+                Values = trimmed.Split("|||", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
+            },
+            "vote" => new AnswerWire { Kind = Kind, Letters = SplitList(trimmed) },
+            _ => new AnswerWire { Kind = "text", Value = trimmed },
+        };
+    }
+
+    static string[] SplitList(string input) =>
+        input.Split([',', '，', ' ', '\t', '\r', '\n'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+    static string[] StringArray(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var values) && values.ValueKind == JsonValueKind.Array
+            ? values.EnumerateArray()
+                .Where(value => value.ValueKind == JsonValueKind.String)
+                .Select(value => value.GetString() ?? "")
+                .Where(value => value.Length > 0)
+                .ToArray()
+            : [];
+
+    static string? String(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 }
 
 public sealed class ReasoningVm : ObservableObject

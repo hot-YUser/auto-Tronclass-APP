@@ -64,7 +64,7 @@ pub async fn answer_question(
     cfg: &LlmConfig,
     messages: &[Value],
     cb: EventCb,
-    quiz_id: &str,
+    activity_token: &str,
     subject_id: &str,
     tools: Option<&ToolCtx<'_>>,
 ) -> Option<String> {
@@ -76,8 +76,8 @@ pub async fn answer_question(
     let mut full = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
     full.extend(messages.iter().cloned());
     match tools {
-        Some(ctx) => tool_loop(client, cfg, full, cb, quiz_id, subject_id, ctx).await,
-        None => stream_answer(client, cfg, full, cb, quiz_id, subject_id).await,
+        Some(ctx) => tool_loop(client, cfg, full, cb, activity_token, subject_id, ctx).await,
+        None => stream_answer(client, cfg, full, cb, activity_token, subject_id).await,
     }
 }
 
@@ -87,7 +87,7 @@ async fn stream_answer(
     cfg: &LlmConfig,
     full: Vec<Value>,
     cb: EventCb,
-    quiz_id: &str,
+    activity_token: &str,
     subject_id: &str,
 ) -> Option<String> {
     let mut body = json!({
@@ -133,7 +133,8 @@ async fn stream_answer(
             if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
                 if !r.is_empty() {
                     emit(cb, &json!({ "id": null, "event": "ReasoningChunk",
-                                      "quiz_id": quiz_id, "subject_id": subject_id, "text": r }));
+                                      "activity_token": activity_token,
+                                      "subject_id": subject_id, "text": r }));
                 }
             }
             if let Some(c) = delta.get("content").and_then(Value::as_str) {
@@ -158,7 +159,7 @@ async fn tool_loop(
     cfg: &LlmConfig,
     mut messages: Vec<Value>,
     cb: EventCb,
-    quiz_id: &str,
+    activity_token: &str,
     subject_id: &str,
     ctx: &ToolCtx<'_>,
 ) -> Option<String> {
@@ -188,7 +189,8 @@ async fn tool_loop(
         if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
             if !r.is_empty() {
                 emit(cb, &json!({ "id": null, "event": "ReasoningChunk",
-                                  "quiz_id": quiz_id, "subject_id": subject_id, "text": r }));
+                                  "activity_token": activity_token,
+                                  "subject_id": subject_id, "text": r }));
             }
         }
         let content = strip_think(msg.get("content").and_then(Value::as_str).unwrap_or("")).trim().to_string();

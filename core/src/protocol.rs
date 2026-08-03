@@ -2,7 +2,67 @@
 //! trust boundary, so a malformed command becomes an Error event, never a panic. Events (core →
 //! UI) are emitted as free-form JSON at the call site (see `engine::emit`).
 
-use serde::Deserialize;
+use crate::quiz::Answer;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnswerWire {
+    Options { option_ids: Vec<String> },
+    Blanks { values: Vec<String> },
+    Text { value: String },
+    Vote { letters: Vec<String> },
+}
+
+impl AnswerWire {
+    pub fn into_answer(self) -> Result<Answer, String> {
+        match self {
+            Self::Options { option_ids }
+                if !option_ids.is_empty() && option_ids.iter().all(|id| !id.trim().is_empty()) =>
+            {
+                Ok(Answer::Options(option_ids))
+            }
+            Self::Blanks { values }
+                if !values.is_empty() && values.iter().all(|value| !value.trim().is_empty()) =>
+            {
+                Ok(Answer::Blanks(values))
+            }
+            Self::Text { value } if !value.trim().is_empty() => Ok(Answer::Text(value)),
+            Self::Vote { letters }
+                if !letters.is_empty() && letters.iter().all(|letter| !letter.trim().is_empty()) =>
+            {
+                Ok(Answer::Vote(letters))
+            }
+            _ => Err("answer payload is empty or malformed".to_string()),
+        }
+    }
+
+    pub fn from_answer(answer: &Answer) -> Self {
+        match answer {
+            Answer::Options(option_ids) => Self::Options {
+                option_ids: option_ids.clone(),
+            },
+            Answer::Blanks(values) => Self::Blanks {
+                values: values.clone(),
+            },
+            Answer::Text(value) => Self::Text {
+                value: value.clone(),
+            },
+            Answer::Vote(letters) => Self::Vote {
+                letters: letters.clone(),
+            },
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            Self::Options { option_ids } => option_ids.join(", "),
+            Self::Blanks { values } => values.join(" ||| "),
+            Self::Text { value } => value.clone(),
+            Self::Vote { letters } => letters.join(", "),
+        }
+    }
+}
 
 /// UI → core. Internally tagged by `cmd`; every variant carries the correlation `id` the caller
 /// assigned, which the core echoes back on the matching reply event.
@@ -43,15 +103,21 @@ pub enum Command {
     StopMonitoring { id: u64 },
 
     /// User decisions on an in-flight rollcall (per-activity: all participating accounts).
-    SignNow { id: u64, rollcall_id: String },
-    DeferSignIn { id: u64, rollcall_id: String },
+    SignNow { id: u64, activity_token: String },
+    DeferSignIn { id: u64, activity_token: String },
 
     /// User decisions on an in-flight quiz (docs 20 flow A). Submit/hold/discard are per merged
     /// activity; SetAnswer resolves one account's one subject (conflicts are per-account).
-    SubmitNow { id: u64, quiz_id: String },
-    HoldAnswer { id: u64, quiz_id: String },
-    DiscardAnswer { id: u64, quiz_id: String },
-    SetAnswer { id: u64, quiz_id: String, account_id: String, subject_id: String, answer: serde_json::Value },
+    SubmitNow { id: u64, activity_token: String },
+    HoldAnswer { id: u64, activity_token: String },
+    DiscardAnswer { id: u64, activity_token: String },
+    SetAnswer {
+        id: u64,
+        activity_token: String,
+        account_id: String,
+        subject_id: String,
+        answer: AnswerWire,
+    },
 
     /// Store the LLM API key in the vault (never in config/logs).
     SetLlmKey { id: u64, key: String },
@@ -86,6 +152,72 @@ impl Command {
             | Command::SetLlmKey { id, .. }
             | Command::UpdateConfig { id, .. }
             | Command::Shutdown { id } => *id,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_commands_require_token_and_typed_answer() {
+        let command: Command = serde_json::from_str(
+            r#"{"id":7,"cmd":"SetAnswer","activity_token":"opaque","account_id":"a","subject_id":"s","answer":{"kind":"options","option_ids":["12"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::SetAnswer {
+                activity_token,
+                answer: AnswerWire::Options { option_ids },
+                ..
+            } if activity_token == "opaque" && option_ids == ["12"]
+        ));
+
+        assert!(serde_json::from_str::<Command>(
+            r#"{"id":8,"cmd":"SubmitNow","quiz_id":"ambiguous"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Command>(
+            r#"{"id":9,"cmd":"SetAnswer","activity_token":"opaque","account_id":"a","subject_id":"s","answer":"free text"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn empty_answer_wire_is_rejected() {
+        assert!(AnswerWire::Text {
+            value: "  ".into()
+        }
+        .into_answer()
+        .is_err());
+        assert!(AnswerWire::Options { option_ids: vec![] }
+            .into_answer()
+            .is_err());
+    }
+
+    #[test]
+    fn shared_quiz_prepared_fixture_uses_typed_answers() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../protocol/fixtures/quiz_prepared_v1.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["event"], "QuizPrepared");
+        assert_eq!(fixture["schema_version"], 1);
+        assert!(fixture["activity_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()));
+
+        for account in fixture["per_account"].as_array().unwrap() {
+            assert!(account["instance_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()));
+            for question in account["questions"].as_array().unwrap() {
+                let answer: AnswerWire =
+                    serde_json::from_value(question["answer"].clone()).unwrap();
+                answer.into_answer().unwrap();
+            }
         }
     }
 }

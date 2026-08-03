@@ -158,15 +158,19 @@ fn slice2_multi_account_monitoring_and_four_types() {
                 a.iter().any(|x| x.as_str() == Some(alice.as_str())) && a.iter().any(|x| x.as_str() == Some(bob.as_str()))
             })
     };
-    assert!(wait_for(merged, 10).is_some(), "RC1 merged alice+bob into one activity");
+    let rc1_a = wait_for(merged, 10).expect("RC1 merged alice+bob into one activity");
+    let rc1_a_token = rc1_a["activity_token"].as_str().expect("RC1@A activity token").to_string();
 
     // --- same rollcall id on B → a DISTINCT activity (different base_url never merges) ---
     open_rollcall(&base_b, r#"{"id":"RC1","kind":"self_registration","attendance_rate":100}"#);
     assert!(wait_for(signed("RC1", &carol), 15).is_some(), "carol signs RC1 on B");
-    assert!(
-        wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC1" && v["base_url"] == base_b.as_str(), 5).is_some(),
-        "B's RC1 is its own activity, not merged with A's"
-    );
+    let rc1_b = wait_for(
+        |v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC1" && v["base_url"] == base_b.as_str(),
+        5,
+    )
+    .expect("B's RC1 is its own activity, not merged with A's");
+    let rc1_b_token = rc1_b["activity_token"].as_str().expect("RC1@B activity token");
+    assert_ne!(rc1_a_token, rc1_b_token, "same external id on different sites must have distinct tokens");
 
     // --- self_registration, radar (empty→pass), qr (teacher-assist) on A ---
     open_rollcall(&base_a, r#"{"id":"RC2","kind":"self_registration","attendance_rate":100}"#);
@@ -179,21 +183,26 @@ fn slice2_multi_account_monitoring_and_four_types() {
 
     // --- 15% gate blocks a near-empty rollcall ---
     open_rollcall(&base_a, r#"{"id":"RC9","kind":"self_registration","attendance_rate":5}"#);
+    let rc9 = wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC9", 10).expect("RC9 detected");
+    let rc9_token = rc9["activity_token"].as_str().expect("RC9 activity token");
     assert!(none_for(|v| v["event"] == "SignedIn" && v["rollcall_id"] == "RC9", 4), "below-15% rollcall must NOT be signed");
 
     // --- below-gate held → SignNow override signs anyway (the reported「簽到率未達門檻時立即簽到沒反應」路徑）---
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","rollcall_id":"RC9"}}"#));
+    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","activity_token":"{rc9_token}"}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).expect("SignNow reply")["ok"], true);
     assert!(wait_for(signed("RC9", &alice), 10).is_some(), "SignNow must override the gate and sign the held RC9");
 
     // --- below-gate NUMBER: manual override must READ the roster code, NOT brute-force 0000–9999 ---
     // Root cause of「立即簽到沒反應」: the code-read only ran on the gate-PASS path, so a held number
     // rollcall had number_code=None → SignNow brute-forced (thousands of PUTs, rate-limits, no timely sign).
     open_rollcall(&base_a, r#"{"id":"RC8","kind":"number","number_code":"4242","attendance_rate":5}"#);
-    assert!(wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC8", 10).is_some(), "RC8 detected");
+    let rc8 = wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC8", 10).expect("RC8 detected");
+    let rc8_token = rc8["activity_token"].as_str().expect("RC8 activity token");
     assert!(none_for(signed("RC8", &alice), 3), "below-gate number must not auto-sign");
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","rollcall_id":"RC8"}}"#));
+    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","activity_token":"{rc8_token}"}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).expect("SignNow reply")["ok"], true);
     assert!(wait_for(signed("RC8", &alice), 10).is_some(), "SignNow on the held number signs");
     // Read-not-brute: one PUT per participant (alice/bob/teacher on base_a share the read code) ≈ a few,
     // NEVER the thousands a 0000–9999 brute-force would make against the real server.
@@ -202,14 +211,22 @@ fn slice2_multi_account_monitoring_and_four_types() {
 
     // --- defer → PendingSignIn → no auto-sign → SignNow → signs ---
     open_rollcall(&base_a, r#"{"id":"RC5","kind":"self_registration","attendance_rate":100}"#);
-    assert!(wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC5", 10).is_some());
+    let rc5 = wait_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "RC5", 10).expect("RC5 detected");
+    let rc5_token = rc5["activity_token"].as_str().expect("RC5 activity token");
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"DeferSignIn","rollcall_id":"RC5"}}"#));
+    send(h, &format!(r#"{{"id":{i},"cmd":"DeferSignIn","activity_token":"{rc5_token}"}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).expect("DeferSignIn reply")["ok"], true);
     assert!(wait_for(|v| v["event"] == "PendingSignIn" && v["rollcall_id"] == "RC5", 5).is_some(), "defer → PendingSignIn");
     assert!(none_for(signed("RC5", &alice), 3), "deferred RC5 must not auto-sign");
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","rollcall_id":"RC5"}}"#));
+    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","activity_token":"{rc5_token}"}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).expect("SignNow reply")["ok"], true);
     assert!(wait_for(signed("RC5", &alice), 10).is_some(), "SignNow completes the deferred sign");
+
+    let i = next();
+    send(h, &format!(r#"{{"id":{i},"cmd":"SignNow","activity_token":"missing"}}"#));
+    let missing = wait_for(reply_ok(i), 5).expect("unknown token reply");
+    assert_eq!(missing["ok"], false);
 
     let i = next();
     send(h, &format!(r#"{{"id":{i},"cmd":"StopMonitoring"}}"#));

@@ -10,6 +10,7 @@
 use crate::answer::{self, Source};
 use crate::llm::LlmConfig;
 use crate::login;
+use crate::protocol::AnswerWire;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
 use crate::rollcall::{self, RollcallKind, SignOutcome};
@@ -29,6 +30,19 @@ pub type EventCb = extern "C" fn(*const u8, usize);
 /// All events cross the seam through the single audited redaction pass (docs 90 §4).
 fn emit(cb: EventCb, v: &Value) {
     crate::redaction::emit(cb, v);
+}
+
+fn command_reply(cb: EventCb, command_id: u64, result: Result<(), String>) {
+    match result {
+        Ok(()) => emit(
+            cb,
+            &json!({ "id": command_id, "event": "Reply", "ok": true, "error": null }),
+        ),
+        Err(error) => emit(
+            cb,
+            &json!({ "id": command_id, "event": "Reply", "ok": false, "error": error }),
+        ),
+    }
 }
 
 /// Per-account runtime context (session already authenticated by the engine). Carries the credentials
@@ -66,8 +80,8 @@ pub enum MonitorMsg {
     GateResult { key: ActivityKey, rate: Option<f64> },
     CodeRead { key: ActivityKey, code: Option<String> },
     SignResult { key: ActivityKey, account_id: String, result: Result<SignOutcome, String> },
-    SignNow { rollcall_id: String },
-    Defer { rollcall_id: String },
+    SignNow { command_id: u64, activity_token: String },
+    Defer { command_id: u64, activity_token: String },
     // --- quiz (slice 3) ---
     QuizDetected { account_id: String, base_url: String, source: String, course: String, course_id: String, activity_id: String, stem: String },
     QuizPrepared { key: ActivityKey, instance_id: String, subjects: Vec<Value>, shared: Map<String, Answer>, existing: Map<String, Map<String, Answer>> },
@@ -76,10 +90,16 @@ pub enum MonitorMsg {
     /// carried, until `missing` clears or the retry budget deadline is hit.
     QuizPrepareRetry { key: ActivityKey, partial: Map<String, Answer>, missing: Vec<String>, gone: bool },
     QuizSubmitResult { key: ActivityKey, account_id: String, result: Result<String, String> },
-    QuizSubmitNow { quiz_id: String },
-    QuizHold { quiz_id: String },
-    QuizDiscard { quiz_id: String },
-    QuizSetAnswer { quiz_id: String, account_id: String, subject_id: String, answer: Value },
+    QuizSubmitNow { command_id: u64, activity_token: String },
+    QuizHold { command_id: u64, activity_token: String },
+    QuizDiscard { command_id: u64, activity_token: String },
+    QuizSetAnswer {
+        command_id: u64,
+        activity_token: String,
+        account_id: String,
+        subject_id: String,
+        answer: AnswerWire,
+    },
     // --- session expiry / re-login (R4-D) ---
     AuthLost { account_id: String },
     AuthRestored { account_id: String, ok: bool },
@@ -89,6 +109,7 @@ pub enum MonitorMsg {
 }
 
 struct Activity {
+    activity_token: String,
     kind: RollcallKind,
     course: String,
     participants: HashSet<String>,
@@ -589,19 +610,52 @@ async fn actor(
                         if dispatch { dispatch_signs(&mut activities, &accounts, &self_tx, &cfg, cb, &key); }
                     }
                     MonitorMsg::SignResult { key, account_id, result } => on_sign_result(&mut activities, &self_tx, cb, key, account_id, result),
-                    MonitorMsg::SignNow { rollcall_id } => on_sign_now(&mut activities, &accounts, &self_tx, &cfg, cb, &rollcall_id),
-                    MonitorMsg::Defer { rollcall_id } => on_defer(&mut activities, cb, &rollcall_id),
+                    MonitorMsg::SignNow { command_id, activity_token } => {
+                        let result = find_activity_key(&activities, &activity_token)
+                            .ok_or_else(|| "unknown rollcall activity_token".to_string())
+                            .map(|key| on_sign_now(&mut activities, &accounts, &self_tx, &cfg, cb, &key));
+                        command_reply(cb, command_id, result);
+                    }
+                    MonitorMsg::Defer { command_id, activity_token } => {
+                        let result = find_activity_key(&activities, &activity_token)
+                            .ok_or_else(|| "unknown rollcall activity_token".to_string())
+                            .map(|key| on_defer(&mut activities, cb, &key));
+                        command_reply(cb, command_id, result);
+                    }
                     MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
                         on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, course_id, activity_id, account_id, stem),
                     MonitorMsg::QuizPrepared { key, instance_id, subjects, shared, existing } =>
                         on_quiz_prepared(&mut quizzes, &cfg, cb, key, instance_id, subjects, shared, existing),
                     MonitorMsg::QuizPrepareRetry { key, partial, missing, gone } =>
                         on_quiz_prepare_retry(&mut quizzes, &cfg, cb, key, partial, missing, gone),
-                    MonitorMsg::QuizSetAnswer { quiz_id, account_id, subject_id, answer } =>
-                        on_quiz_set_answer(&mut quizzes, &cfg, cb, &quiz_id, &account_id, &subject_id, answer),
-                    MonitorMsg::QuizSubmitNow { quiz_id } => { if let Some(key) = find_quiz_key(&quizzes, &quiz_id) { dispatch_quiz_submits(&mut quizzes, &accounts, &self_tx, &cfg, &key); } }
-                    MonitorMsg::QuizHold { quiz_id } => { if let Some(q) = find_quiz_mut(&mut quizzes, &quiz_id) { q.countdown_deadline = None; q.held = true; } }
-                    MonitorMsg::QuizDiscard { quiz_id } => { if let Some(q) = find_quiz_mut(&mut quizzes, &quiz_id) { q.countdown_deadline = None; q.discarded = true; emit(cb, &json!({"id":null,"event":"LogLine","level":"info","text":format!("quiz {quiz_id} discarded")})); } }
+                    MonitorMsg::QuizSetAnswer { command_id, activity_token, account_id, subject_id, answer } => {
+                        let result = on_quiz_set_answer(&mut quizzes, &cfg, cb, &activity_token, &account_id, &subject_id, answer);
+                        command_reply(cb, command_id, result);
+                    }
+                    MonitorMsg::QuizSubmitNow { command_id, activity_token } => {
+                        let result = find_quiz_key(&quizzes, &activity_token)
+                            .ok_or_else(|| "unknown quiz activity_token".to_string())
+                            .map(|key| dispatch_quiz_submits(&mut quizzes, &accounts, &self_tx, &cfg, &key));
+                        command_reply(cb, command_id, result);
+                    }
+                    MonitorMsg::QuizHold { command_id, activity_token } => {
+                        let result = find_quiz_mut(&mut quizzes, &activity_token)
+                            .ok_or_else(|| "unknown quiz activity_token".to_string())
+                            .map(|q| { q.countdown_deadline = None; q.held = true; });
+                        command_reply(cb, command_id, result);
+                    }
+                    MonitorMsg::QuizDiscard { command_id, activity_token } => {
+                        let result = find_quiz_mut(&mut quizzes, &activity_token)
+                            .ok_or_else(|| "unknown quiz activity_token".to_string())
+                            .map(|q| {
+                                q.countdown_deadline = None;
+                                q.discarded = true;
+                                emit(cb, &json!({"id":null,"event":"LogLine","level":"info",
+                                    "text":format!("quiz {} discarded", q.activity_id),
+                                    "activity_token": q.activity_token}));
+                            });
+                        command_reply(cb, command_id, result);
+                    }
                     MonitorMsg::QuizSubmitResult { key, account_id, result } => on_quiz_submit_result(&mut quizzes, cb, key, account_id, result),
                     MonitorMsg::AuthLost { account_id } => {
                         // Session expired mid-poll. Re-login once (dedup concurrent triggers); the poller
@@ -647,6 +701,7 @@ fn on_detected(
 ) {
     let key = (d.base_url.clone(), d.kind.as_str().to_string(), d.rollcall_id.clone());
     let entry = activities.entry(key.clone()).or_insert_with(|| Activity {
+        activity_token: crate::config::new_id(),
         kind: d.kind,
         course: d.course.clone(),
         participants: HashSet::new(),
@@ -690,6 +745,7 @@ fn on_gate(
     // the threshold instead of an empty countdown slot, and swaps back on `holding:false`.
     let holding = rate + f64::EPSILON < cfg.gate_percent;
     emit(cb, &json!({ "id": null, "event": "RollcallGate", "rollcall_id": key.2,
+                      "activity_token": a.activity_token,
                       "rate": a.attendance_rate, "gate_percent": cfg.gate_percent, "holding": holding }));
     if holding {
         // Below the anti-fake-rollcall gate → hold and re-check on the next detection window.
@@ -726,7 +782,8 @@ fn on_tick(
             }
             let remaining = deadline.saturating_duration_since(now).as_secs();
             emit(cb, &json!({ "id": null, "event": "Countdown", "scope": "rollcall",
-                              "id_": key.2, "remaining_secs": remaining }));
+                              "activity_token": a.activity_token, "external_id": key.2,
+                              "remaining_secs": remaining }));
             if now >= deadline {
                 dispatch_signs(activities, accounts, tx, cfg, cb, &key);
             }
@@ -750,9 +807,8 @@ fn on_sign_now(
     tx: &UnboundedSender<MonitorMsg>,
     cfg: &MonitorConfig,
     cb: EventCb,
-    rollcall_id: &str,
+    key: &ActivityKey,
 ) {
-    let Some(key) = find_key(activities, rollcall_id) else { return };
     // Decide under a scoped borrow, then act once it ends (dispatch_signs re-borrows `activities`).
     enum Act {
         None,
@@ -760,7 +816,7 @@ fn on_sign_now(
         Dispatch,
     }
     let act = {
-        let Some(a) = activities.get_mut(&key) else { return };
+        let Some(a) = activities.get_mut(key) else { return };
         if a.acted {
             Act::None
         } else if a.kind == RollcallKind::Number && a.number_code.is_none() {
@@ -780,8 +836,8 @@ fn on_sign_now(
     };
     match act {
         Act::None | Act::ReadCode(None) => {}
-        Act::ReadCode(Some(acc_id)) => spawn_code_read(accounts, tx, &key, &acc_id),
-        Act::Dispatch => dispatch_signs(activities, accounts, tx, cfg, cb, &key),
+        Act::ReadCode(Some(acc_id)) => spawn_code_read(accounts, tx, key, &acc_id),
+        Act::Dispatch => dispatch_signs(activities, accounts, tx, cfg, cb, key),
     }
 }
 
@@ -806,6 +862,7 @@ fn dispatch_signs(
     let participants: Vec<String> = a.participants.iter().cloned().collect();
     let rollcall_id = key.2.clone();
     let base_url = key.0.clone();
+    let activity_token = a.activity_token.clone();
     let radar_strategy = cfg.radar_strategy.clone();
     let ncfg = rollcall::NumberCfg {
         concurrency: cfg.number_concurrency,
@@ -826,6 +883,7 @@ fn dispatch_signs(
             }
             None => emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
                                      "code": "qr_needs_teacher",
+                                     "activity_token": activity_token,
                                      "message": "偵測到 QR 點名,但此站台沒有教師帳號可輔助——請到「帳號」新增一個教師帳號並開啟 QR 輔助。" })),
         }
         return;
@@ -855,6 +913,7 @@ fn on_sign_result(
                 a.number_code = outcome.discovered_code.clone(); // share a brute-forced code
             }
             emit(cb, &json!({ "id": null, "event": "SignedIn", "rollcall_id": key.2,
+                              "activity_token": a.activity_token,
                               "account_id": account_id, "course": a.course, "method": outcome.method }));
         }
         // Session died mid-sign (R4.1 #2): DON'T give up on the first hit — mark for re-sign, ask the
@@ -867,7 +926,8 @@ fn on_sign_result(
             if *n > MAX_RESIGN {
                 a.needs_resign.remove(&account_id);
                 emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
-                                  "code": "sign_failed", "message": format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} re-logins)") }));
+                                  "code": "sign_failed", "activity_token": a.activity_token,
+                                  "message": format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} re-logins)") }));
             } else {
                 a.needs_resign.insert(account_id.clone());
                 emit(cb, &json!({ "id": null, "event": "LogLine", "level": "warn",
@@ -876,7 +936,8 @@ fn on_sign_result(
             }
         }
         Err(e) => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
-                                    "code": "sign_failed", "message": format!("{account_id}: {e}") })),
+                                    "code": "sign_failed", "activity_token": a.activity_token,
+                                    "message": format!("{account_id}: {e}") })),
     }
 }
 
@@ -903,13 +964,12 @@ fn redispatch_signs(
     }
 }
 
-fn on_defer(activities: &mut HashMap<ActivityKey, Activity>, cb: EventCb, rollcall_id: &str) {
-    if let Some(key) = find_key(activities, rollcall_id) {
-        if let Some(a) = activities.get_mut(&key) {
-            a.countdown_deadline = None;
-            a.gate_pending = false;
-            emit(cb, &json!({ "id": null, "event": "PendingSignIn", "rollcall_id": rollcall_id }));
-        }
+fn on_defer(activities: &mut HashMap<ActivityKey, Activity>, cb: EventCb, key: &ActivityKey) {
+    if let Some(a) = activities.get_mut(key) {
+        a.countdown_deadline = None;
+        a.gate_pending = false;
+        emit(cb, &json!({ "id": null, "event": "PendingSignIn", "rollcall_id": key.2,
+            "activity_token": a.activity_token }));
     }
 }
 
@@ -1018,13 +1078,17 @@ async fn first_course(client: &Client, ep: &Endpoints) -> Option<String> {
 
 // --- small helpers ---
 
-fn find_key(activities: &HashMap<ActivityKey, Activity>, rollcall_id: &str) -> Option<ActivityKey> {
-    activities.keys().find(|k| k.2 == rollcall_id).cloned()
+fn find_activity_key(activities: &HashMap<ActivityKey, Activity>, activity_token: &str) -> Option<ActivityKey> {
+    activities
+        .iter()
+        .find(|(_, activity)| activity.activity_token == activity_token)
+        .map(|(key, _)| key.clone())
 }
 
 fn emit_rollcall_detected(cb: EventCb, rollcall_id: &str, base_url: &str, a: &Activity) {
     let accounts: Vec<&String> = a.participants.iter().collect();
     emit(cb, &json!({ "id": null, "event": "RollcallDetected", "rollcall_id": rollcall_id,
+                      "activity_token": a.activity_token,
                       "base_url": base_url, "kind": a.kind.as_str(), "course": a.course,
                       "attendance_rate": a.attendance_rate, "accounts": accounts }));
 }
@@ -1054,6 +1118,7 @@ fn course_name(rc: &Value) -> String {
 // ================= quiz (slice 3) =================
 
 struct QuizActivity {
+    activity_token: String,
     source: Source,
     course: String,
     course_id: String, // R5: course the tool executor searches for materials
@@ -1092,6 +1157,7 @@ fn on_quiz_detected(
 ) {
     let key = (base_url, format!("quiz:{source}"), activity_id.clone());
     let q = quizzes.entry(key.clone()).or_insert_with(|| QuizActivity {
+        activity_token: crate::config::new_id(),
         source: Source::parse(&source),
         course,
         course_id,
@@ -1194,7 +1260,8 @@ fn on_quiz_prepare_retry(
             format!("unanswerable subjects: {}", missing.join(", "))
         };
         emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
-                          "code": "quiz_unanswerable", "message": format!("{}: {detail}", q.activity_id) }));
+                          "code": "quiz_unanswerable", "activity_token": q.activity_token,
+                          "message": format!("{}: {detail}", q.activity_id) }));
         return;
     }
     // Re-arm prepare after a ~poll-idle backoff; the tick's grace-gate re-spawns with q.shared as prior.
@@ -1206,21 +1273,38 @@ fn on_quiz_set_answer(
     quizzes: &mut HashMap<ActivityKey, QuizActivity>,
     cfg: &MonitorConfig,
     cb: EventCb,
-    quiz_id: &str,
+    activity_token: &str,
     account_id: &str,
     subject_id: &str,
-    answer: Value,
-) {
-    let Some(q) = find_quiz_mut(quizzes, quiz_id) else { return };
-    q.overrides.entry(account_id.to_string()).or_default().insert(subject_id.to_string(), answer_from_value(&answer));
+    answer: AnswerWire,
+) -> Result<(), String> {
+    let q = find_quiz_mut(quizzes, activity_token)
+        .ok_or_else(|| "unknown quiz activity_token".to_string())?;
+    if !q.participants.contains(account_id) {
+        return Err("account is not a participant in this quiz".to_string());
+    }
+    let subject = q
+        .subjects
+        .iter()
+        .find(|subject| crate::quiz::subject_id(subject) == subject_id)
+        .ok_or_else(|| "unknown subject for this quiz".to_string())?;
+    let answer = answer.into_answer()?;
+    crate::quiz::validate_answer(subject, &answer, q.source == Source::Vote)?;
+    q.overrides
+        .entry(account_id.to_string())
+        .or_default()
+        .insert(subject_id.to_string(), answer.clone());
     if let Some(cset) = q.conflicts.get_mut(account_id) {
         cset.remove(subject_id);
         if cset.is_empty() {
             q.conflicts.remove(account_id);
         }
     }
-    emit(cb, &json!({ "id": null, "event": "AnswerUpdated", "quiz_id": quiz_id,
-                      "account_id": account_id, "subject_id": subject_id, "source": "user", "conflict": false }));
+    emit(cb, &json!({ "id": null, "event": "AnswerUpdated", "quiz_id": q.activity_id,
+                      "activity_token": q.activity_token, "account_id": account_id,
+                      "subject_id": subject_id, "answer": AnswerWire::from_answer(&answer),
+                      "display_answer": AnswerWire::from_answer(&answer).display(),
+                      "source": "user", "conflict": false }));
     let conflicts: usize = q.conflicts.values().map(|s| s.len()).sum();
     // `held` gates the re-arm: once the user held this quiz, resolving a conflict must NOT restart the
     // auto-submit countdown (only an explicit SubmitNow may). Without this, hold-then-resolve silently
@@ -1228,6 +1312,7 @@ fn on_quiz_set_answer(
     if conflicts == 0 && q.countdown_deadline.is_none() && !q.held && !q.acted && !q.discarded {
         q.countdown_deadline = Some(Instant::now() + Duration::from_secs(cfg.countdown_secs));
     }
+    Ok(())
 }
 
 fn on_quiz_tick(
@@ -1248,7 +1333,20 @@ fn on_quiz_tick(
                 if now.saturating_duration_since(t) >= Duration::from_millis(1200) {
                     q.prepare_started = true;
                     let participants: Vec<Arc<Account>> = q.participants.iter().filter_map(|id| accounts.get(id).cloned()).collect();
-                    spawn_quiz_prepare(participants, q.source, q.activity_id.clone(), q.course_id.clone(), q.stem.clone(), cfg.llm(), cfg.max_answer_reask, q.shared.clone(), tx.clone(), key.clone(), cb);
+                    spawn_quiz_prepare(
+                        participants,
+                        q.source,
+                        q.activity_id.clone(),
+                        q.activity_token.clone(),
+                        q.course_id.clone(),
+                        q.stem.clone(),
+                        cfg.llm(),
+                        cfg.max_answer_reask,
+                        q.shared.clone(),
+                        tx.clone(),
+                        key.clone(),
+                        cb,
+                    );
                 }
             }
             continue;
@@ -1260,7 +1358,8 @@ fn on_quiz_tick(
         }
         let remaining = deadline.saturating_duration_since(now).as_secs();
         emit(cb, &json!({ "id": null, "event": "Countdown", "scope": "quiz",
-                          "id_": q.activity_id, "remaining_secs": remaining }));
+                          "activity_token": q.activity_token, "external_id": q.activity_id,
+                          "remaining_secs": remaining }));
         if now >= deadline {
             dispatch_quiz_submits(quizzes, accounts, tx, cfg, &key);
         }
@@ -1300,14 +1399,30 @@ fn on_quiz_submit_result(quizzes: &mut HashMap<ActivityKey, QuizActivity>, cb: E
     match result {
         Ok(detail) => {
             q.submitted.insert(account_id.clone());
-            emit(cb, &json!({ "id": null, "event": "QuizSubmitted", "quiz_id": q.activity_id, "account_id": account_id, "result": detail }));
+            emit(cb, &json!({ "id": null, "event": "QuizSubmitted", "quiz_id": q.activity_id,
+                "activity_token": q.activity_token, "account_id": account_id, "result": detail }));
         }
-        Err(e) => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error", "code": "quiz_submit_failed", "message": format!("{account_id}: {e}") })),
+        Err(e) => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+            "code": "quiz_submit_failed", "activity_token": q.activity_token,
+            "message": format!("{account_id}: {e}") })),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_id: String, course_id: String, stem: String, llm: LlmConfig, max_reask: u32, prior: Map<String, Answer>, tx: UnboundedSender<MonitorMsg>, key: ActivityKey, cb: EventCb) {
+fn spawn_quiz_prepare(
+    participants: Vec<Arc<Account>>,
+    source: Source,
+    activity_id: String,
+    activity_token: String,
+    course_id: String,
+    stem: String,
+    llm: LlmConfig,
+    max_reask: u32,
+    prior: Map<String, Answer>,
+    tx: UnboundedSender<MonitorMsg>,
+    key: ActivityKey,
+    cb: EventCb,
+) {
     tokio::spawn(async move {
         let Some(lead) = participants.first().cloned() else { return };
         let ep = Endpoints::derive(&lead.base_url);
@@ -1325,7 +1440,18 @@ fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_
             tx.send(MonitorMsg::QuizPrepareRetry { key, partial: prior, missing: Vec::new(), gone: true }).ok();
             return;
         }
-        let shared = answer::shared_answers(&lead.client, &llm, cb, &activity_id, &course_id, &lead.base_url, &paper.subjects, max_reask, &prior).await;
+        let shared = answer::shared_answers(
+            &lead.client,
+            &llm,
+            cb,
+            &activity_token,
+            &course_id,
+            &lead.base_url,
+            &paper.subjects,
+            max_reask,
+            &prior,
+        )
+        .await;
         let missing = answer::missing_subjects(&paper.subjects, &shared);
         if !missing.is_empty() {
             // No LLM key → the missing subjects can never be answered by retrying; fail fast with a clear
@@ -1333,6 +1459,7 @@ fn spawn_quiz_prepare(participants: Vec<Arc<Account>>, source: Source, activity_
             // fill `shared` WITHOUT the LLM, so a fully-leaked paper never reaches this branch.)
             if llm.api_key.trim().is_empty() {
                 emit(cb, &json!({ "id": null, "event": "Error", "severity": "error", "code": "llm_key_missing",
+                    "activity_token": activity_token,
                     "message": format!("{activity_id}：尚未設定 LLM 金鑰，無法自動作答（請至 設定 → 儲存金鑰）") }));
                 tx.send(MonitorMsg::QuizPrepareRetry { key, partial: shared, missing, gone: true }).ok();
                 return;
@@ -1431,22 +1558,89 @@ fn emit_quiz_prepared(cb: EventCb, q: &QuizActivity) {
                 .map(|s| {
                     let sid = crate::quiz::subject_id(s);
                     let conflict = q.conflicts.get(acc).map(|c| c.contains(&sid)).unwrap_or(false);
-                    json!({ "subject_id": sid, "conflict": conflict })
+                    let existing_answer = q.overrides.get(acc).and_then(|answers| answers.get(&sid));
+                    let answer = q.shared.get(&sid);
+                    let answer_wire = answer.map(AnswerWire::from_answer);
+                    let existing_wire = existing_answer.map(AnswerWire::from_answer);
+                    let display_answer = answer_wire
+                        .as_ref()
+                        .map(AnswerWire::display)
+                        .unwrap_or_default();
+                    let options: Vec<Value> = s
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .map(|options| {
+                            options
+                                .iter()
+                                .map(|option| {
+                                    json!({
+                                        "id": id_of(option).unwrap_or_default(),
+                                        "text": option.get("content")
+                                            .or_else(|| option.get("description"))
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "subject_id": sid,
+                        "parent_id": value_id(s.get("parent_id")),
+                        "type": s.get("type").and_then(Value::as_str).unwrap_or(""),
+                        "answer_type": s.get("answer_type").and_then(Value::as_str)
+                            .or_else(|| s.get("type").and_then(Value::as_str)).unwrap_or(""),
+                        "stem": subject_stem(s),
+                        "options": options,
+                        "answer": answer_wire,
+                        "existing_answer": existing_wire,
+                        "display_answer": display_answer,
+                        "source": "llm",
+                        "conflict": conflict
+                    })
                 })
                 .collect();
-            json!({ "account_id": acc, "questions": questions })
+            json!({ "account_id": acc, "instance_id": q.instance_id, "questions": questions })
         })
         .collect();
     let conflict_count: usize = q.conflicts.values().map(|s| s.len()).sum();
-    emit(cb, &json!({ "id": null, "event": "QuizPrepared", "quiz_id": q.activity_id, "course": q.course,
-                      "per_account": per_account, "conflict_count": conflict_count }));
+    emit(cb, &json!({ "id": null, "event": "QuizPrepared", "schema_version": 1,
+        "activity_token": q.activity_token, "quiz_id": q.activity_id,
+        "activity": { "external_id": q.activity_id, "source": q.source.as_str(),
+            "course_id": q.course_id, "course": q.course },
+        "course": q.course, "per_account": per_account, "conflict_count": conflict_count }));
 }
 
-fn find_quiz_key(quizzes: &HashMap<ActivityKey, QuizActivity>, quiz_id: &str) -> Option<ActivityKey> {
-    quizzes.iter().find(|(_, q)| q.activity_id == quiz_id).map(|(k, _)| k.clone())
+fn subject_stem(subject: &Value) -> &str {
+    ["description", "content", "stem"]
+        .iter()
+        .find_map(|key| subject.get(*key).and_then(Value::as_str).filter(|text| !text.is_empty()))
+        .unwrap_or("")
 }
-fn find_quiz_mut<'a>(quizzes: &'a mut HashMap<ActivityKey, QuizActivity>, quiz_id: &str) -> Option<&'a mut QuizActivity> {
-    quizzes.values_mut().find(|q| q.activity_id == quiz_id)
+
+fn value_id(value: Option<&Value>) -> Option<String> {
+    value.and_then(|value| {
+        value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| value.as_i64().map(|id| id.to_string()))
+            .or_else(|| value.as_u64().map(|id| id.to_string()))
+    })
+}
+
+fn find_quiz_key(quizzes: &HashMap<ActivityKey, QuizActivity>, activity_token: &str) -> Option<ActivityKey> {
+    quizzes
+        .iter()
+        .find(|(_, quiz)| quiz.activity_token == activity_token)
+        .map(|(key, _)| key.clone())
+}
+fn find_quiz_mut<'a>(
+    quizzes: &'a mut HashMap<ActivityKey, QuizActivity>,
+    activity_token: &str,
+) -> Option<&'a mut QuizActivity> {
+    quizzes
+        .values_mut()
+        .find(|quiz| quiz.activity_token == activity_token)
 }
 
 async fn get_json(client: &Client, url: &str) -> Result<Value, String> {
@@ -1497,20 +1691,6 @@ fn id_of(v: &Value) -> Option<String> {
         .or_else(|| v.get("activity_id"))
         .or_else(|| v.get("course_id"))
         .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
-}
-
-fn answer_from_value(v: &Value) -> Answer {
-    if let Some(o) = v.get("options").and_then(Value::as_array) {
-        Answer::Options(o.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-    } else if let Some(b) = v.get("blanks").and_then(Value::as_array) {
-        Answer::Blanks(b.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-    } else if let Some(t) = v.get("text").and_then(Value::as_str) {
-        Answer::Text(t.to_string())
-    } else if let Some(vv) = v.get("vote").and_then(Value::as_array) {
-        Answer::Vote(vv.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-    } else {
-        Answer::Text(v.as_str().unwrap_or("").to_string())
-    }
 }
 
 fn vote_letters(a: &Answer) -> Vec<String> {
@@ -1612,6 +1792,7 @@ mod tests {
         let mut conflicts: Map<String, HashSet<String>> = Map::new();
         conflicts.insert("acc1".to_string(), HashSet::from(["subj1".to_string()]));
         let q = QuizActivity {
+            activity_token: "token1".to_string(),
             source: Source::Exam,
             course: String::new(),
             course_id: String::new(),
@@ -1622,7 +1803,7 @@ mod tests {
             prepare_started: true,
             prepare_deadline: None,
             instance_id: String::new(),
-            subjects: vec![],
+            subjects: vec![json!({ "id": "subj1", "type": "short_answer", "content": "Question" })],
             shared: Map::new(),
             overrides: Map::new(),
             conflicts,
@@ -1642,7 +1823,16 @@ mod tests {
         let (mut quizzes, key) = quiz_with_conflict();
         quizzes.get_mut(&key).unwrap().held = true; // user held while a conflict was still open
         let cfg = cfg_countdown(15);
-        on_quiz_set_answer(&mut quizzes, &cfg, noop_cb, "act1", "acc1", "subj1", json!("x"));
+        on_quiz_set_answer(
+            &mut quizzes,
+            &cfg,
+            noop_cb,
+            "token1",
+            "acc1",
+            "subj1",
+            AnswerWire::Text { value: "x".into() },
+        )
+        .unwrap();
         let q = quizzes.get(&key).unwrap();
         assert!(q.conflicts.is_empty(), "the conflict is resolved");
         assert!(q.countdown_deadline.is_none(), "a HELD quiz must not re-arm auto-submit — only SubmitNow may");
@@ -1652,8 +1842,39 @@ mod tests {
     fn unheld_quiz_rearms_countdown_when_conflict_resolves() {
         let (mut quizzes, key) = quiz_with_conflict(); // held = false
         let cfg = cfg_countdown(15);
-        on_quiz_set_answer(&mut quizzes, &cfg, noop_cb, "act1", "acc1", "subj1", json!("x"));
+        on_quiz_set_answer(
+            &mut quizzes,
+            &cfg,
+            noop_cb,
+            "token1",
+            "acc1",
+            "subj1",
+            AnswerWire::Text { value: "x".into() },
+        )
+        .unwrap();
         let q = quizzes.get(&key).unwrap();
         assert!(q.countdown_deadline.is_some(), "an un-held quiz re-arms once its last conflict clears");
+    }
+
+    #[test]
+    fn invalid_typed_answer_does_not_resolve_conflict() {
+        let (mut quizzes, key) = quiz_with_conflict();
+        let cfg = cfg_countdown(15);
+
+        let result = on_quiz_set_answer(
+            &mut quizzes,
+            &cfg,
+            noop_cb,
+            "token1",
+            "acc1",
+            "subj1",
+            AnswerWire::Options {
+                option_ids: vec!["not-for-text".into()],
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(quizzes[&key].conflicts["acc1"].contains("subj1"));
+        assert!(!quizzes[&key].overrides.contains_key("acc1"));
     }
 }
