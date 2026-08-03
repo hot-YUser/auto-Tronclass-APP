@@ -24,13 +24,15 @@ public sealed class MockCore : ICore
     private const string BaseUrl = "https://ilearn.thu.edu.tw";
 
     // Mutable so the Accounts tab is fully interactive in preview (Add/Delete/Switch re-emit Accounts).
-    private readonly List<(string id, string label, string user, string school)> _accounts = new()
+    // teacher/course mirror AccountMeta (config.rs) so the teacher badge + QR-assist entry preview live.
+    private readonly List<(string id, string label, string user, string school, bool teacher, string? course)> _accounts = new()
     {
-        ("a1", "我的東海", "s1109999@thu.edu.tw", "thu"),
-        ("a2", "公有雲測試", "demo@example.com", "tronclass"),
+        ("a1", "我的東海", "s1109999@thu.edu.tw", "thu", false, null),
+        ("a2", "公有雲測試", "demo@example.com", "tronclass", false, null),
+        ("a3", "課堂教師機", "teacher@thu.edu.tw", "thu", true, "55379"),
     };
     private string _active = "a1";
-    private int _nextId = 3;
+    private int _nextId = 4;
 
     // 目前生效的設定;UpdateConfig/SetLlmKey 後更新並重發,讓設定頁的預覽是活的。
     private readonly Dictionary<string, object?> _settings = new()
@@ -49,7 +51,7 @@ public sealed class MockCore : ICore
     {
         Emit(new { id = (object?)null, @event = "Caps", caps = new {
             background_monitoring = true, self_update = true,
-            qr_teacher_assist = false, ocr_captcha = false } });
+            qr_teacher_assist = true, ocr_captcha = false } });
         Emit(new { id = (object?)null, @event = "StateChanged", state = "idle" });
         // 核心以 device-key 自動解鎖：Init 後即 unlocked（使用者不需輸入主密碼）。
         Emit(new { id = (object?)null, @event = "VaultState", exists = true, unlocked = true });
@@ -74,7 +76,8 @@ public sealed class MockCore : ICore
         switch (cmd)
         {
             case "AddAccount":
-                _accounts.Add(($"a{_nextId++}", Str("label") ?? "新帳號", Str("username") ?? "", Str("school") ?? "thu"));
+                _accounts.Add(($"a{_nextId++}", Str("label") ?? "新帳號", Str("username") ?? "", Str("school") ?? "thu",
+                    f.TryGetValue("is_teacher", out var it) && it is true, Str("course_id")));
                 EmitAccounts();
                 break;
             case "DeleteAccount":
@@ -197,7 +200,8 @@ public sealed class MockCore : ICore
     }
 
     private void EmitAccounts() => Emit(new { id = (object?)null, @event = "Accounts", active = _active,
-        accounts = _accounts.ConvertAll(a => new { id = a.id, label = a.label, username = a.user, school_ref = a.school }) });
+        accounts = _accounts.ConvertAll(a => new { id = a.id, label = a.label, username = a.user, school_ref = a.school,
+            is_teacher = a.teacher, course_id = a.course }) });
 
     private void Emit(object o)
     {

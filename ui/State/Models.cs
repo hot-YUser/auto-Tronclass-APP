@@ -56,12 +56,16 @@ public sealed class AccountVm : ObservableObject
 {
     public required string Id { get; init; }
     string _label = "", _username = "", _schoolRef = "", _state = "offline";
-    bool _isActive; string? _error;
+    bool _isActive, _isTeacher; string? _error, _courseId;
 
     public string Label { get => _label; set => Set(ref _label, value); }
     public string Username { get => _username; set => Set(ref _username, value); }
     public string SchoolRef { get => _schoolRef; set => Set(ref _schoolRef, value); }
     public bool IsActive { get => _isActive; set => Set(ref _isActive, value); }
+    /// 教師帳號:偵測到 QR 點名時,用它開一場點名取得輪替 data 替學生簽到(core spawn_qr_teacher_assist)。
+    public bool IsTeacher { get => _isTeacher; set => Set(ref _isTeacher, value); }
+    /// 教師帳號主持 QR 點名的課程;null/空 = core 退回教師的第一門課。
+    public string? CourseId { get => _courseId; set => Set(ref _courseId, value); }
     public string? Error { get => _error; set => Set(ref _error, value); }
     public string State
     {

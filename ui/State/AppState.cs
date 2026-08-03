@@ -183,6 +183,8 @@ public sealed class AppState : ObservableObject
                 vm.Label = Str(a, "label") ?? "";
                 vm.Username = Str(a, "username") ?? "";
                 vm.SchoolRef = Str(a, "school_ref") ?? "";
+                vm.IsTeacher = Bool(a, "is_teacher");
+                vm.CourseId = Str(a, "course_id");
                 vm.IsActive = id == ActiveAccountId;
             }
         foreach (var gone in Accounts.Where(x => !seen.Contains(x.Id)).ToList()) Accounts.Remove(gone);
@@ -363,8 +365,10 @@ public sealed class AppState : ObservableObject
     public Task StartMonitoring() => Send("StartMonitoring");
     public Task StopMonitoring() => Send("StopMonitoring");
 
-    public async Task<bool> AddAccount(string label, string school, string username, string password) =>
-        OkReply(await Send("AddAccount", ("label", label), ("school", school), ("username", username), ("password", password)));
+    public async Task<bool> AddAccount(string label, string school, string username, string password,
+                                       bool isTeacher = false, string? courseId = null) =>
+        OkReply(await Send("AddAccount", ("label", label), ("school", school), ("username", username), ("password", password),
+                           ("is_teacher", isTeacher), ("course_id", string.IsNullOrWhiteSpace(courseId) ? null : courseId.Trim())));
     public Task SwitchAccount(string id) => Send("SwitchAccount", ("account_id", id));
     public Task DeleteAccount(string id) => Send("DeleteAccount", ("account_id", id));
     public Task Login(string id) => Send("Login", ("account_id", id));

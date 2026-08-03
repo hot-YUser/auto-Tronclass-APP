@@ -656,11 +656,12 @@ fn emit_accounts(cb: EventCb, st: &CoreState) {
 }
 
 fn emit_caps(cb: EventCb) {
-    // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false.
+    // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false. QR teacher-assist IS implemented
+    // (monitor::spawn_qr_teacher_assist) — the build supports it; it just needs a teacher account added.
     emit(cb, &json!({ "id": null, "event": "Caps", "caps": {
         "background_monitoring": true,
         "self_update": true,
-        "qr_teacher_assist": false,
+        "qr_teacher_assist": true,
         "ocr_captcha": false
     }}));
 }

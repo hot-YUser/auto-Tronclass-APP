@@ -92,7 +92,7 @@ sealed class AccountCard : Border
         base.OnBindingContextChanged();
         Unhook();
         if (BindingContext is not AccountVm vm) return;
-        _handler = (_, a) => { if (a.PropertyName is nameof(AccountVm.State) or nameof(AccountVm.IsActive)) Render(vm); };
+        _handler = (_, a) => { if (a.PropertyName is nameof(AccountVm.State) or nameof(AccountVm.IsActive) or nameof(AccountVm.IsTeacher)) Render(vm); };
         vm.PropertyChanged += _handler;
         _hookedVm = vm;
         Render(vm);
@@ -106,6 +106,8 @@ sealed class AccountCard : Border
         titleRow.Children.Add(Theme.Strong(vm.Label, 15));
         if (vm.IsActive)
             titleRow.Children.Add(Theme.TextPill("使用中", Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD));
+        if (vm.IsTeacher)
+            titleRow.Children.Add(Theme.TextPill("教師 · QR 輔助", Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD));
 
         var (fgL, fgD, bgL, bgD) = vm.State switch
         {
@@ -137,6 +139,9 @@ sealed class AccountCard : Border
 
         var stack = new VerticalStackLayout { Spacing = 8, Children = { header, Theme.Dim(vm.Username, 12.5) } };
         if (!string.IsNullOrEmpty(school)) stack.Children.Add(Theme.Dim(school, 12.5));
+        if (vm.IsTeacher)
+            stack.Children.Add(Theme.Dim(
+                string.IsNullOrWhiteSpace(vm.CourseId) ? "主持課程:自動(第一門課)" : $"主持課程:{vm.CourseId}", 12.5));
         if (vm.Error is { Length: > 0 } err)
             stack.Children.Add(Theme.Text(err, 12.5, Theme.FontRegular, Theme.DangerL, Theme.DangerD));
         stack.Children.Add(buttons);
@@ -165,6 +170,25 @@ public sealed class AddAccountPage : ContentPage
         picker.SelectedIndexChanged += (_, _) =>
             customUrl.IsVisible = picker.SelectedIndex == schoolNames.Count - 1;
 
+        // 教師帳號(選用):偵測到 QR 點名時,用它開一場點名取得輪替 data 替同站台學生簽到。
+        var isTeacher = new Switch();
+        var courseId = new Entry { Placeholder = "課程 ID(選填,留空自動用第一門課)", Keyboard = Keyboard.Numeric, IsVisible = false };
+        isTeacher.Toggled += (_, e) => courseId.IsVisible = e.Value;
+        var teacherRow = new Grid { ColumnSpacing = 12 };
+        teacherRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        teacherRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        teacherRow.Add(new VerticalStackLayout
+        {
+            Spacing = 2,
+            Children =
+            {
+                Theme.Body("教師帳號 QR 輔助"),
+                Theme.Dim("偵測到 QR 點名時,用此帳號取得輪替 data 替學生簽到。需此站台教師權限。", 12),
+            },
+        }, 0, 0);
+        isTeacher.VerticalOptions = LayoutOptions.Center;
+        teacherRow.Add(isTeacher, 1, 0);
+
         var error = Theme.Text("", 12.5, Theme.FontRegular, Theme.DangerL, Theme.DangerD);
         error.IsVisible = false;
 
@@ -181,7 +205,8 @@ public sealed class AddAccountPage : ContentPage
                 return;
             }
             error.IsVisible = false;
-            if (await state.AddAccount(label.Text.Trim(), school, username.Text.Trim(), password.Text))
+            if (await state.AddAccount(label.Text.Trim(), school, username.Text.Trim(), password.Text,
+                                       isTeacher.IsToggled, isTeacher.IsToggled ? courseId.Text : null))
                 await Navigation.PopAsync();
         });
 
@@ -197,6 +222,12 @@ public sealed class AddAccountPage : ContentPage
                     {
                         Spacing = 10,
                         Children = { label, picker, customUrl, username, password, error },
+                    }),
+                    Theme.Section("教師帳號(選用)"),
+                    Theme.Card(new VerticalStackLayout
+                    {
+                        Spacing = 10,
+                        Children = { teacherRow, courseId },
                     }),
                     submit,
                 },

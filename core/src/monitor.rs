@@ -825,7 +825,8 @@ fn dispatch_signs(
                 spawn_qr_teacher_assist(t, students, tx.clone(), key.clone());
             }
             None => emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
-                                     "code": "qr_needs_teacher", "message": format!("rollcall {rollcall_id}: qr needs a teacher account") })),
+                                     "code": "qr_needs_teacher",
+                                     "message": "偵測到 QR 點名,但此站台沒有教師帳號可輔助——請到「帳號」新增一個教師帳號並開啟 QR 輔助。" })),
         }
         return;
     }
