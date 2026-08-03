@@ -92,6 +92,34 @@ public static class Theme
     public static Border TextPill(string t, Color fgL, Color fgD, Color bgL, Color bgD) =>
         Pill(Text(t, 11.5, FontSemibold, fgL, fgD), bgL, bgD);
 
+    /// <summary>把既有膠囊改上另一組語意色(狀態變動時原地換色,不重建視圖)。</summary>
+    public static void Recolor(this Border pill, Label label, Color fgL, Color fgD, Color bgL, Color bgD)
+    {
+        pill.Themed(VisualElement.BackgroundColorProperty, bgL, bgD);
+        label.Themed(Label.TextColorProperty, fgL, fgD);
+    }
+
+    /// <summary>活動類型徽章:圓角方塊 + 置中字紋,統一主色墊。回傳徽章與其內層 Label(字紋可後續更新)。</summary>
+    public static (Border view, Label glyph) Emblem(double size = 42)
+    {
+        var glyph = Text("", 14.5, FontSemibold, PrimL, PrimD);
+        glyph.HorizontalOptions = LayoutOptions.Center;
+        glyph.VerticalOptions = LayoutOptions.Center;
+        glyph.LineBreakMode = LineBreakMode.NoWrap;
+        var b = new Border
+        {
+            Content = glyph,
+            WidthRequest = size,
+            HeightRequest = size,
+            Padding = 0,
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = 13 },
+            VerticalOptions = LayoutOptions.Start,
+        };
+        b.Themed(VisualElement.BackgroundColorProperty, PrimBgL, PrimBgD);
+        return (b, glyph);
+    }
+
     public static Ellipse Dot(Color light, Color dark, double size = 9)
     {
         var e = new Ellipse { WidthRequest = size, HeightRequest = size, VerticalOptions = LayoutOptions.Center };

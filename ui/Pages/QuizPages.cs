@@ -15,7 +15,7 @@ public sealed class QuizListPage : ContentPage
         BindableLayout.SetItemsSource(host, state.Quizzes);
         BindableLayout.SetItemTemplate(host, new DataTemplate(() => new QuizRow()));
 
-        var empty = Theme.Dim("尚未偵測到測驗。開始監控後,新的測驗會即時出現在這裡。", 13);
+        var empty = new EmptyState("尚無答題紀錄", "開始監控後,偵測到的測驗會由 LLM 備答並出現在這裡,並保留為紀錄。");
         void SyncEmpty() => empty.IsVisible = state.Quizzes.Count == 0;
         state.Quizzes.CollectionChanged += (_, _) => SyncEmpty();
         SyncEmpty();
@@ -32,39 +32,15 @@ public sealed class QuizListPage : ContentPage
     }
 }
 
+/// <summary>紀錄卡:測驗徽章 + 課程 + 狀態膠囊 + meta(題數·時間) + 逐帳號送出 chips + 迷你倒數。</summary>
 sealed class QuizRow : Border
 {
-    readonly VerticalStackLayout _countdownHost = new();
-
     public QuizRow()
     {
         Padding = 14;
         StrokeThickness = 1;
-        StrokeShape = new RoundRectangle { CornerRadius = 16 };
+        StrokeShape = new RoundRectangle { CornerRadius = 18 };
         this.Themed(BackgroundColorProperty, Theme.CardL, Theme.CardD).StrokeThemed(Theme.LineL, Theme.LineD);
-
-        var course = Theme.Strong("", 15);
-        course.SetBinding(Label.TextProperty, nameof(QuizVm.Course));
-        var sub = Theme.Dim("");
-        sub.SetBinding(Label.TextProperty, nameof(QuizVm.SubtitleText));
-        var status = Theme.Text("", 12.5, Theme.FontSemibold, Theme.PrimL, Theme.PrimD);
-        status.SetBinding(Label.TextProperty, nameof(QuizVm.StatusText));
-
-        var conflictPill = Theme.TextPill("衝突待定案", Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD);
-        conflictPill.SetBinding(IsVisibleProperty, nameof(QuizVm.HasConflicts));
-
-        var header = new Grid();
-        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
-        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
-        header.Add(course, 0, 0);
-        header.Add(conflictPill, 1, 0);
-
-        Content = new VerticalStackLayout
-        {
-            Spacing = 4,
-            Children = { header, sub, status, _countdownHost },
-        };
-
         this.OnTap(() => BindingContext is QuizVm vm
             ? ((AppShell)Shell.Current).OpenQuizDetail(vm)
             : Task.CompletedTask);
@@ -73,10 +49,53 @@ sealed class QuizRow : Border
     protected override void OnBindingContextChanged()
     {
         base.OnBindingContextChanged();
-        _countdownHost.Children.Clear();
-        if (BindingContext is QuizVm vm)
-            _countdownHost.Children.Add(new CountdownView(vm, "自動送出", 12) { Margin = new Thickness(0, 6, 0, 0) });
+        if (BindingContext is not QuizVm vm) { Content = null; return; }
+
+        var (emblem, glyph) = Theme.Emblem();
+        glyph.Text = vm.KindEmblem; // 答題無子類型,固定「測驗」
+
+        var course = Theme.Strong("", 15.5);
+        course.VerticalOptions = LayoutOptions.Center;
+        course.SetBinding(Label.TextProperty, new Binding(nameof(QuizVm.Course), source: vm));
+
+        var statusPill = new StatusPill(vm, () => QuizToneOf(vm), nameof(QuizVm.StatusTag));
+        statusPill.VerticalOptions = LayoutOptions.Center;
+        statusPill.HorizontalOptions = LayoutOptions.End;
+
+        var header = new Grid { ColumnSpacing = 8 };
+        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        header.Add(course, 0, 0);
+        header.Add(statusPill, 1, 0);
+
+        var meta = Theme.Dim("", 12.5);
+        meta.SetBinding(Label.TextProperty, new Binding(nameof(QuizVm.SubtitleText), source: vm));
+
+        var chips = new ChipsView(vm.PerAccount,
+            o => { var a = (QuizAccountVm)o; return (a.ChipText, a.Submitted); },
+            nameof(QuizAccountVm.ChipText));
+
+        var countdown = new CountdownView(vm, "自動送出", 12) { Margin = new Thickness(0, 2, 0, 0) };
+
+        var body = new VerticalStackLayout { Spacing = 6, Children = { header, meta, chips, countdown } };
+
+        var grid = new Grid { ColumnSpacing = 12 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        grid.Add(emblem, 0, 0);
+        grid.Add(body, 1, 0);
+        Content = grid;
     }
+
+    /// 狀態膠囊短標籤 + 語意色:已送出綠、暫緩琥珀、捨棄紅、待定案琥珀、審題中主色。
+    static (string, Color, Color, Color, Color) QuizToneOf(QuizVm vm) => vm.Status switch
+    {
+        "done" => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
+        "held" => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
+        "discarded" => (vm.StatusTag, Theme.DangerL, Theme.DangerD, Theme.DangerBgL, Theme.DangerBgD),
+        _ when vm.AnyConflict => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
+        _ => (vm.StatusTag, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD),
+    };
 }
 
 /// <summary>

@@ -1,6 +1,103 @@
+using System.Collections;
+using System.Collections.Specialized;
 using System.ComponentModel;
 
 namespace Ui;
+
+/// <summary>空狀態:置中標題 + 說明,收在一張卡裡(比一行灰字更完整、耐看)。</summary>
+public sealed class EmptyState : ContentView
+{
+    public EmptyState(string title, string subtitle)
+    {
+        var t = Theme.Strong(title, 15);
+        t.HorizontalOptions = LayoutOptions.Center;
+        var s = Theme.Dim(subtitle, 12.5);
+        s.HorizontalOptions = LayoutOptions.Center;
+        s.HorizontalTextAlignment = TextAlignment.Center;
+        Content = Theme.Card(new VerticalStackLayout
+        {
+            Spacing = 6,
+            Padding = new Thickness(12, 22),
+            Children = { t, s },
+        });
+    }
+}
+
+/// <summary>
+/// 狀態膠囊:文字 + 語意色隨 VM 狀態原地換色(不重建)。<paramref name="tone"/> 回傳當下的
+/// 標籤與色組;<paramref name="triggers"/> 是會改變它的屬性名(空 = 任何變動都重算)。
+/// 訂閱綁 attach/detach,離開畫面即退訂。
+/// </summary>
+public sealed class StatusPill : ContentView
+{
+    public StatusPill(INotifyPropertyChanged vm,
+        Func<(string tag, Color fgL, Color fgD, Color bgL, Color bgD)> tone, params string[] triggers)
+    {
+        var label = Theme.Text("", 11.5, Theme.FontSemibold, Theme.PrimL, Theme.PrimD);
+        var pill = Theme.Pill(label, Theme.PrimBgL, Theme.PrimBgD, new Thickness(11, 4));
+        Content = pill;
+
+        void Sync() { var (t, fl, fd, bl, bd) = tone(); label.Text = t; pill.Recolor(label, fl, fd, bl, bd); }
+        void OnPc(object? _, PropertyChangedEventArgs e) { if (triggers.Length == 0 || triggers.Contains(e.PropertyName)) Sync(); }
+        this.WhileAttached(() => { vm.PropertyChanged += OnPc; Sync(); }, () => vm.PropertyChanged -= OnPc);
+    }
+}
+
+/// <summary>
+/// 逐帳號結果膠囊列(換行排列)。<paramref name="cell"/> 由每個項目算出(文字, 是否完成);完成＝綠、
+/// 未完成＝灰。集合變動、或項目的 <paramref name="triggers"/> 屬性變動時重建。訂閱綁 attach/detach。
+/// </summary>
+public sealed class ChipsView : ContentView
+{
+    readonly FlexLayout _flex = new() { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap };
+    readonly IEnumerable _items;
+    readonly Func<object, (string text, bool done)> _cell;
+    readonly string[] _triggers;
+    readonly Dictionary<INotifyPropertyChanged, PropertyChangedEventHandler> _hooks = [];
+
+    public ChipsView(IEnumerable items, Func<object, (string text, bool done)> cell, params string[] triggers)
+    {
+        _items = items; _cell = cell; _triggers = triggers;
+        Content = _flex;
+
+        var coll = items as INotifyCollectionChanged;
+        void OnColl(object? _, NotifyCollectionChangedEventArgs __) => Rebuild();
+        this.WhileAttached(
+            () => { if (coll != null) coll.CollectionChanged += OnColl; Rebuild(); },
+            () => { if (coll != null) coll.CollectionChanged -= OnColl; UnhookAll(); });
+    }
+
+    void UnhookAll()
+    {
+        foreach (var (k, h) in _hooks) k.PropertyChanged -= h;
+        _hooks.Clear();
+    }
+
+    void Rebuild()
+    {
+        foreach (var obj in _items)
+            if (obj is INotifyPropertyChanged npc && !_hooks.ContainsKey(npc))
+            {
+                void H(object? _, PropertyChangedEventArgs e) { if (_triggers.Length == 0 || _triggers.Contains(e.PropertyName)) Rebuild(); }
+                npc.PropertyChanged += H;
+                _hooks[npc] = H;
+            }
+
+        _flex.Children.Clear();
+        var any = false;
+        foreach (var obj in _items)
+        {
+            any = true;
+            var (text, done) = _cell(obj);
+            var chip = done
+                ? Theme.TextPill(text, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD)
+                : Theme.TextPill(text, Theme.DimL, Theme.DimD, Theme.Card2L, Theme.Card2D);
+            chip.Margin = new Thickness(0, 2, 6, 0);
+            _flex.Children.Add(chip);
+        }
+        IsVisible = any;
+    }
+}
 
 /// <summary>
 /// 倒數條:只渲染 core 推來的 <see cref="ICountdownVm.RemainingSecs"/>(UI 不自己計時),

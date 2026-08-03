@@ -13,7 +13,7 @@ public sealed class RollcallListPage : ContentPage
         BindableLayout.SetItemsSource(host, state.Rollcalls);
         BindableLayout.SetItemTemplate(host, new DataTemplate(() => new RollcallRow()));
 
-        var empty = Theme.Dim("尚未偵測到點名。開始監控後,新的點名會即時出現在這裡。", 13);
+        var empty = new EmptyState("尚無點名紀錄", "開始監控後,偵測到的點名會即時出現在這裡,並保留為紀錄。");
         void SyncEmpty() => empty.IsVisible = state.Rollcalls.Count == 0;
         state.Rollcalls.CollectionChanged += (_, _) => SyncEmpty();
         SyncEmpty();
@@ -30,31 +30,15 @@ public sealed class RollcallListPage : ContentPage
     }
 }
 
-/// <summary>列表列:課程/型別/時間/簽到率 + 狀態 + 迷你倒數(與詳細頁、彈窗綁同一 VM)。</summary>
+/// <summary>紀錄卡:類型徽章 + 課程 + 狀態膠囊 + meta(類型·時間·簽到率) + 逐帳號簽到 chips + 迷你倒數。</summary>
 sealed class RollcallRow : Border
 {
-    readonly VerticalStackLayout _countdownHost = new();
-
     public RollcallRow()
     {
         Padding = 14;
         StrokeThickness = 1;
-        StrokeShape = new RoundRectangle { CornerRadius = 16 };
+        StrokeShape = new RoundRectangle { CornerRadius = 18 };
         this.Themed(BackgroundColorProperty, Theme.CardL, Theme.CardD).StrokeThemed(Theme.LineL, Theme.LineD);
-
-        var course = Theme.Strong("", 15);
-        course.SetBinding(Label.TextProperty, nameof(RollcallVm.Course));
-        var sub = Theme.Dim("");
-        sub.SetBinding(Label.TextProperty, nameof(RollcallVm.SubtitleText));
-        var status = Theme.Text("", 12.5, Theme.FontSemibold, Theme.PrimL, Theme.PrimD);
-        status.SetBinding(Label.TextProperty, nameof(RollcallVm.StatusText));
-
-        Content = new VerticalStackLayout
-        {
-            Spacing = 4,
-            Children = { course, sub, status, _countdownHost },
-        };
-
         this.OnTap(() => BindingContext is RollcallVm vm
             ? ((AppShell)Shell.Current).OpenRollcallDetail(vm)
             : Task.CompletedTask);
@@ -63,13 +47,55 @@ sealed class RollcallRow : Border
     protected override void OnBindingContextChanged()
     {
         base.OnBindingContextChanged();
-        _countdownHost.Children.Clear();
-        if (BindingContext is RollcallVm vm)
-            _countdownHost.Children.Add(new CountdownView(vm, "自動簽到", 12) { Margin = new Thickness(0, 6, 0, 0) });
+        if (BindingContext is not RollcallVm vm) { Content = null; return; }
+
+        var (emblem, glyph) = Theme.Emblem();
+        glyph.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.KindEmblem), source: vm));
+
+        var course = Theme.Strong("", 15.5);
+        course.VerticalOptions = LayoutOptions.Center;
+        course.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.Course), source: vm));
+
+        var statusPill = new StatusPill(vm, () => RollcallToneOf(vm), nameof(RollcallVm.StatusTag));
+        statusPill.VerticalOptions = LayoutOptions.Center;
+        statusPill.HorizontalOptions = LayoutOptions.End;
+
+        var header = new Grid { ColumnSpacing = 8 };
+        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        header.Add(course, 0, 0);
+        header.Add(statusPill, 1, 0);
+
+        var meta = Theme.Dim("", 12.5);
+        meta.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.MetaText), source: vm));
+
+        var chips = new ChipsView(vm.Accounts,
+            o => { var a = (RollcallAccountVm)o; return (a.ChipText, a.Signed); },
+            nameof(RollcallAccountVm.ChipText));
+
+        var countdown = new CountdownView(vm, "自動簽到", 12, showRate: false) { Margin = new Thickness(0, 2, 0, 0) };
+
+        var body = new VerticalStackLayout { Spacing = 6, Children = { header, meta, chips, countdown } };
+
+        var grid = new Grid { ColumnSpacing = 12 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        grid.Add(emblem, 0, 0);
+        grid.Add(body, 1, 0);
+        Content = grid;
     }
+
+    /// 狀態膠囊的短標籤 + 語意色:已完成綠、暫緩/等待門檻琥珀、進行中主色。列表卡與詳細頁共用。
+    internal static (string, Color, Color, Color, Color) RollcallToneOf(RollcallVm vm) => vm.Status switch
+    {
+        "done" => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
+        "pending" => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
+        _ when vm.Holding => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
+        _ => (vm.StatusTag, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD),
+    };
 }
 
-/// <summary>點名詳細:資訊 / 倒數與動作 / 暫緩補簽 / per-account 簽到狀態。</summary>
+/// <summary>點名詳細:大標頭(徽章/課程/狀態) / 倒數與動作 / 暫緩補簽 / 資訊 / per-account 簽到狀態。</summary>
 public sealed class RollcallDetailPage : ContentPage
 {
     public RollcallDetailPage(AppState state, RollcallVm vm)
@@ -77,22 +103,28 @@ public sealed class RollcallDetailPage : ContentPage
         Title = vm.Course;
         BindingContext = vm;
 
-        var info = Theme.Card(new VerticalStackLayout
+        // --- 大標頭 ---
+        var (emblem, glyph) = Theme.Emblem(46);
+        glyph.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.KindEmblem), source: vm));
+        var metaLabel = Theme.Dim("", 13);
+        metaLabel.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.MetaText), source: vm));
+        var titleCol = new VerticalStackLayout
         {
-            Spacing = 8,
-            Children =
-            {
-                new HorizontalStackLayout
-                {
-                    Spacing = 8,
-                    Children = { Theme.TextPill(vm.KindText, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD) },
-                },
-                KeyValue("課程", vm.Course),
-                KeyValueBound("全班簽到率", nameof(RollcallVm.AttendanceRateText)), // 未達門檻時每秒重查,要活的
-                KeyValue("偵測時間", vm.DetectedAt.ToString("HH:mm:ss")),
-                KeyValue("平台", vm.BaseUrl),
-            },
-        });
+            Spacing = 3,
+            VerticalOptions = LayoutOptions.Center,
+            Children = { Theme.Strong(vm.Course, 18), metaLabel },
+        };
+        var statusPill = new StatusPill(vm, () => RollcallRow.RollcallToneOf(vm), nameof(RollcallVm.StatusTag));
+        statusPill.VerticalOptions = LayoutOptions.Center;
+
+        var headerGrid = new Grid { ColumnSpacing = 12 };
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        headerGrid.Add(emblem, 0, 0);
+        headerGrid.Add(titleCol, 1, 0);
+        headerGrid.Add(statusPill, 2, 0);
+        var header = Theme.Card(headerGrid);
 
         var actionRow = new Grid { ColumnSpacing = 8 };
         actionRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
@@ -123,22 +155,20 @@ public sealed class RollcallDetailPage : ContentPage
             Theme.OkBgL, Theme.OkBgD, Theme.OkL, Theme.OkD);
         doneCard.SetBinding(IsVisibleProperty, nameof(RollcallVm.IsDone));
 
-        var accountRows = new VerticalStackLayout { Spacing = 8 };
-        BindableLayout.SetItemsSource(accountRows, vm.Accounts);
-        BindableLayout.SetItemTemplate(accountRows, new DataTemplate(() =>
+        var info = Theme.Card(new VerticalStackLayout
         {
-            var name = Theme.Body("");
-            name.SetBinding(Label.TextProperty, nameof(RollcallAccountVm.Label));
-            var st = Theme.Dim("");
-            st.SetBinding(Label.TextProperty, nameof(RollcallAccountVm.StateText));
-            st.HorizontalOptions = LayoutOptions.End;
-            var g = new Grid();
-            g.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
-            g.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
-            g.Add(name, 0, 0);
-            g.Add(st, 1, 0);
-            return g;
-        }));
+            Spacing = 8,
+            Children =
+            {
+                KeyValueBound("全班簽到率", nameof(RollcallVm.AttendanceRateText)), // 未達門檻時每秒重查,要活的
+                KeyValue("偵測時間", vm.DetectedAt.ToString("yyyy/M/d HH:mm:ss")),
+                KeyValue("平台", vm.BaseUrl),
+            },
+        });
+
+        var accountRows = new VerticalStackLayout { Spacing = 4 };
+        BindableLayout.SetItemsSource(accountRows, vm.Accounts);
+        BindableLayout.SetItemTemplate(accountRows, new DataTemplate(() => new ParticipantRow()));
 
         Content = new ScrollView
         {
@@ -149,10 +179,11 @@ public sealed class RollcallDetailPage : ContentPage
                 Children =
                 {
                     new StatusBanner(state),
-                    info,
+                    header,
                     countingCard,
                     pendingCard,
                     doneCard,
+                    info,
                     Theme.Section("參與帳號"),
                     Theme.Card(accountRows),
                 },
@@ -178,5 +209,56 @@ public sealed class RollcallDetailPage : ContentPage
         g.Add(Theme.Dim(key, 13), 0, 0);
         g.Add(value, 1, 0);
         return g;
+    }
+}
+
+/// <summary>參與帳號列:狀態點(已簽綠/等待灰) + 名稱 + 方式/狀態文字。與 VM 綁定,簽到到達即變色。</summary>
+sealed class ParticipantRow : Grid
+{
+    readonly Ellipse _dot;
+    readonly Label _name, _state;
+    RollcallAccountVm? _vm;
+    System.ComponentModel.PropertyChangedEventHandler? _handler;
+
+    public ParticipantRow()
+    {
+        Padding = new Thickness(0, 6);
+        ColumnSpacing = 10;
+        ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+
+        _dot = Theme.Dot(Theme.DimL, Theme.DimD);
+        _name = Theme.Body("");
+        _name.VerticalOptions = LayoutOptions.Center;
+        _state = Theme.Dim("");
+        _state.HorizontalOptions = LayoutOptions.End;
+        _state.VerticalOptions = LayoutOptions.Center;
+
+        this.Add(_dot, 0, 0);
+        this.Add(_name, 1, 0);
+        this.Add(_state, 2, 0);
+        Unloaded += (_, _) => Unhook();
+    }
+
+    void Unhook() { if (_vm is not null && _handler is not null) _vm.PropertyChanged -= _handler; _vm = null; _handler = null; }
+
+    protected override void OnBindingContextChanged()
+    {
+        base.OnBindingContextChanged();
+        Unhook();
+        if (BindingContext is not RollcallAccountVm vm) return;
+        _vm = vm;
+        _handler = (_, a) => { if (a.PropertyName is nameof(RollcallAccountVm.Signed) or nameof(RollcallAccountVm.ChipText) or nameof(RollcallAccountVm.Label)) Render(vm); };
+        vm.PropertyChanged += _handler;
+        Render(vm);
+    }
+
+    void Render(RollcallAccountVm vm)
+    {
+        _name.Text = vm.Label;
+        _state.Text = vm.StateText;
+        var (l, d) = vm.Signed ? (Theme.OkL, Theme.OkD) : (Theme.DimL, Theme.DimD);
+        _dot.SetAppTheme<Brush>(Shape.FillProperty, new SolidColorBrush(l), new SolidColorBrush(d));
     }
 }
