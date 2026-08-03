@@ -45,8 +45,13 @@ pub struct Paper {
 /// A JSON id as a string whether the server sent it as a number or a string (ids like
 /// `exam_paper_instance_id` come back as integers). Empty when absent.
 fn json_id_string(v: Option<&Value>) -> String {
-    v.and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
-        .unwrap_or_default()
+    v.and_then(|x| {
+        x.as_str()
+            .map(str::to_string)
+            .or_else(|| x.as_i64().map(|n| n.to_string()))
+            .or_else(|| x.as_u64().map(|n| n.to_string()))
+    })
+    .unwrap_or_default()
 }
 
 /// Fetch the paper for an activity, per the family's real contract (docs 31). exam/classroom/
@@ -307,8 +312,17 @@ fn parse_answer(subject: &Value, qtype: &str, text: &str) -> Option<Answer> {
 
 /// An account's existing answer for a subject (parsed from its distribute), for conflict detection.
 pub fn existing_answer(subject: &Value) -> Option<Answer> {
-    if let Some(ids) = subject.get("student_answer_option_ids").and_then(Value::as_array) {
-        let ids: Vec<String> = ids.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+    if let Some(ids) = subject
+        .get("student_answer_option_ids")
+        .and_then(Value::as_array)
+    {
+        let ids: Vec<String> = ids
+            .iter()
+            .filter_map(|value| {
+                let id = json_id_string(Some(value));
+                (!id.is_empty()).then_some(id)
+            })
+            .collect();
         if !ids.is_empty() {
             return Some(Answer::Options(ids));
         }
@@ -574,6 +588,22 @@ mod tests {
         assert_eq!(missing_subjects(&subjects, &answers), vec!["s2".to_string()]);
         answers.insert("s2".into(), Answer::Text("done".into()));
         assert!(missing_subjects(&subjects, &answers).is_empty(), "all non-Skip answered ⇒ ready");
+    }
+
+    #[test]
+    fn existing_answer_preserves_numeric_and_string_option_ids() {
+        let subject = json!({
+            "student_answer_option_ids": [123, "456", 7_654_321_098_u64]
+        });
+
+        assert_eq!(
+            existing_answer(&subject),
+            Some(Answer::Options(vec![
+                "123".into(),
+                "456".into(),
+                "7654321098".into(),
+            ]))
+        );
     }
 
     #[test]
