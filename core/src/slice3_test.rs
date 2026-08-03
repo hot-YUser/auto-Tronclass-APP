@@ -119,9 +119,15 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     // Open an exam with two subjects: s1 (selection, LLM → option "o1"), s2 (short_answer, LLM → text).
     // bob has an EXISTING answer on s1 = "o2" → a per-account conflict (o2 ≠ LLM's o1). alice: none.
     let quiz = r#"{"activity_id":"EX1","course_id":"C1","course_name":"Math",
-        "subjects":[{"id":"s1","type":"single_selection","content":"pick","options":[{"id":"o1","content":"A"},{"id":"o2","content":"B"}]},
-                    {"id":"s2","type":"short_answer","content":"why"}],
-        "existing":{"bob":{"s1":{"options":["o2"]}}}}"#;
+        "per_user_papers":{
+            "alice":{"instance_id":"instance-alice","subjects":[
+                {"id":"s1","type":"single_selection","content":"pick","options":[{"id":"alice-o1","content":"A"},{"id":"alice-o2","content":"B"}]},
+                {"id":"s2","type":"short_answer","content":"why"}]},
+            "bob":{"instance_id":"instance-bob","subjects":[
+                {"id":"s1","type":"single_selection","content":"pick","options":[{"id":"bob-o1","content":"A"},{"id":"bob-o2","content":"B"}]},
+                {"id":"s2","type":"short_answer","content":"why"}]}
+        },
+        "existing":{"bob":{"s1":{"options":["bob-o2"]}}}}"#;
     post(&base, "/_test/open_quiz", quiz);
 
     // Prepared with bob's conflict; reasoning streamed for the LLM subjects.
@@ -141,14 +147,34 @@ fn slice3_quiz_prepare_conflict_and_submit() {
 
     // Resolve bob's conflict → countdown → both submit.
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SetAnswer","activity_token":"{activity_token}","account_id":"{bob}","subject_id":"s1","answer":{{"kind":"options","option_ids":["o1"]}}}}"#));
+    send(h, &format!(r#"{{"id":{i},"cmd":"SetAnswer","activity_token":"{activity_token}","account_id":"{bob}","subject_id":"s1","answer":{{"kind":"options","option_ids":["bob-o1"]}}}}"#));
     wait_for(reply_ok(i), 5);
     assert!(wait_for(submitted("EX1", &alice), 15).is_some(), "alice submits after resolution");
     assert!(wait_for(submitted("EX1", &bob), 15).is_some(), "bob submits after resolution");
 
-    // LLM ran ONCE per pending subject (s1, s2), shared across both accounts → 2 calls, not 4.
+    // 題目語意相同但 option ID 契約不同，未建立安全映射前不得跨帳號重用答案。
     let calls: Value = serde_json::from_str(&fetch(&base, "/_test/llm_calls")).unwrap_or(Value::Null);
-    assert_eq!(calls["count"].as_u64().unwrap_or(99), 2, "LLM shared: 2 calls for 2 subjects (not per-account)");
+    assert_eq!(calls["count"].as_u64().unwrap_or(99), 4, "different paper contracts are answered independently");
+
+    let submissions: Value = serde_json::from_str(&fetch(&base, "/_test/submissions")).unwrap_or(Value::Null);
+    assert_eq!(submissions["alice"]["exam_paper_instance_id"], "instance-alice");
+    assert_eq!(submissions["alice"]["subjects"][0]["answer_option_ids"], serde_json::json!(["alice-o1"]));
+    assert_eq!(submissions["bob"]["exam_paper_instance_id"], "instance-bob");
+    assert_eq!(submissions["bob"]["subjects"][0]["answer_option_ids"], serde_json::json!(["bob-o1"]));
+
+    // 完整 paper contract 相同且 tools 關閉時，才允許跨帳號重用完整答案。
+    let i = next();
+    send(h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"enable_llm_tools":false}}}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).expect("disable tools reply")["ok"], true);
+    post(&base, "/_test/open_quiz", r#"{"activity_id":"EX2","course_id":"C1","course_name":"Math",
+        "instance_id":"same-contract-instance",
+        "subjects":[{"id":"same-s1","type":"single_selection","content":"pick","options":[{"id":"same-o1","content":"A"},{"id":"same-o2","content":"B"}]},
+                    {"id":"same-s2","type":"short_answer","content":"why"}]}"#);
+    assert!(wait_for(|v| v["event"] == "QuizPrepared" && v["quiz_id"] == "EX2", 20).is_some());
+    assert!(wait_for(submitted("EX2", &alice), 15).is_some());
+    assert!(wait_for(submitted("EX2", &bob), 15).is_some());
+    let calls: Value = serde_json::from_str(&fetch(&base, "/_test/llm_calls")).unwrap_or(Value::Null);
+    assert_eq!(calls["count"].as_u64().unwrap_or(99), 6, "identical contract reuses two complete answers");
 
     let i = next();
     send(h, &format!(r#"{{"id":{i},"cmd":"StopMonitoring"}}"#));

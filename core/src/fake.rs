@@ -84,6 +84,7 @@ struct QuizDef {
     source: String,
     instance_id: String,
     subjects: Value,        // array of subject objects (real distribute shapes incl. leaks)
+    per_user_papers: Value, // { user: { instance_id, subjects } } — randomized per-account paper
     existing: Value,        // { user: { subject_id: answer_value } } → per-user prior answer
     review: Value,          // correct_answers_data.correct_answers for the resubmit read
     stem: String,           // homework question stem (GET /api/activities/{id})
@@ -125,6 +126,7 @@ struct FakeState {
     llm_calls: u32,
     llm_fail_times: u32, // first N /v1/chat/completions calls return empty content (R3c retry test)
     last_submission: Value,
+    submissions: Value, // user -> most recent submission body (proves per-account instance/paper)
     last_llm_request: Value, // the last /v1/chat/completions request body (R3b assertion)
     captcha_required: bool,
     captcha_expected: String,
@@ -400,6 +402,9 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     if request_line.starts_with("GET /_test/last_submission") {
         return json(200, &state.lock().unwrap().last_submission.to_string());
     }
+    if request_line.starts_with("GET /_test/submissions") {
+        return json(200, &state.lock().unwrap().submissions.to_string());
+    }
     if request_line.starts_with("GET /_test/saw_radar_signal") {
         return json(200, &format!(r#"{{"saw":{}}}"#, state.lock().unwrap().saw_radar_signal));
     }
@@ -416,6 +421,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             source: v["source"].as_str().unwrap_or("exam").to_string(),
             instance_id: v["instance_id"].as_str().unwrap_or("inst-1").to_string(),
             subjects: v["subjects"].clone(),
+            per_user_papers: v["per_user_papers"].clone(),
             existing: v["existing"].clone(),
             review: v["review"].clone(),
             stem: v["stem"].as_str().unwrap_or("").to_string(),
@@ -537,9 +543,17 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         if let Some(id) = api_suffix_id(request_line, "GET", seg, "distribute") {
             let st = state.lock().unwrap();
             let Some(q) = st.quizzes.iter().find(|q| q.activity_id == id) else { return json(404, "{}") };
-            let subjects = merge_existing(&q.subjects, &q.existing, &user);
+            let user_paper = q.per_user_papers.get(&user);
+            let raw_subjects = user_paper
+                .and_then(|paper| paper.get("subjects"))
+                .unwrap_or(&q.subjects);
+            let subjects = merge_existing(raw_subjects, &q.existing, &user);
             // A retake mints a fresh paper instance (the original is closed after a submit).
-            let inst = if q.submitted { format!("{}-retake", q.instance_id) } else { q.instance_id.clone() };
+            let base_instance = user_paper
+                .and_then(|paper| paper.get("instance_id"))
+                .and_then(Value::as_str)
+                .unwrap_or(&q.instance_id);
+            let inst = if q.submitted { format!("{base_instance}-retake") } else { base_instance.to_string() };
             return json(200, &json!({ "exam_paper_instance_id": inst, "subjects": subjects,
                 "allow_retake_exam": q.allow_retake,
                 "announce_answer": if q.reveal { "immediate" } else { "never" } }).to_string());
@@ -590,7 +604,11 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     if let Some(id) = api_suffix_id(request_line, "POST", "exams", "submissions") {
         let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
         let mut st = state.lock().unwrap();
-        st.last_submission = v;
+        st.last_submission = v.clone();
+        if !st.submissions.is_object() {
+            st.submissions = json!({});
+        }
+        st.submissions[&user] = v;
         let (retake, sid) = st.quizzes.iter_mut().find(|q| q.activity_id == id)
             .map(|q| { q.submitted = true; (q.allow_retake, format!("sub-{user}")) })
             .unwrap_or((false, format!("sub-{user}")));

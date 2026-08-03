@@ -75,7 +75,7 @@ pub struct Detected {
     course: String,
 }
 
-pub enum MonitorMsg {
+pub(crate) enum MonitorMsg {
     Detected(Detected),
     GateResult { key: ActivityKey, rate: Option<f64> },
     CodeRead { key: ActivityKey, code: Option<String> },
@@ -84,11 +84,26 @@ pub enum MonitorMsg {
     Defer { command_id: u64, activity_token: String },
     // --- quiz (slice 3) ---
     QuizDetected { account_id: String, base_url: String, source: String, course: String, course_id: String, activity_id: String, stem: String },
-    QuizPrepared { key: ActivityKey, instance_id: String, subjects: Vec<Value>, shared: Map<String, Answer>, existing: Map<String, Map<String, Answer>> },
+    QuizPrepared { key: ActivityKey, attempts: Vec<PreparedAttempt> },
     /// R3c all-or-nothing gate: prepare could NOT fully answer the paper (or a re-fetch failed / found
     /// the activity gone). `gone` → the activity closed (silent done); else re-prepare with `partial`
     /// carried, until `missing` clears or the retry budget deadline is hit.
-    QuizPrepareRetry { key: ActivityKey, partial: Map<String, Answer>, missing: Vec<String>, gone: bool },
+    QuizPrepareRetry {
+        key: ActivityKey,
+        account_id: String,
+        generation: u64,
+        contract: Vec<Value>,
+        partial: Map<String, Answer>,
+        missing: Vec<String>,
+    },
+    QuizPrepareGone { key: ActivityKey, account_id: String, generation: u64 },
+    QuizPrepareFailed {
+        key: ActivityKey,
+        account_id: String,
+        generation: u64,
+        code: String,
+        message: String,
+    },
     QuizSubmitResult { key: ActivityKey, account_id: String, result: Result<String, String> },
     QuizSubmitNow { command_id: u64, activity_token: String },
     QuizHold { command_id: u64, activity_token: String },
@@ -624,10 +639,14 @@ async fn actor(
                     }
                     MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
                         on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, course_id, activity_id, account_id, stem),
-                    MonitorMsg::QuizPrepared { key, instance_id, subjects, shared, existing } =>
-                        on_quiz_prepared(&mut quizzes, &cfg, cb, key, instance_id, subjects, shared, existing),
-                    MonitorMsg::QuizPrepareRetry { key, partial, missing, gone } =>
-                        on_quiz_prepare_retry(&mut quizzes, &cfg, cb, key, partial, missing, gone),
+                    MonitorMsg::QuizPrepared { key, attempts } =>
+                        on_quiz_prepared(&mut quizzes, &cfg, cb, key, attempts),
+                    MonitorMsg::QuizPrepareRetry { key, account_id, generation, contract, partial, missing } =>
+                        on_quiz_prepare_retry(&mut quizzes, &cfg, cb, key, account_id, generation, contract, partial, missing),
+                    MonitorMsg::QuizPrepareGone { key, account_id, generation } =>
+                        on_quiz_prepare_gone(&mut quizzes, &cfg, key, account_id, generation),
+                    MonitorMsg::QuizPrepareFailed { key, account_id, generation, code, message } =>
+                        on_quiz_prepare_failed(&mut quizzes, &cfg, cb, key, account_id, generation, code, message),
                     MonitorMsg::QuizSetAnswer { command_id, activity_token, account_id, subject_id, answer } => {
                         let result = on_quiz_set_answer(&mut quizzes, &cfg, cb, &activity_token, &account_id, &subject_id, answer);
                         command_reply(cb, command_id, result);
@@ -635,7 +654,7 @@ async fn actor(
                     MonitorMsg::QuizSubmitNow { command_id, activity_token } => {
                         let result = find_quiz_key(&quizzes, &activity_token)
                             .ok_or_else(|| "unknown quiz activity_token".to_string())
-                            .map(|key| dispatch_quiz_submits(&mut quizzes, &accounts, &self_tx, &cfg, &key));
+                            .and_then(|key| dispatch_quiz_submits(&mut quizzes, &accounts, &self_tx, &cfg, &key));
                         command_reply(cb, command_id, result);
                     }
                     MonitorMsg::QuizHold { command_id, activity_token } => {
@@ -1124,20 +1143,74 @@ struct QuizActivity {
     course_id: String, // R5: course the tool executor searches for materials
     activity_id: String,
     stem: String, // homework question stem, from the detection payload
-    participants: HashSet<String>,
-    detect_at: Option<Instant>,
-    prepare_started: bool,
-    prepare_deadline: Option<Instant>, // R3c: give-up deadline for the re-prepare retry budget
-    instance_id: String,
-    subjects: Vec<Value>,
-    shared: Map<String, Answer>,                 // subject_id -> shared LLM/replay answer
-    overrides: Map<String, Map<String, Answer>>, // account -> subject -> answer
-    conflicts: Map<String, HashSet<String>>,     // account -> unresolved conflict subjects
+    attempts: HashMap<String, PerAccountAttempt>,
     countdown_deadline: Option<Instant>,
     held: bool,
     discarded: bool,
-    acted: bool,
-    submitted: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptState {
+    Waiting,
+    Preparing,
+    Ready,
+    Submitting,
+    Submitted,
+    Gone,
+    Failed,
+}
+
+struct PerAccountAttempt {
+    state: AttemptState,
+    prepare_generation: u64,
+    prepare_at: Instant,
+    prepare_deadline: Option<Instant>,
+    answer_contract: Option<Vec<Value>>,
+    instance_id: String,
+    subjects: Vec<Value>,
+    generated_answers: Map<String, Answer>,
+    existing_answers: Map<String, Answer>,
+    overrides: Map<String, Answer>,
+    conflicts: HashSet<String>,
+}
+
+impl PerAccountAttempt {
+    fn waiting(now: Instant) -> Self {
+        Self {
+            state: AttemptState::Waiting,
+            prepare_generation: 0,
+            prepare_at: now + Duration::from_millis(1200),
+            prepare_deadline: None,
+            answer_contract: None,
+            instance_id: String::new(),
+            subjects: Vec::new(),
+            generated_answers: Map::new(),
+            existing_answers: Map::new(),
+            overrides: Map::new(),
+            conflicts: HashSet::new(),
+        }
+    }
+}
+
+pub(crate) struct PreparedAttempt {
+    account_id: String,
+    generation: u64,
+    instance_id: String,
+    subjects: Vec<Value>,
+    generated_answers: Map<String, Answer>,
+    existing_answers: Map<String, Answer>,
+}
+
+#[derive(Clone)]
+struct ReusableAnswers {
+    contract: Vec<Value>,
+    answers: Map<String, Answer>,
+}
+
+#[derive(Clone)]
+struct PriorAnswers {
+    contract: Vec<Value>,
+    answers: Map<String, Answer>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1163,26 +1236,15 @@ fn on_quiz_detected(
         course_id,
         activity_id: activity_id.clone(),
         stem,
-        participants: HashSet::new(),
-        detect_at: None,
-        prepare_started: false,
-        prepare_deadline: None,
-        instance_id: String::new(),
-        subjects: Vec::new(),
-        shared: Map::new(),
-        overrides: Map::new(),
-        conflicts: Map::new(),
+        attempts: HashMap::new(),
         countdown_deadline: None,
         held: false,
         discarded: false,
-        acted: false,
-        submitted: HashSet::new(),
     });
-    q.participants.insert(account_id);
-    // Prepare is kicked off from the tick after a short grace window, so all enrolled accounts that
-    // detect the activity in the same poll cycle are gathered first (per-account conflicts need them).
-    if q.detect_at.is_none() {
-        q.detect_at = Some(Instant::now());
+    if !q.discarded && !q.attempts.contains_key(&account_id) {
+        q.attempts.insert(account_id, PerAccountAttempt::waiting(Instant::now()));
+        // A late participant invalidates a running countdown until its own paper and conflicts are known.
+        q.countdown_deadline = None;
     }
     let _ = (accounts, tx, cfg, cb);
 }
@@ -1193,67 +1255,73 @@ fn on_quiz_prepared(
     cfg: &MonitorConfig,
     cb: EventCb,
     key: ActivityKey,
-    instance_id: String,
-    subjects: Vec<Value>,
-    shared: Map<String, Answer>,
-    existing: Map<String, Map<String, Answer>>,
+    prepared: Vec<PreparedAttempt>,
 ) {
     let Some(q) = quizzes.get_mut(&key) else { return };
-    q.instance_id = instance_id;
-    q.subjects = subjects;
-    q.shared = shared;
-    q.conflicts.clear();
-    for (acc, ex) in existing {
-        let mut cset = HashSet::new();
-        for (sid, exa) in &ex {
-            if q.shared.get(sid).is_some_and(|sha| sha != exa) {
-                cset.insert(sid.clone()); // existing answer differs → conflict, keep existing (no overwrite)
-            }
+    if q.discarded {
+        return;
+    }
+    for data in prepared {
+        let Some(attempt) = q.attempts.get_mut(&data.account_id) else { continue };
+        if attempt.state != AttemptState::Preparing
+            || attempt.prepare_generation != data.generation
+        {
+            continue; // stale async completion after a terminal transition
         }
-        if !cset.is_empty() {
-            q.conflicts.insert(acc.clone(), cset);
-        }
-        q.overrides.entry(acc).or_default().extend(ex);
+        attempt.answer_contract = Some(paper_contract(&data.subjects));
+        attempt.instance_id = data.instance_id;
+        attempt.subjects = data.subjects;
+        attempt.generated_answers = data.generated_answers;
+        attempt.existing_answers = data.existing_answers;
+        attempt.overrides.clear();
+        attempt.conflicts = attempt
+            .existing_answers
+            .iter()
+            .filter(|(subject_id, existing)| {
+                attempt
+                    .generated_answers
+                    .get(*subject_id)
+                    .is_some_and(|generated| generated != *existing)
+            })
+            .map(|(subject_id, _)| subject_id.clone())
+            .collect();
+        attempt.state = AttemptState::Ready;
     }
     emit_quiz_prepared(cb, q);
-    let conflicts: usize = q.conflicts.values().map(|s| s.len()).sum();
-    // Same `held` gate as on_quiz_set_answer: a re-prepare (R3c retry) of a quiz the user already held
-    // must not re-arm the auto-submit countdown behind their back.
-    if conflicts == 0 && !q.held {
-        q.countdown_deadline = Some(Instant::now() + Duration::from_secs(cfg.countdown_secs));
-    }
+    rearm_quiz_countdown(q, cfg);
 }
 
 /// R3c all-or-nothing retry: prepare could not fully answer the paper (or a re-fetch failed/was gone).
 /// `gone` → the activity closed → silent done. Otherwise carry the partial answers and re-arm prepare
 /// after a backoff, until `missing` clears or the minutes-scale budget deadline is hit (then one Error).
+#[allow(clippy::too_many_arguments)]
 fn on_quiz_prepare_retry(
     quizzes: &mut HashMap<ActivityKey, QuizActivity>,
     cfg: &MonitorConfig,
     cb: EventCb,
     key: ActivityKey,
+    account_id: String,
+    generation: u64,
+    contract: Vec<Value>,
     partial: Map<String, Answer>,
     missing: Vec<String>,
-    gone: bool,
 ) {
     let Some(q) = quizzes.get_mut(&key) else { return };
-    if q.acted || q.discarded {
+    if q.discarded {
         return;
     }
-    if gone {
-        q.discarded = true; // activity closed → silent done (never a half-submit, no Error)
-        q.countdown_deadline = None;
+    let Some(attempt) = q.attempts.get_mut(&account_id) else { return };
+    if attempt.state != AttemptState::Preparing || attempt.prepare_generation != generation {
         return;
     }
-    q.shared = partial; // carry answers resolved so far into the next prepare (leaked answers still win)
+    attempt.answer_contract = Some(contract);
+    attempt.generated_answers = partial;
     let now = Instant::now();
-    let deadline = *q
+    let deadline = *attempt
         .prepare_deadline
         .get_or_insert_with(|| now + Duration::from_secs(cfg.prepare_retry_budget_secs));
     if now >= deadline {
-        // Budget exhausted → give up on THIS paper (never a half-submit); name the stuck subjects.
-        q.discarded = true;
-        q.countdown_deadline = None;
+        attempt.state = AttemptState::Failed;
         let detail = if missing.is_empty() {
             "could not fetch the paper".to_string()
         } else {
@@ -1261,12 +1329,71 @@ fn on_quiz_prepare_retry(
         };
         emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
                           "code": "quiz_unanswerable", "activity_token": q.activity_token,
+                          "account_id": account_id,
                           "message": format!("{}: {detail}", q.activity_id) }));
+        rearm_quiz_countdown(q, cfg);
         return;
     }
-    // Re-arm prepare after a ~poll-idle backoff; the tick's grace-gate re-spawns with q.shared as prior.
-    q.prepare_started = false;
-    q.detect_at = Some(now + Duration::from_secs(cfg.poll_idle_secs.max(1)));
+    attempt.state = AttemptState::Waiting;
+    attempt.prepare_at = now + Duration::from_secs(cfg.poll_idle_secs.max(1));
+    q.countdown_deadline = None;
+}
+
+fn on_quiz_prepare_gone(
+    quizzes: &mut HashMap<ActivityKey, QuizActivity>,
+    cfg: &MonitorConfig,
+    key: ActivityKey,
+    account_id: String,
+    generation: u64,
+) {
+    let Some(q) = quizzes.get_mut(&key) else { return };
+    if q.discarded {
+        return;
+    }
+    let Some(attempt) = q.attempts.get_mut(&account_id) else { return };
+    if attempt.state == AttemptState::Preparing && attempt.prepare_generation == generation {
+        attempt.state = AttemptState::Gone;
+        rearm_quiz_countdown(q, cfg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn on_quiz_prepare_failed(
+    quizzes: &mut HashMap<ActivityKey, QuizActivity>,
+    cfg: &MonitorConfig,
+    cb: EventCb,
+    key: ActivityKey,
+    account_id: String,
+    generation: u64,
+    code: String,
+    message: String,
+) {
+    let Some(q) = quizzes.get_mut(&key) else { return };
+    if q.discarded {
+        return;
+    }
+    let Some(attempt) = q.attempts.get_mut(&account_id) else { return };
+    if attempt.state != AttemptState::Preparing || attempt.prepare_generation != generation {
+        return;
+    }
+    attempt.state = AttemptState::Failed;
+    emit(cb, &json!({ "id": null, "event": "Error", "severity": "error", "code": code,
+        "activity_token": q.activity_token, "account_id": account_id, "message": message }));
+    rearm_quiz_countdown(q, cfg);
+}
+
+fn rearm_quiz_countdown(q: &mut QuizActivity, cfg: &MonitorConfig) {
+    let preparation_pending = q
+        .attempts
+        .values()
+        .any(|attempt| matches!(attempt.state, AttemptState::Waiting | AttemptState::Preparing));
+    let unresolved_conflict = q.attempts.values().any(|attempt| !attempt.conflicts.is_empty());
+    let has_ready = q.attempts.values().any(|attempt| attempt.state == AttemptState::Ready);
+    if q.held || q.discarded || preparation_pending || unresolved_conflict || !has_ready {
+        q.countdown_deadline = None;
+    } else if q.countdown_deadline.is_none() {
+        q.countdown_deadline = Some(Instant::now() + Duration::from_secs(cfg.countdown_secs));
+    }
 }
 
 fn on_quiz_set_answer(
@@ -1280,38 +1407,30 @@ fn on_quiz_set_answer(
 ) -> Result<(), String> {
     let q = find_quiz_mut(quizzes, activity_token)
         .ok_or_else(|| "unknown quiz activity_token".to_string())?;
-    if !q.participants.contains(account_id) {
-        return Err("account is not a participant in this quiz".to_string());
+    let attempt = q
+        .attempts
+        .get_mut(account_id)
+        .ok_or_else(|| "account is not a participant in this quiz".to_string())?;
+    if attempt.state != AttemptState::Ready {
+        return Err("account paper is not ready for answer changes".to_string());
     }
-    let subject = q
+    let subject = attempt
         .subjects
         .iter()
         .find(|subject| crate::quiz::subject_id(subject) == subject_id)
         .ok_or_else(|| "unknown subject for this quiz".to_string())?;
     let answer = answer.into_answer()?;
     crate::quiz::validate_answer(subject, &answer, q.source == Source::Vote)?;
-    q.overrides
-        .entry(account_id.to_string())
-        .or_default()
-        .insert(subject_id.to_string(), answer.clone());
-    if let Some(cset) = q.conflicts.get_mut(account_id) {
-        cset.remove(subject_id);
-        if cset.is_empty() {
-            q.conflicts.remove(account_id);
-        }
-    }
+    attempt.overrides.insert(subject_id.to_string(), answer.clone());
+    attempt.conflicts.remove(subject_id);
+    let answer_wire = AnswerWire::from_answer(&answer);
+    let display_answer = answer_wire.display();
     emit(cb, &json!({ "id": null, "event": "AnswerUpdated", "quiz_id": q.activity_id,
                       "activity_token": q.activity_token, "account_id": account_id,
-                      "subject_id": subject_id, "answer": AnswerWire::from_answer(&answer),
-                      "display_answer": AnswerWire::from_answer(&answer).display(),
+                      "subject_id": subject_id, "answer": answer_wire,
+                      "display_answer": display_answer,
                       "source": "user", "conflict": false }));
-    let conflicts: usize = q.conflicts.values().map(|s| s.len()).sum();
-    // `held` gates the re-arm: once the user held this quiz, resolving a conflict must NOT restart the
-    // auto-submit countdown (only an explicit SubmitNow may). Without this, hold-then-resolve silently
-    // re-armed and auto-submitted — overriding the user's decision on the one path that acts for them.
-    if conflicts == 0 && q.countdown_deadline.is_none() && !q.held && !q.acted && !q.discarded {
-        q.countdown_deadline = Some(Instant::now() + Duration::from_secs(cfg.countdown_secs));
-    }
+    rearm_quiz_countdown(q, cfg);
     Ok(())
 }
 
@@ -1326,42 +1445,99 @@ fn on_quiz_tick(
     let keys: Vec<ActivityKey> = quizzes.keys().cloned().collect();
     for key in keys {
         let Some(q) = quizzes.get_mut(&key) else { continue };
-
-        // Start prepare once the grace window has gathered all same-cycle participants.
-        if !q.prepare_started {
-            if let Some(t) = q.detect_at {
-                if now.saturating_duration_since(t) >= Duration::from_millis(1200) {
-                    q.prepare_started = true;
-                    let participants: Vec<Arc<Account>> = q.participants.iter().filter_map(|id| accounts.get(id).cloned()).collect();
-                    spawn_quiz_prepare(
-                        participants,
-                        q.source,
-                        q.activity_id.clone(),
-                        q.activity_token.clone(),
-                        q.course_id.clone(),
-                        q.stem.clone(),
-                        cfg.llm(),
-                        cfg.max_answer_reask,
-                        q.shared.clone(),
-                        tx.clone(),
-                        key.clone(),
-                        cb,
-                    );
+        let mut due_ids: Vec<String> = q
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| attempt.state == AttemptState::Waiting && now >= attempt.prepare_at)
+            .map(|(account_id, _)| account_id.clone())
+            .collect();
+        due_ids.sort();
+        if !due_ids.is_empty() {
+            for account_id in due_ids
+                .iter()
+                .filter(|account_id| !accounts.contains_key(*account_id))
+            {
+                if let Some(attempt) = q.attempts.get_mut(account_id) {
+                    attempt.state = AttemptState::Failed;
+                }
+                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                    "code": "quiz_account_unavailable", "activity_token": q.activity_token,
+                    "account_id": account_id, "message": "測驗帳號已不在監控工作階段中" }));
+            }
+            due_ids.retain(|account_id| accounts.contains_key(account_id));
+            if due_ids.is_empty() {
+                rearm_quiz_countdown(q, cfg);
+                continue;
+            }
+            let participants: Vec<Arc<Account>> = due_ids
+                .iter()
+                .map(|account_id| accounts.get(account_id).expect("filtered account exists").clone())
+                .collect();
+            let priors: HashMap<String, PriorAnswers> = due_ids
+                .iter()
+                .filter_map(|account_id| {
+                    let attempt = q.attempts.get(account_id)?;
+                    Some((
+                        account_id.clone(),
+                        PriorAnswers {
+                            contract: attempt.answer_contract.clone()?,
+                            answers: attempt.generated_answers.clone(),
+                        },
+                    ))
+                })
+                .collect();
+            let reusable: Vec<ReusableAnswers> = if cfg.enable_llm_tools {
+                Vec::new()
+            } else {
+                q.attempts
+                    .values()
+                    .filter(|attempt| {
+                        matches!(
+                            attempt.state,
+                            AttemptState::Ready | AttemptState::Submitting | AttemptState::Submitted
+                        )
+                    })
+                    .map(|attempt| ReusableAnswers {
+                        contract: paper_contract(&attempt.subjects),
+                        answers: attempt.generated_answers.clone(),
+                    })
+                    .collect()
+            };
+            let mut generations = HashMap::new();
+            for account_id in &due_ids {
+                if let Some(attempt) = q.attempts.get_mut(account_id) {
+                    attempt.prepare_generation = attempt.prepare_generation.wrapping_add(1).max(1);
+                    attempt.state = AttemptState::Preparing;
+                    generations.insert(account_id.clone(), attempt.prepare_generation);
                 }
             }
+            q.countdown_deadline = None;
+            spawn_quiz_prepare(
+                participants,
+                q.source,
+                q.activity_id.clone(),
+                q.activity_token.clone(),
+                q.course_id.clone(),
+                q.stem.clone(),
+                cfg.llm(),
+                cfg.max_answer_reask,
+                priors,
+                generations,
+                reusable,
+                tx.clone(),
+                key.clone(),
+                cb,
+            );
             continue;
         }
 
         let Some(deadline) = q.countdown_deadline else { continue };
-        if q.acted {
-            continue;
-        }
         let remaining = deadline.saturating_duration_since(now).as_secs();
         emit(cb, &json!({ "id": null, "event": "Countdown", "scope": "quiz",
                           "activity_token": q.activity_token, "external_id": q.activity_id,
                           "remaining_secs": remaining }));
         if now >= deadline {
-            dispatch_quiz_submits(quizzes, accounts, tx, cfg, &key);
+            let _ = dispatch_quiz_submits(quizzes, accounts, tx, cfg, &key);
         }
     }
 }
@@ -1372,39 +1548,86 @@ fn dispatch_quiz_submits(
     tx: &UnboundedSender<MonitorMsg>,
     cfg: &MonitorConfig,
     key: &ActivityKey,
-) {
-    let Some(q) = quizzes.get_mut(key) else { return };
-    if q.acted || q.discarded {
-        return;
+) -> Result<(), String> {
+    let Some(q) = quizzes.get_mut(key) else { return Err("unknown quiz activity".to_string()) };
+    if q.discarded {
+        return Err("quiz was discarded".to_string());
     }
-    q.acted = true;
+    if q
+        .attempts
+        .values()
+        .any(|attempt| matches!(attempt.state, AttemptState::Waiting | AttemptState::Preparing))
+    {
+        return Err("quiz attempts are still preparing".to_string());
+    }
+    if q.attempts.values().any(|attempt| !attempt.conflicts.is_empty()) {
+        return Err("quiz has unresolved answer conflicts".to_string());
+    }
     q.countdown_deadline = None;
-    let (source, instance_id, subjects) = (q.source, q.instance_id.clone(), q.subjects.clone());
+    let source = q.source;
     let resubmit = cfg.resubmit_for_correct;
     let activity_id = q.activity_id.clone();
-    for acc_id in q.participants.iter().cloned().collect::<Vec<_>>() {
-        let Some(acc) = accounts.get(&acc_id).cloned() else { continue };
-        let mut answers = q.shared.clone();
-        if let Some(ov) = q.overrides.get(&acc_id) {
-            for (k, v) in ov {
-                answers.insert(k.clone(), v.clone());
-            }
-        }
-        spawn_quiz_submit(acc, source, activity_id.clone(), instance_id.clone(), subjects.clone(), answers, resubmit, tx.clone(), key.clone());
+    let ready_ids: Vec<String> = q
+        .attempts
+        .iter()
+        .filter(|(_, attempt)| attempt.state == AttemptState::Ready)
+        .map(|(account_id, _)| account_id.clone())
+        .collect();
+    if ready_ids.is_empty() {
+        return Err("quiz has no ready attempts to submit".to_string());
     }
+    let mut jobs = Vec::with_capacity(ready_ids.len());
+    for account_id in &ready_ids {
+        let account = accounts
+            .get(account_id)
+            .cloned()
+            .ok_or_else(|| format!("quiz account {account_id} is unavailable"))?;
+        let attempt = q.attempts.get(account_id).expect("ready attempt exists");
+        let mut answers = attempt.generated_answers.clone();
+        for (subject_id, answer) in &attempt.overrides {
+            answers.insert(subject_id.clone(), answer.clone());
+        }
+        jobs.push((
+            account,
+            attempt.instance_id.clone(),
+            attempt.subjects.clone(),
+            answers,
+        ));
+    }
+    for account_id in ready_ids {
+        q.attempts.get_mut(&account_id).expect("ready attempt exists").state = AttemptState::Submitting;
+    }
+    for (account, instance_id, subjects, answers) in jobs {
+        spawn_quiz_submit(
+            account,
+            source,
+            activity_id.clone(),
+            instance_id,
+            subjects,
+            answers,
+            resubmit,
+            tx.clone(),
+            key.clone(),
+        );
+    }
+    Ok(())
 }
 
 fn on_quiz_submit_result(quizzes: &mut HashMap<ActivityKey, QuizActivity>, cb: EventCb, key: ActivityKey, account_id: String, result: Result<String, String>) {
     let Some(q) = quizzes.get_mut(&key) else { return };
+    let Some(attempt) = q.attempts.get_mut(&account_id) else { return };
     match result {
         Ok(detail) => {
-            q.submitted.insert(account_id.clone());
+            attempt.state = AttemptState::Submitted;
             emit(cb, &json!({ "id": null, "event": "QuizSubmitted", "quiz_id": q.activity_id,
                 "activity_token": q.activity_token, "account_id": account_id, "result": detail }));
         }
-        Err(e) => emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
-            "code": "quiz_submit_failed", "activity_token": q.activity_token,
-            "message": format!("{account_id}: {e}") })),
+        Err(e) => {
+            attempt.state = AttemptState::Ready;
+            emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                "code": "quiz_submit_failed", "activity_token": q.activity_token,
+                "account_id": account_id, "message": format!("{account_id}: {e}") }));
+        }
     }
 }
 
@@ -1418,81 +1641,173 @@ fn spawn_quiz_prepare(
     stem: String,
     llm: LlmConfig,
     max_reask: u32,
-    prior: Map<String, Answer>,
+    priors: HashMap<String, PriorAnswers>,
+    generations: HashMap<String, u64>,
+    mut reusable: Vec<ReusableAnswers>,
     tx: UnboundedSender<MonitorMsg>,
     key: ActivityKey,
     cb: EventCb,
 ) {
     tokio::spawn(async move {
-        let Some(lead) = participants.first().cloned() else { return };
-        let ep = Endpoints::derive(&lead.base_url);
-        let paper = match answer::fetch_paper(&lead.client, &ep, source, &activity_id, &stem).await {
-            Ok(p) => p,
-            // R3c: a re-fetch failure is ambiguous (often a transient 404) → not-ready, retry; the actor
-            // Errors only at the budget deadline. Carry the prior partial so answered subjects survive.
-            Err(_) => {
-                tx.send(MonitorMsg::QuizPrepareRetry { key, partial: prior, missing: Vec::new(), gone: false }).ok();
-                return;
-            }
-        };
-        // An empty paper = the activity closed / dropped out → silent done (v1-style), never an Error.
-        if paper.subjects.is_empty() {
-            tx.send(MonitorMsg::QuizPrepareRetry { key, partial: prior, missing: Vec::new(), gone: true }).ok();
-            return;
-        }
-        let shared = answer::shared_answers(
-            &lead.client,
-            &llm,
-            cb,
-            &activity_token,
-            &course_id,
-            &lead.base_url,
-            &paper.subjects,
-            max_reask,
-            &prior,
-        )
-        .await;
-        let missing = answer::missing_subjects(&paper.subjects, &shared);
-        if !missing.is_empty() {
-            // No LLM key → the missing subjects can never be answered by retrying; fail fast with a clear
-            // message instead of spinning the retry budget for minutes. (Leak-answered subjects already
-            // fill `shared` WITHOUT the LLM, so a fully-leaked paper never reaches this branch.)
-            if llm.api_key.trim().is_empty() {
-                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error", "code": "llm_key_missing",
-                    "activity_token": activity_token,
-                    "message": format!("{activity_id}：尚未設定 LLM 金鑰，無法自動作答（請至 設定 → 儲存金鑰）") }));
-                tx.send(MonitorMsg::QuizPrepareRetry { key, partial: shared, missing, gone: true }).ok();
-                return;
-            }
-            // All-or-nothing: never submit a half-paper — carry the partial answers and retry.
-            tx.send(MonitorMsg::QuizPrepareRetry { key, partial: shared, missing, gone: false }).ok();
-            return;
-        }
-        // Fully answered → gather each account's existing answers (conflict detection) and prepare.
-        let mut existing: Map<String, Map<String, Answer>> = Map::new();
-        for acc in &participants {
-            let epa = Endpoints::derive(&acc.base_url);
-            if let Ok(p) = answer::fetch_paper(&acc.client, &epa, source, &activity_id, &stem).await {
-                let mut m = Map::new();
-                for s in &p.subjects {
-                    if let Some(a) = answer::existing_answer(s) {
-                        m.insert(crate::quiz::subject_id(s), a);
-                    }
+        let mut prepared = Vec::new();
+        for account in participants {
+            let account_id = account.id.clone();
+            let generation = generations.get(&account_id).copied().unwrap_or_default();
+            let prior_snapshot = priors.get(&account_id).cloned();
+            let endpoints = Endpoints::derive(&account.base_url);
+            let paper = match answer::fetch_paper(
+                &account.client,
+                &endpoints,
+                source,
+                &activity_id,
+                &stem,
+            )
+            .await
+            {
+                Ok(paper) => paper,
+                Err(_) => {
+                    tx.send(MonitorMsg::QuizPrepareRetry {
+                        key: key.clone(),
+                        account_id,
+                        generation,
+                        contract: prior_snapshot
+                            .as_ref()
+                            .map(|prior| prior.contract.clone())
+                            .unwrap_or_default(),
+                        partial: prior_snapshot
+                            .as_ref()
+                            .map(|prior| prior.answers.clone())
+                            .unwrap_or_default(),
+                        missing: Vec::new(),
+                    })
+                    .ok();
+                    continue;
                 }
-                if !m.is_empty() {
-                    existing.insert(acc.id.clone(), m);
-                }
+            };
+            if paper.subjects.is_empty() {
+                tx.send(MonitorMsg::QuizPrepareGone {
+                    key: key.clone(),
+                    account_id,
+                    generation,
+                })
+                .ok();
+                continue;
             }
+
+            let contract = paper_contract(&paper.subjects);
+            let prior = compatible_prior(prior_snapshot.as_ref(), &contract);
+            let generated_answers = if prior.is_empty() && !llm.enable_tools {
+                reusable
+                    .iter()
+                    .find(|entry| entry.contract == contract)
+                    .map(|entry| entry.answers.clone())
+            } else {
+                None
+            };
+            let generated_answers = match generated_answers {
+                Some(answers) => answers,
+                None => {
+                    answer::shared_answers(
+                        &account.client,
+                        &llm,
+                        cb,
+                        &activity_token,
+                        &course_id,
+                        &account.base_url,
+                        &paper.subjects,
+                        max_reask,
+                        &prior,
+                    )
+                    .await
+                }
+            };
+            let missing = answer::missing_subjects(&paper.subjects, &generated_answers);
+            if !missing.is_empty() {
+                if llm.api_key.trim().is_empty() {
+                    tx.send(MonitorMsg::QuizPrepareFailed {
+                        key: key.clone(),
+                        account_id,
+                        generation,
+                        code: "llm_key_missing".to_string(),
+                        message: format!(
+                            "{activity_id}：尚未設定 LLM 金鑰，無法自動作答（請至 設定 → 儲存金鑰）"
+                        ),
+                    })
+                    .ok();
+                } else {
+                    tx.send(MonitorMsg::QuizPrepareRetry {
+                        key: key.clone(),
+                        account_id,
+                        generation,
+                        contract,
+                        partial: generated_answers,
+                        missing,
+                    })
+                    .ok();
+                }
+                continue;
+            }
+
+            if !llm.enable_tools && !reusable.iter().any(|entry| entry.contract == contract) {
+                reusable.push(ReusableAnswers {
+                    contract,
+                    answers: generated_answers.clone(),
+                });
+            }
+            let existing_answers = paper
+                .subjects
+                .iter()
+                .filter_map(|subject| {
+                    answer::existing_answer(subject)
+                        .map(|value| (crate::quiz::subject_id(subject), value))
+                })
+                .collect();
+            prepared.push(PreparedAttempt {
+                account_id,
+                generation,
+                instance_id: paper.instance_id,
+                subjects: paper.subjects,
+                generated_answers,
+                existing_answers,
+            });
         }
-        tx.send(MonitorMsg::QuizPrepared {
-            key,
-            instance_id: paper.instance_id,
-            subjects: paper.subjects,
-            shared,
-            existing,
-        })
-        .ok();
+        if !prepared.is_empty() {
+            tx.send(MonitorMsg::QuizPrepared {
+                key,
+                attempts: prepared,
+            })
+            .ok();
+        }
     });
+}
+
+/// Remove only per-user response fields before comparing paper contracts. Correct-answer leaks remain:
+/// they affect the generated answer and therefore must be identical before reuse is safe.
+fn paper_contract(subjects: &[Value]) -> Vec<Value> {
+    subjects
+        .iter()
+        .cloned()
+        .map(|mut subject| {
+            if let Some(object) = subject.as_object_mut() {
+                for key in [
+                    "student_answer_option_ids",
+                    "student_answer",
+                    "student_answers",
+                    "my_answer",
+                ] {
+                    object.remove(key);
+                }
+            }
+            subject
+        })
+        .collect()
+}
+
+fn compatible_prior(prior: Option<&PriorAnswers>, contract: &[Value]) -> Map<String, Answer> {
+    prior
+        .filter(|prior| prior.contract == contract)
+        .map(|prior| prior.answers.clone())
+        .unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1549,17 +1864,23 @@ fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, ins
 
 fn emit_quiz_prepared(cb: EventCb, q: &QuizActivity) {
     let per_account: Vec<Value> = q
-        .participants
+        .attempts
         .iter()
-        .map(|acc| {
-            let questions: Vec<Value> = q
+        .filter(|(_, attempt)| {
+            matches!(
+                attempt.state,
+                AttemptState::Ready | AttemptState::Submitting | AttemptState::Submitted
+            )
+        })
+        .map(|(account_id, attempt)| {
+            let questions: Vec<Value> = attempt
                 .subjects
                 .iter()
                 .map(|s| {
                     let sid = crate::quiz::subject_id(s);
-                    let conflict = q.conflicts.get(acc).map(|c| c.contains(&sid)).unwrap_or(false);
-                    let existing_answer = q.overrides.get(acc).and_then(|answers| answers.get(&sid));
-                    let answer = q.shared.get(&sid);
+                    let conflict = attempt.conflicts.contains(&sid);
+                    let existing_answer = attempt.existing_answers.get(&sid);
+                    let answer = attempt.generated_answers.get(&sid);
                     let answer_wire = answer.map(AnswerWire::from_answer);
                     let existing_wire = existing_answer.map(AnswerWire::from_answer);
                     let display_answer = answer_wire
@@ -1600,10 +1921,10 @@ fn emit_quiz_prepared(cb: EventCb, q: &QuizActivity) {
                     })
                 })
                 .collect();
-            json!({ "account_id": acc, "instance_id": q.instance_id, "questions": questions })
+            json!({ "account_id": account_id, "instance_id": attempt.instance_id, "questions": questions })
         })
         .collect();
-    let conflict_count: usize = q.conflicts.values().map(|s| s.len()).sum();
+    let conflict_count: usize = q.attempts.values().map(|attempt| attempt.conflicts.len()).sum();
     emit(cb, &json!({ "id": null, "event": "QuizPrepared", "schema_version": 1,
         "activity_token": q.activity_token, "quiz_id": q.activity_id,
         "activity": { "external_id": q.activity_id, "source": q.source.as_str(),
@@ -1789,8 +2110,19 @@ mod tests {
     /// after a user holds a paper that still has a conflict.
     fn quiz_with_conflict() -> (HashMap<ActivityKey, QuizActivity>, ActivityKey) {
         let key = ("http://x".to_string(), "quiz:exam".to_string(), "act1".to_string());
-        let mut conflicts: Map<String, HashSet<String>> = Map::new();
-        conflicts.insert("acc1".to_string(), HashSet::from(["subj1".to_string()]));
+        let attempt = PerAccountAttempt {
+            state: AttemptState::Ready,
+            prepare_generation: 1,
+            prepare_at: Instant::now(),
+            prepare_deadline: None,
+            answer_contract: Some(vec![json!({ "id": "subj1", "type": "short_answer", "content": "Question" })]),
+            instance_id: "instance-acc1".to_string(),
+            subjects: vec![json!({ "id": "subj1", "type": "short_answer", "content": "Question" })],
+            generated_answers: Map::from([("subj1".to_string(), Answer::Text("llm".to_string()))]),
+            existing_answers: Map::from([("subj1".to_string(), Answer::Text("old".to_string()))]),
+            overrides: Map::new(),
+            conflicts: HashSet::from(["subj1".to_string()]),
+        };
         let q = QuizActivity {
             activity_token: "token1".to_string(),
             source: Source::Exam,
@@ -1798,20 +2130,10 @@ mod tests {
             course_id: String::new(),
             activity_id: "act1".to_string(),
             stem: String::new(),
-            participants: HashSet::from(["acc1".to_string()]),
-            detect_at: None,
-            prepare_started: true,
-            prepare_deadline: None,
-            instance_id: String::new(),
-            subjects: vec![json!({ "id": "subj1", "type": "short_answer", "content": "Question" })],
-            shared: Map::new(),
-            overrides: Map::new(),
-            conflicts,
+            attempts: HashMap::from([("acc1".to_string(), attempt)]),
             countdown_deadline: None,
             held: false,
             discarded: false,
-            acted: false,
-            submitted: HashSet::new(),
         };
         let mut quizzes = HashMap::new();
         quizzes.insert(key.clone(), q);
@@ -1834,7 +2156,7 @@ mod tests {
         )
         .unwrap();
         let q = quizzes.get(&key).unwrap();
-        assert!(q.conflicts.is_empty(), "the conflict is resolved");
+        assert!(q.attempts["acc1"].conflicts.is_empty(), "the conflict is resolved");
         assert!(q.countdown_deadline.is_none(), "a HELD quiz must not re-arm auto-submit — only SubmitNow may");
     }
 
@@ -1874,7 +2196,128 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(quizzes[&key].conflicts["acc1"].contains("subj1"));
-        assert!(!quizzes[&key].overrides.contains_key("acc1"));
+        assert!(quizzes[&key].attempts["acc1"].conflicts.contains("subj1"));
+        assert!(quizzes[&key].attempts["acc1"].overrides.is_empty());
+    }
+
+    #[test]
+    fn late_participant_gets_own_waiting_attempt_and_cancels_countdown() {
+        let (mut quizzes, key) = quiz_with_conflict();
+        quizzes.get_mut(&key).unwrap().attempts.get_mut("acc1").unwrap().conflicts.clear();
+        quizzes.get_mut(&key).unwrap().countdown_deadline = Some(Instant::now());
+        let accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = cfg_countdown(15);
+
+        on_quiz_detected(
+            &mut quizzes,
+            &accounts,
+            &tx,
+            &cfg,
+            noop_cb,
+            "http://x".to_string(),
+            "exam".to_string(),
+            String::new(),
+            String::new(),
+            "act1".to_string(),
+            "acc2".to_string(),
+            String::new(),
+        );
+
+        let quiz = &quizzes[&key];
+        assert_eq!(quiz.attempts["acc1"].instance_id, "instance-acc1");
+        assert_eq!(quiz.attempts["acc2"].state, AttemptState::Waiting);
+        assert!(quiz.countdown_deadline.is_none());
+    }
+
+    #[test]
+    fn stale_prepare_generation_cannot_overwrite_new_attempt() {
+        let (mut quizzes, key) = quiz_with_conflict();
+        let attempt = quizzes.get_mut(&key).unwrap().attempts.get_mut("acc1").unwrap();
+        attempt.state = AttemptState::Preparing;
+        attempt.prepare_generation = 2;
+        let cfg = cfg_countdown(15);
+
+        on_quiz_prepared(
+            &mut quizzes,
+            &cfg,
+            noop_cb,
+            key.clone(),
+            vec![PreparedAttempt {
+                account_id: "acc1".to_string(),
+                generation: 1,
+                instance_id: "stale-instance".to_string(),
+                subjects: vec![json!({ "id": "stale", "type": "short_answer" })],
+                generated_answers: Map::from([(
+                    "stale".to_string(),
+                    Answer::Text("stale".to_string()),
+                )]),
+                existing_answers: Map::new(),
+            }],
+        );
+
+        let attempt = &quizzes[&key].attempts["acc1"];
+        assert_eq!(attempt.prepare_generation, 2);
+        assert_eq!(attempt.instance_id, "instance-acc1");
+        assert_eq!(attempt.state, AttemptState::Preparing);
+    }
+
+    #[test]
+    fn paper_contract_ignores_existing_answer_but_not_option_identity() {
+        let alice = vec![json!({
+            "id": "s1",
+            "type": "single_selection",
+            "options": [{ "id": "alice-o1", "content": "A" }]
+        })];
+        let mut same_contract = alice.clone();
+        same_contract[0]["student_answer_option_ids"] = json!(["alice-o1"]);
+        let different_options = vec![json!({
+            "id": "s1",
+            "type": "single_selection",
+            "options": [{ "id": "bob-o1", "content": "A" }]
+        })];
+
+        assert_eq!(paper_contract(&alice), paper_contract(&same_contract));
+        assert_ne!(paper_contract(&alice), paper_contract(&different_options));
+    }
+
+    #[test]
+    fn changed_paper_contract_drops_partial_answers() {
+        let prior = PriorAnswers {
+            contract: vec![json!({ "id": "s1", "options": [{ "id": "old" }] })],
+            answers: Map::from([(
+                "s1".to_string(),
+                Answer::Options(vec!["old".to_string()]),
+            )]),
+        };
+        let changed = vec![json!({ "id": "s1", "options": [{ "id": "new" }] })];
+
+        assert!(compatible_prior(Some(&prior), &changed).is_empty());
+        assert_eq!(compatible_prior(Some(&prior), &prior.contract), prior.answers);
+    }
+
+    #[test]
+    fn gone_attempt_does_not_block_another_ready_account() {
+        let (mut quizzes, key) = quiz_with_conflict();
+        let quiz = quizzes.get_mut(&key).unwrap();
+        quiz.attempts.get_mut("acc1").unwrap().conflicts.clear();
+        quiz.attempts.insert("acc2".to_string(), PerAccountAttempt {
+            state: AttemptState::Preparing,
+            prepare_generation: 3,
+            prepare_at: Instant::now(),
+            prepare_deadline: None,
+            answer_contract: None,
+            instance_id: String::new(),
+            subjects: Vec::new(),
+            generated_answers: Map::new(),
+            existing_answers: Map::new(),
+            overrides: Map::new(),
+            conflicts: HashSet::new(),
+        });
+
+        on_quiz_prepare_gone(&mut quizzes, &cfg_countdown(15), key.clone(), "acc2".to_string(), 3);
+
+        assert_eq!(quizzes[&key].attempts["acc2"].state, AttemptState::Gone);
+        assert!(quizzes[&key].countdown_deadline.is_some());
     }
 }
