@@ -80,7 +80,10 @@ public sealed class AppState : ObservableObject
         switch (evEl.GetString())
         {
             case "Tick": Ticked?.Invoke(); break;
-            case "StateChanged": MonitorState = Str(e, "state") ?? MonitorState; break;
+            case "StateChanged":
+                MonitorState = Str(e, "state") ?? MonitorState;
+                if (MonitorState == "idle") MonitoringServiceLifetime.Stop();
+                break;
 
             case "Caps" when e.TryGetProperty("caps", out var c):
                 Caps.BackgroundMonitoring = Bool(c, "background_monitoring");
@@ -412,8 +415,17 @@ public sealed class AppState : ObservableObject
 
     // ---------------- 命令(UI → core) ----------------
 
-    public Task StartMonitoring() => Send("StartMonitoring");
-    public Task StopMonitoring() => Send("StopMonitoring");
+    public async Task StartMonitoring()
+    {
+        // Android 12+ 只允許在使用者前景互動時啟動多數 FGS；按鈕呼叫路徑就是授權時點。
+        MonitoringServiceLifetime.Start();
+        if (!OkReply(await Send("StartMonitoring"))) MonitoringServiceLifetime.Stop();
+    }
+
+    public async Task StopMonitoring()
+    {
+        if (OkReply(await Send("StopMonitoring"))) MonitoringServiceLifetime.Stop();
+    }
 
     public async Task<bool> AddAccount(string label, string school, string username, string password,
                                        bool isTeacher = false, string? courseId = null) =>

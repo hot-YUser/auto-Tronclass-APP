@@ -4,6 +4,7 @@ using Android.OS;
 using Android.Runtime;
 using AndroidX.Core.App;
 using Microsoft.Extensions.DependencyInjection;
+using System.Runtime.Versioning;
 using System.Text.Json;
 using TronClass.Interop;
 
@@ -49,12 +50,25 @@ public class CoreForegroundService : Service
             _ = _core.BootAsync(DataPaths.Resolve()); // Android → 沙盒；與 UI 端同一決策點
         }
 
-        return StartCommandResult.Sticky;
+        // 監控狀態不會在 process death 後自動恢復；Sticky 只會重建一個沒有監控工作的服務，
+        // 還會繼續消耗 Android 15 的 dataSync 六小時額度。
+        return StartCommandResult.NotSticky;
+    }
+
+    [SupportedOSPlatform("android35.0")]
+    public override void OnTimeout(int startId, global::Android.Content.PM.ForegroundService fgsType)
+    {
+        // SendAsync 在第一次 await 前會同步送出 StopMonitoring；不可等待最長 300 秒的 Reply，
+        // 系統只給數秒 grace period，必須立刻離開前景並 stopSelf。
+        if (_core is not null) _ = _core.SendAsync("StopMonitoring");
+        StopForeground(StopForegroundFlags.Remove);
+        StopSelf(startId);
     }
 
     public override void OnDestroy()
     {
         if (_core is not null) _core.EventReceived -= OnCoreEvent;
+        StopForeground(StopForegroundFlags.Remove);
         base.OnDestroy();
     }
 
@@ -81,6 +95,12 @@ public class CoreForegroundService : Service
             "QuizSubmitted" => "已送出測驗 ✓ 繼續監控中",
             _ => null,
         };
+        if (name == "StateChanged" && ev.TryGetProperty("state", out var state) && state.GetString() == "idle")
+        {
+            StopForeground(StopForegroundFlags.Remove);
+            StopSelf();
+            return;
+        }
         if (text is null || text == _status) return; // only update when the visible status actually changes
         _status = text;
         var mgr = (NotificationManager)GetSystemService(NotificationService)!;

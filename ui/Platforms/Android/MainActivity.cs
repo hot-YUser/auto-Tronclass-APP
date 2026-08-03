@@ -20,13 +20,5 @@ public class MainActivity : MauiAppCompatActivity
         {
             RequestPermissions(new[] { Android.Manifest.Permission.PostNotifications }, 1001);
         }
-
-        // Start the foreground service so the core's monitor loop survives backgrounding.
-        // This is the Android half of "the platform keeps the process alive" (docs 50 step 0).
-        var intent = new Intent(this, typeof(CoreForegroundService));
-        if (OperatingSystem.IsAndroidVersionAtLeast(26))
-            StartForegroundService(intent);
-        else
-            StartService(intent);
     }
 }
