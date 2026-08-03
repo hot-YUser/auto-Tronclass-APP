@@ -249,7 +249,7 @@ sealed class ParticipantRow : Grid
         Unhook();
         if (BindingContext is not RollcallAccountVm vm) return;
         _vm = vm;
-        _handler = (_, a) => { if (a.PropertyName is nameof(RollcallAccountVm.Signed) or nameof(RollcallAccountVm.ChipText) or nameof(RollcallAccountVm.Label)) Render(vm); };
+        _handler = (_, a) => { if (a.PropertyName is nameof(RollcallAccountVm.Signed) or nameof(RollcallAccountVm.Method) or nameof(RollcallAccountVm.Label)) Render(vm); };
         vm.PropertyChanged += _handler;
         Render(vm);
     }

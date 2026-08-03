@@ -132,7 +132,7 @@ public sealed class RollcallVm : ObservableObject, IGateVm
     public double AttendanceRate
     {
         get => _rate;
-        set { if (Set(ref _rate, value)) { Raise(nameof(AttendanceRateText)); Raise(nameof(SubtitleText)); Raise(nameof(StatusText)); Raise(nameof(MetaText)); } }
+        set { if (Set(ref _rate, value)) { Raise(nameof(AttendanceRateText)); Raise(nameof(StatusText)); Raise(nameof(MetaText)); } }
     }
     public double GatePercent
     {
@@ -175,7 +175,6 @@ public sealed class RollcallVm : ObservableObject, IGateVm
         _ when Holding => "等待門檻",
         _ => "進行中",
     };
-    public string SubtitleText => $"{KindText} · {DetectedAt:HH:mm} · 全班簽到率 {AttendanceRate:0.#}%";
     public string StatusText => Status switch
     {
         "pending" => "暫緩中 · 可補簽",
@@ -210,7 +209,7 @@ public sealed class RollcallAccountVm : ObservableObject
         var m when m.StartsWith("qr") => "QR",
         var m => m,
     };
-    public string StateText => Signed ? (Method is null ? "已簽到" : $"已簽到 · {Method}") : "等待中";
+    public string StateText => Signed ? (MethodText.Length > 0 ? $"已簽到 · {MethodText}" : "已簽到") : "等待中";
     /// 列表卡的逐帳號膠囊文字。
     public string ChipText => Signed
         ? (MethodText.Length > 0 ? $"✓ {Label} · {MethodText}" : $"✓ {Label}")
