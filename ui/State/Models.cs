@@ -26,6 +26,15 @@ public interface ICountdownVm : INotifyPropertyChanged
     int TotalSecs { get; }
 }
 
+/// <summary>有防假點名門檻的倒數(點名才有,測驗沒有)。未達門檻時 core 不倒數,
+/// 倒數欄位改渲染「即時簽到率 → 門檻」的進度,達標後讓回倒數。</summary>
+public interface IGateVm : ICountdownVm
+{
+    bool Holding { get; }          // 簽到率未達門檻、暫不自動簽(仍可手動「立即簽到」)
+    double AttendanceRate { get; } // 全班即時簽到率 %
+    double GatePercent { get; }    // 門檻 %
+}
+
 public sealed class CapsVm : ObservableObject
 {
     bool _bg, _selfUpdate, _qr, _ocr;
@@ -88,17 +97,36 @@ public sealed record LogEntry(DateTime At, string Level, string Text)
 
 // ---------------- 點名 ----------------
 
-public sealed class RollcallVm : ObservableObject, ICountdownVm
+public sealed class RollcallVm : ObservableObject, IGateVm
 {
     public required string Id { get; init; }
     public string BaseUrl { get; set; } = "";
     public string Kind { get; set; } = "";
     public string Course { get; set; } = "";
-    public double AttendanceRate { get; set; }
     public DateTime DetectedAt { get; } = DateTime.Now;
     public ObservableCollection<RollcallAccountVm> Accounts { get; } = [];
 
     int? _remaining; int _total; string _status = "counting"; // counting | pending | done
+    double _rate; double _gate; bool _holding;                // 防假點名門檻(core 的 RollcallGate 事件推來)
+
+    /// 全班即時簽到率 %。未達門檻時 core 每秒重查一次,所以這個值是活的。
+    public double AttendanceRate
+    {
+        get => _rate;
+        set { if (Set(ref _rate, value)) { Raise(nameof(AttendanceRateText)); Raise(nameof(SubtitleText)); Raise(nameof(StatusText)); } }
+    }
+    public double GatePercent
+    {
+        get => _gate;
+        set { if (Set(ref _gate, value)) Raise(nameof(StatusText)); }
+    }
+    /// true = 簽到率未達門檻,core 不會自動簽(但「立即簽到」仍可手動覆蓋)。
+    public bool Holding
+    {
+        get => _holding;
+        set { if (Set(ref _holding, value)) Raise(nameof(StatusText)); }
+    }
+    public string AttendanceRateText => $"{AttendanceRate:0.#}%";
 
     public int? RemainingSecs { get => _remaining; set => Set(ref _remaining, value); }
     public int TotalSecs { get => _total; set => Set(ref _total, value); }
@@ -118,6 +146,8 @@ public sealed class RollcallVm : ObservableObject, ICountdownVm
     {
         "pending" => "暫緩中 · 可補簽",
         "done" => $"已簽到 {SignedCount}/{Accounts.Count}",
+        // 未達門檻:講清楚在等什麼(差多少),而不是含糊的「進行中」。
+        _ when Holding => $"等待簽到率 · {AttendanceRate:0.#}% / 門檻 {GatePercent:0.#}%",
         _ => $"進行中 · 已簽 {SignedCount}/{Accounts.Count}",
     };
 

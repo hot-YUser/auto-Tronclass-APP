@@ -9,13 +9,27 @@ namespace Ui;
 /// </summary>
 public sealed class CountdownView : ContentView
 {
-    public CountdownView(ICountdownVm vm, string verb, double fontSize = 13)
+    /// <param name="showRate">未達門檻時是否把簽到率數字寫進這行字。英雄彈窗用大字顯示簽到率,
+    /// 這裡就傳 false 免得同一個數字出現兩次。</param>
+    public CountdownView(ICountdownVm vm, string verb, double fontSize = 13, bool showRate = true)
     {
         var label = Theme.Text("", fontSize, Theme.FontSemibold, Theme.PrimL, Theme.PrimD);
         var bar = new ProgressBar();
 
         void Update(bool animate)
         {
+            // 未達門檻:core 不倒數,此時渲染「即時簽到率 → 門檻」的進度(原本整條收合、畫面很空)。
+            if (vm is IGateVm { Holding: true } gate)
+            {
+                IsVisible = true;
+                label.Text = showRate
+                    ? $"全班簽到率 {gate.AttendanceRate:0.#}% · 未達 {gate.GatePercent:0.#}% 門檻"
+                    : $"未達 {gate.GatePercent:0.#}% 門檻 · 持續偵測中";
+                var pct = gate.GatePercent > 0 ? Math.Clamp(gate.AttendanceRate / gate.GatePercent, 0, 1) : 0;
+                if (animate) bar.ProgressTo(pct, 950, Easing.Linear);
+                else bar.Progress = pct;
+                return;
+            }
             IsVisible = vm.RemainingSecs.HasValue;
             if (vm.RemainingSecs is not int s) return;
             label.Text = $"{s} 秒後{verb}";
@@ -26,7 +40,8 @@ public sealed class CountdownView : ContentView
 
         void OnChanged(object? _, PropertyChangedEventArgs a)
         {
-            if (a.PropertyName is nameof(ICountdownVm.RemainingSecs)) Update(animate: true);
+            if (a.PropertyName is nameof(ICountdownVm.RemainingSecs)
+                or nameof(IGateVm.Holding) or nameof(IGateVm.AttendanceRate)) Update(animate: true);
         }
 
         this.WhileAttached(

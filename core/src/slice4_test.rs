@@ -425,3 +425,71 @@ fn vault_auto_unlocks_without_a_password() {
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"g","school":"http://x","username":"g","password":"secret"}}"#));
     assert_eq!(wait_for(reply_ok(i), 5).unwrap()["ok"], true, "AddAccount works with no unlock step");
 }
+
+/// Boot one account against a fresh fake and start monitoring with the anti-fake gate at `gate` %.
+fn boot_monitoring(tag: &str, gate: f64) -> (Harness, String) {
+    let base = start_fake();
+    let mut hz = Harness::new();
+    let dir = data_dir(tag);
+    let i = hz.next();
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    wait_for(reply_ok(i), 10);
+    let i = hz.next();
+    send(hz.h, &format!(
+        r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":1,"attendance_gate_percent":{gate}}}}}"#
+    ));
+    wait_for(reply_ok(i), 5);
+    let i = hz.next();
+    send(hz.h, &format!(
+        r#"{{"id":{i},"cmd":"AddAccount","label":"eve","school":"{base}","username":"eve","password":"secret"}}"#
+    ));
+    wait_for(reply_ok(i), 5);
+    let i = hz.next();
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
+    wait_for(reply_ok(i), 15);
+    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    (hz, base)
+}
+
+/// A settings change must reach the RUNNING monitor. The actor owns a `MonitorConfig` snapshot and each
+/// poller a `PollTuning` clone, so before this they only ever saw the values captured at `StartMonitoring`
+/// — the user had to stop and restart monitoring for any change to bite.
+#[test]
+fn config_update_applies_to_a_running_monitor() {
+    let _g = SEQ.lock().unwrap();
+    let (mut hz, base) = boot_monitoring("livecfg", 100.0);
+
+    post(&base, "/_test/open_rollcall", r#"{"id":"RC50","kind":"self_registration","attendance_rate":50}"#);
+    let signed = |v: &Value| v["event"] == "SignedIn" && v["rollcall_id"] == "RC50";
+    assert!(none_for(signed, 3), "a 50%-attendance rollcall is held by the 100% gate");
+
+    // Lower the gate WHILE monitoring — no stop/start cycle.
+    let i = hz.next();
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"attendance_gate_percent":10}}}}"#));
+    assert_eq!(wait_for(reply_ok(i), 5).unwrap()["ok"], true, "UpdateConfig accepted");
+    assert!(wait_for(signed, 15).is_some(), "the running monitor must adopt the new gate without a restart");
+}
+
+/// While a rollcall is held below the gate there is no countdown, so the UI needs the live class rate
+/// (and the threshold) to render that wait instead of an empty box — and a flip to `holding:false` when
+/// the gate is finally met, so it can swap back to the countdown.
+#[test]
+fn below_gate_emits_live_attendance_for_the_ui() {
+    let _g = SEQ.lock().unwrap();
+    let (mut hz, base) = boot_monitoring("gateui", 80.0);
+
+    post(&base, "/_test/open_rollcall", r#"{"id":"RC40","kind":"self_registration","attendance_rate":40}"#);
+    let held = wait_for(|v| v["event"] == "RollcallGate" && v["rollcall_id"] == "RC40" && v["holding"] == true, 15)
+        .expect("a held rollcall emits RollcallGate{holding:true}");
+    let rate = held["rate"].as_f64().expect("carries the live class attendance rate");
+    assert!((30.0..50.0).contains(&rate), "rate ≈ the fake's 40% roster, got {rate}");
+    assert_eq!(held["gate_percent"].as_f64(), Some(80.0), "carries the configured threshold");
+
+    let i = hz.next();
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"attendance_gate_percent":10}}}}"#));
+    wait_for(reply_ok(i), 5);
+    assert!(
+        wait_for(|v| v["event"] == "RollcallGate" && v["rollcall_id"] == "RC40" && v["holding"] == false, 15).is_some(),
+        "clearing the gate emits holding:false so the UI restores the countdown"
+    );
+}

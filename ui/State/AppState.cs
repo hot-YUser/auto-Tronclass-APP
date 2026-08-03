@@ -141,6 +141,17 @@ public sealed class AppState : ObservableObject
             }
 
             case "RollcallDetected": OnRollcallDetected(e); break;
+            // 門檻狀態:未達門檻沒有倒數,UI 改用即時簽到率填那個欄位(達標後 holding=false 讓回倒數)。
+            case "RollcallGate":
+                if (FindRollcall(Str(e, "rollcall_id")) is { } gated)
+                {
+                    if (e.TryGetProperty("rate", out var gr) && gr.ValueKind == JsonValueKind.Number)
+                        gated.AttendanceRate = gr.GetDouble();
+                    gated.GatePercent = Dbl(e, "gate_percent");
+                    gated.Holding = Bool(e, "holding");
+                    if (gated.Holding) gated.RemainingSecs = null; // 還沒開始倒數
+                }
+                break;
             case "PendingSignIn":
                 if (FindRollcall(Str(e, "rollcall_id")) is { } pending)
                 {
@@ -207,7 +218,9 @@ public sealed class AppState : ObservableObject
         if (vm.IsDone) { vm.Status = "counting"; foreach (var p in vm.Accounts) { p.Signed = false; p.Method = null; } }
         vm.Kind = Str(e, "kind") ?? vm.Kind;
         vm.Course = Str(e, "course") ?? vm.Course;
-        vm.AttendanceRate = Dbl(e, "attendance_rate");
+        // 首次偵測時 core 還沒查到簽到率(null)——別用 0 蓋掉 RollcallGate 已推來的活值。
+        if (e.TryGetProperty("attendance_rate", out var ar) && ar.ValueKind == JsonValueKind.Number)
+            vm.AttendanceRate = ar.GetDouble();
         if (e.TryGetProperty("accounts", out var arr))
             foreach (var a in arr.EnumerateArray())
             {

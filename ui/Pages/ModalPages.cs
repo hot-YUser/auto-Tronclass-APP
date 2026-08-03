@@ -71,10 +71,24 @@ public sealed class HeroRollcallPage : ModalPageBase
         var stack = new VerticalStackLayout { Spacing = 12 };
 
         var big = Centered(Theme.Text("", 46, Theme.FontSemibold, Theme.PrimL, Theme.PrimD));
+        var rate = Theme.Dim("", 13);
+        rate.VerticalOptions = LayoutOptions.Center;
         void UpdateBig()
         {
-            big.IsVisible = vm.RemainingSecs.HasValue;
-            big.Text = vm.RemainingSecs?.ToString() ?? "";
+            // 未達門檻時沒有倒數:大字改放「即時簽到率」(否則這塊是空的);
+            // 達標後大字讓回倒數,簽到率退回下面那行小字。
+            if (vm.Holding)
+            {
+                big.IsVisible = true;
+                big.Text = vm.AttendanceRateText;
+            }
+            else
+            {
+                big.IsVisible = vm.RemainingSecs.HasValue;
+                big.Text = vm.RemainingSecs?.ToString() ?? "";
+            }
+            rate.Text = $"全班簽到率 {vm.AttendanceRateText}";
+            rate.IsVisible = !vm.Holding; // 未達門檻時它就是上面那個大字,不重複顯示
         }
 
         var chips = new FlexLayout
@@ -97,15 +111,13 @@ public sealed class HeroRollcallPage : ModalPageBase
 
         var meta = new HorizontalStackLayout { Spacing = 8, HorizontalOptions = LayoutOptions.Center };
         meta.Children.Add(Theme.TextPill(vm.KindText, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD));
-        var rate = Theme.Dim($"全班簽到率 {vm.AttendanceRate:0.#}%", 13);
-        rate.VerticalOptions = LayoutOptions.Center;
         meta.Children.Add(rate);
 
         stack.Children.Add(Header("偵測到點名", _collapse));
         stack.Children.Add(Centered(Theme.Strong(vm.Course, 20)));
         stack.Children.Add(meta);
         stack.Children.Add(big);
-        stack.Children.Add(new CountdownView(vm, "自動簽到"));
+        stack.Children.Add(new CountdownView(vm, "自動簽到", showRate: false)); // 簽到率由上面的大字負責
         stack.Children.Add(chips);
         stack.Children.Add(Theme.Primary("立即簽到", () => state.SignNow(vm.Id)));
         stack.Children.Add(Row(
@@ -129,7 +141,8 @@ public sealed class HeroRollcallPage : ModalPageBase
         void OnAccounts(object? _, NotifyCollectionChangedEventArgs __) { foreach (var p in vm.Accounts) HookAcc(p); BuildChips(); }
         async void OnVm(object? _, PropertyChangedEventArgs a)
         {
-            if (a.PropertyName == nameof(RollcallVm.RemainingSecs)) { UpdateBig(); return; }
+            if (a.PropertyName is nameof(RollcallVm.RemainingSecs)
+                or nameof(RollcallVm.Holding) or nameof(RollcallVm.AttendanceRate)) { UpdateBig(); return; }
             if (a.PropertyName != nameof(RollcallVm.Status)) return;
             if (vm.IsPending) await close(this);
             else if (vm.IsDone) { ShowSuccess(); await Task.Delay(800); await close(this); }

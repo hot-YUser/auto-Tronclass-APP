@@ -88,7 +88,7 @@ public sealed class RollcallDetailPage : ContentPage
                     Children = { Theme.TextPill(vm.KindText, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD) },
                 },
                 KeyValue("課程", vm.Course),
-                KeyValue("全班簽到率", $"{vm.AttendanceRate:0.#}%"),
+                KeyValueBound("全班簽到率", nameof(RollcallVm.AttendanceRateText)), // 未達門檻時每秒重查,要活的
                 KeyValue("偵測時間", vm.DetectedAt.ToString("HH:mm:ss")),
                 KeyValue("平台", vm.BaseUrl),
             },
@@ -160,13 +160,23 @@ public sealed class RollcallDetailPage : ContentPage
         };
     }
 
-    static Grid KeyValue(string key, string value)
+    static Grid KeyValue(string key, string value) => KeyValueView(key, Theme.Body(value));
+
+    /// 值會變的欄位:綁 VM 屬性(頁面 BindingContext = vm),而不是建構當下的快照。
+    static Grid KeyValueBound(string key, string path)
+    {
+        var v = Theme.Body("");
+        v.SetBinding(Label.TextProperty, path);
+        return KeyValueView(key, v);
+    }
+
+    static Grid KeyValueView(string key, View value)
     {
         var g = new Grid { ColumnSpacing = 12 };
         g.ColumnDefinitions.Add(new ColumnDefinition(new GridLength(96)));
         g.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
         g.Add(Theme.Dim(key, 13), 0, 0);
-        g.Add(Theme.Body(value), 1, 0);
+        g.Add(value, 1, 0);
         return g;
     }
 }

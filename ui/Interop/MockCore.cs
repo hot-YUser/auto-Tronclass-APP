@@ -152,7 +152,15 @@ public sealed class MockCore : ICore
 
         const string rc = "30558";
         Emit(new { id = (object?)null, @event = "RollcallDetected", rollcall_id = rc, base_url = BaseUrl,
-            kind = "radar", course = "行銷管理", attendance_rate = 42.0, accounts = new[] { "a1", "a2" } });
+            kind = "radar", course = "行銷管理", attendance_rate = (object?)null, accounts = new[] { "a1", "a2" } });
+        // 未達門檻:core 不倒數,只每秒回報即時簽到率(UI 用它填倒數欄位)。爬過門檻才 holding=false → 開始倒數。
+        var gate = Convert.ToDouble(_settings["attendance_gate_percent"]);
+        foreach (var r in new[] { 3.7, 7.4, 11.1, 14.8 })
+        {
+            Emit(new { id = (object?)null, @event = "RollcallGate", rollcall_id = rc, rate = r, gate_percent = gate, holding = true });
+            await Task.Delay(900);
+        }
+        Emit(new { id = (object?)null, @event = "RollcallGate", rollcall_id = rc, rate = 42.0, gate_percent = gate, holding = false });
         for (var s = 15; s >= 0; s--)
         {
             Emit(new { id = (object?)null, @event = "Countdown", scope = "rollcall", id_ = rc, remaining_secs = s });

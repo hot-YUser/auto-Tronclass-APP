@@ -266,6 +266,7 @@ fn handle_sync(core: &Core, cmd: Command) {
             };
             match result {
                 Ok(()) => {
+                    push_config(st); // a running monitor starts answering with the new key immediately
                     emit_settings(cb, st); // has_llm_key flips true → the Settings screen updates
                     reply(cb, id, true, None);
                 }
@@ -354,6 +355,7 @@ fn handle_sync(core: &Core, cmd: Command) {
                 }
             }
             let _ = st.config.save(&st.config_path());
+            push_config(st); // a running monitor adopts the change live (no stop/start)
             emit_settings(cb, st); // echo the applied settings so the UI reflects the saved values
             reply(cb, id, true, None);
         }
@@ -497,6 +499,43 @@ async fn authed_client(base_url: &str, username: &str, password: &str, cached: &
     Ok((client, dump_cookies(&jar)))
 }
 
+/// The monitor's view of the current settings. Built at `StartMonitoring` **and** on every settings
+/// change (see `push_config`) so one definition serves both — the two must never drift.
+fn monitor_config(st: &CoreState) -> MonitorConfig {
+    let s = &st.config.settings;
+    MonitorConfig {
+        countdown_secs: s.countdown_secs,
+        gate_percent: s.attendance_gate_percent,
+        llm_endpoint: s.llm_endpoint.clone(),
+        llm_model: s.llm_model.clone(),
+        llm_key: st.vault.as_ref().and_then(|v| v.get_llm_key()),
+        llm_max_tokens: s.llm_max_tokens,
+        max_answer_reask: s.max_answer_reask,
+        prepare_retry_budget_secs: s.prepare_retry_budget_secs,
+        autoanswer_types: s.autoanswer_types.clone(),
+        enable_llm_tools: s.enable_llm_tools,
+        max_tool_iterations: s.max_tool_iterations,
+        resubmit_for_correct: s.resubmit_for_correct,
+        radar_strategy: s.radar_strategy.clone(),
+        number_concurrency: s.number_concurrency,
+        number_min_concurrency: s.number_min_concurrency,
+        number_cooldown_ms: s.number_cooldown_ms,
+        number_max_cooldowns: s.number_max_cooldowns,
+        poll_idle_secs: s.poll_idle_secs,
+        quiz_detect_secs: s.quiz_detect_secs,
+        operating: s.operating.clone(),
+        tz_offset_minutes: s.tz_offset_minutes,
+    }
+}
+
+/// Hand the just-changed settings to a RUNNING monitor. Without this the actor/pollers keep the snapshot
+/// they took at `StartMonitoring`, so a settings change only bit after a manual stop→start (user-reported).
+fn push_config(st: &CoreState) {
+    if let Some(h) = st.monitor.as_ref() {
+        let _ = h.tx.send(monitor::MonitorMsg::ConfigUpdated(Box::new(monitor_config(st))));
+    }
+}
+
 /// Start concurrent monitoring: authenticate every account, then hand ready sessions to the monitor.
 fn spawn_start_monitoring(core: &Core, id: u64) {
     let cb = core.cb;
@@ -514,31 +553,7 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
             let secret = vault.get(&acc.id).unwrap_or_default();
             accts.push((acc.clone(), base_url, secret.password, secret.cookies));
         }
-        let s = &st.config.settings;
-        let cfg = MonitorConfig {
-            countdown_secs: s.countdown_secs,
-            gate_percent: s.attendance_gate_percent,
-            llm_endpoint: s.llm_endpoint.clone(),
-            llm_model: s.llm_model.clone(),
-            llm_key: vault.get_llm_key(),
-            llm_max_tokens: s.llm_max_tokens,
-            max_answer_reask: s.max_answer_reask,
-            prepare_retry_budget_secs: s.prepare_retry_budget_secs,
-            autoanswer_types: s.autoanswer_types.clone(),
-            enable_llm_tools: s.enable_llm_tools,
-            max_tool_iterations: s.max_tool_iterations,
-            resubmit_for_correct: s.resubmit_for_correct,
-            radar_strategy: s.radar_strategy.clone(),
-            number_concurrency: s.number_concurrency,
-            number_min_concurrency: s.number_min_concurrency,
-            number_cooldown_ms: s.number_cooldown_ms,
-            number_max_cooldowns: s.number_max_cooldowns,
-            poll_idle_secs: s.poll_idle_secs,
-            quiz_detect_secs: s.quiz_detect_secs,
-            operating: s.operating.clone(),
-            tz_offset_minutes: s.tz_offset_minutes,
-        };
-        (accts, cfg)
+        (accts, monitor_config(st))
     };
     let (accts, cfg) = snap;
 

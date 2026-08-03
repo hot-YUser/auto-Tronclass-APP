@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -82,6 +83,8 @@ pub enum MonitorMsg {
     // --- session expiry / re-login (R4-D) ---
     AuthLost { account_id: String },
     AuthRestored { account_id: String, ok: bool },
+    /// Settings changed while monitoring: adopt them live (boxed — much larger than the other variants).
+    ConfigUpdated(Box<MonitorConfig>),
     Stop,
 }
 
@@ -139,6 +142,17 @@ impl MonitorConfig {
             max_tokens: self.llm_max_tokens,
             enable_tools: self.enable_llm_tools,
             max_tool_iterations: self.max_tool_iterations,
+        }
+    }
+
+    /// The slice of the config each poller needs (cadences + schedule + family allowlist).
+    fn tuning(&self) -> PollTuning {
+        PollTuning {
+            idle: Duration::from_secs(self.poll_idle_secs.max(1)),
+            quiz_detect: Duration::from_secs(self.quiz_detect_secs.max(1)),
+            operating: self.operating.clone(),
+            tz_offset_minutes: self.tz_offset_minutes,
+            wanted_types: self.autoanswer_types.clone(),
         }
     }
 }
@@ -218,19 +232,15 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
     let map: HashMap<String, Arc<Account>> =
         accounts.into_iter().map(|a| (a.id.clone(), Arc::new(a))).collect();
 
-    let tune = PollTuning {
-        idle: Duration::from_secs(cfg.poll_idle_secs.max(1)),
-        quiz_detect: Duration::from_secs(cfg.quiz_detect_secs.max(1)),
-        operating: cfg.operating.clone(),
-        tz_offset_minutes: cfg.tz_offset_minutes,
-        wanted_types: cfg.autoanswer_types.clone(),
-    };
+    // Pollers read their tuning from a watch channel so a live `ConfigUpdated` reaches them too — the
+    // actor owns the sender and republishes on every settings change (no stop/start needed).
+    let (tune_tx, tune_rx) = watch::channel(cfg.tuning());
 
     let mut tasks = Vec::new();
     for acc in map.values() {
-        tasks.push(tokio::spawn(poller(acc.clone(), tx.clone(), cb, tune.clone())));
+        tasks.push(tokio::spawn(poller(acc.clone(), tx.clone(), cb, tune_rx.clone())));
     }
-    tasks.push(tokio::spawn(actor(cb, map, rx, tx.clone(), cfg)));
+    tasks.push(tokio::spawn(actor(cb, map, rx, tx.clone(), cfg, tune_tx)));
 
     emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "monitoring" }));
     MonitorHandle { tx, tasks }
@@ -239,7 +249,8 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
 /// Poll one account's rollcalls; report each newly-seen rollcall once (the actor fetches fresh
 /// attendance itself). Adaptive cadence: faster when something is active. Outside the operating-hours
 /// schedule the poller neither polls nor detects (docs 20) — the actor stays alive but idle.
-async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb, tune: PollTuning) {
+async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb, mut tune_rx: watch::Receiver<PollTuning>) {
+    let mut tune = tune_rx.borrow_and_update().clone();
     let ep = Endpoints::derive(&acc.base_url);
     let mut seen: HashSet<String> = HashSet::new();
     let mut courses: Vec<String> = Vec::new(); // refreshed every 300s (a new enrolment appears)
@@ -253,6 +264,10 @@ async fn poller(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, cb: EventCb,
     loop {
         if tx.is_closed() {
             break;
+        }
+        // Adopt a live settings change (cheap: only clones when the actor actually republished).
+        if tune_rx.has_changed().unwrap_or(false) {
+            tune = tune_rx.borrow_and_update().clone();
         }
         // Operating-hours gate: closed → skip polling + detection, re-check on a coarse cadence.
         if !tune.operating.is_open(now_epoch_secs(), tune.tz_offset_minutes) {
@@ -548,7 +563,8 @@ async fn actor(
     accounts: HashMap<String, Arc<Account>>,
     mut rx: UnboundedReceiver<MonitorMsg>,
     self_tx: UnboundedSender<MonitorMsg>,
-    cfg: MonitorConfig,
+    mut cfg: MonitorConfig,
+    tune_tx: watch::Sender<PollTuning>,
 ) {
     let mut activities: HashMap<ActivityKey, Activity> = HashMap::new();
     let mut quizzes: HashMap<ActivityKey, QuizActivity> = HashMap::new();
@@ -596,6 +612,13 @@ async fn actor(
                                 None => { reauth.remove(&account_id); }
                             }
                         }
+                    }
+                    // Settings changed mid-run: adopt them here AND republish the poller slice, so the
+                    // change bites immediately (a held rollcall re-checks its gate on the next tick).
+                    // Already-armed countdowns keep their deadline — only new ones use the new length.
+                    MonitorMsg::ConfigUpdated(new) => {
+                        cfg = *new;
+                        let _ = tune_tx.send(cfg.tuning());
                     }
                     MonitorMsg::AuthRestored { account_id, ok } => {
                         reauth.remove(&account_id);
@@ -663,7 +686,12 @@ fn on_gate(
     if a.acted || a.countdown_deadline.is_some() {
         return;
     }
-    if rate + f64::EPSILON < cfg.gate_percent {
+    // The UI renders this: while held there is no countdown, so it shows the LIVE class rate closing on
+    // the threshold instead of an empty countdown slot, and swaps back on `holding:false`.
+    let holding = rate + f64::EPSILON < cfg.gate_percent;
+    emit(cb, &json!({ "id": null, "event": "RollcallGate", "rollcall_id": key.2,
+                      "rate": a.attendance_rate, "gate_percent": cfg.gate_percent, "holding": holding }));
+    if holding {
         // Below the anti-fake-rollcall gate → hold and re-check on the next detection window.
         a.gate_pending = true;
         emit(cb, &json!({ "id": null, "event": "LogLine", "level": "info",
