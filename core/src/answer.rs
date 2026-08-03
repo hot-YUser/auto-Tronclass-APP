@@ -4,6 +4,7 @@
 //!
 //! Submit values are VERBATIM (gotcha 1): blank/short answers keep whatever text/HTML they carry.
 
+use crate::http;
 use crate::llm::{self, LlmConfig};
 use crate::providers::Endpoints;
 use crate::quiz::{self, Answer, Decision};
@@ -70,7 +71,7 @@ pub async fn fetch_paper(client: &Client, ep: &Endpoints, source: Source, activi
         Source::Vote => return fetch_vote_paper(client, ep, activity_id).await,
         Source::Homework => return Ok(homework_paper(client, ep, activity_id, stem).await),
     };
-    let v: Value = client.get(url).send().await.map_err(|e| format!("distribute: {e}"))?.json().await.map_err(|e| e.to_string())?;
+    let v = http::json_checked(client.get(url), "fetch distributed paper").await?;
     let raw = v.get("subjects").and_then(Value::as_array).cloned().unwrap_or_default();
     Ok(Paper {
         // Real distribute returns this as an integer (e.g. 635061) — reading it as_str gave "" and the
@@ -83,7 +84,7 @@ pub async fn fetch_paper(client: &Client, ep: &Endpoints, source: Source, activi
 /// vote: `GET votes/{id}` → `interaction.data.vote_option_items` (letter→text) → one selection subject
 /// whose option ids ARE the letters (A=1st…); the submit then sends `{votes:[letters]}`.
 async fn fetch_vote_paper(client: &Client, ep: &Endpoints, activity_id: &str) -> Result<Paper, String> {
-    let v: Value = client.get(ep.votes_read(activity_id)).send().await.map_err(|e| format!("vote: {e}"))?.json().await.map_err(|e| e.to_string())?;
+    let v = http::json_checked(client.get(ep.votes_read(activity_id)), "fetch vote paper").await?;
     let mut opts = Vec::new();
     if let Some(Value::Object(m)) = v.pointer("/interaction/data/vote_option_items") {
         let mut keys: Vec<&String> = m.keys().collect();
@@ -421,18 +422,17 @@ pub async fn submit_exam(
         .filter_map(|s| answers.get(&quiz::subject_id(s)).map(|a| exam_subject_entry(s, a))) // skip un-answered (never blank)
         .collect();
     let body = exam_body(instance_id, &entries);
-    let v: Value = client
-        .post(ep.exam_submissions(activity_id))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("submit: {e}"))?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let v = http::json_checked(
+        client.post(ep.exam_submissions(activity_id)).json(&body),
+        "submit exam",
+    )
+    .await?;
     // submission_id comes back as an INTEGER (e.g. 681504) — reading it as_str gave "" and disabled the
     // resubmit-for-correct pass; accept int OR string, with the v1 `id` fallback (confirmed live 2026-07).
     let sid = json_id_string(v.get("submission_id").or_else(|| v.get("id")));
+    if sid.is_empty() {
+        return Err("submit exam: response missing submission_id".to_string());
+    }
     let retake = v.get("allow_retake_exam").and_then(Value::as_bool).unwrap_or(false);
     Ok((sid, retake))
 }
@@ -441,7 +441,8 @@ pub async fn submit_exam(
 /// `exam_paper_instance_id` (a retake mints a new one — the original 400s) and member validation, read
 /// `correct_answers_data.correct_answers`, **overlay** onto the first answers where the **review value
 /// wins** (option_ids member-validated → cross-block dropped; blanks with the review's raw `sort`;
-/// short from the review `answer`), preserving `parent_id`, then resubmit. Guard-only (dup 400 is fine).
+/// short from the review `answer`), preserving `parent_id`, then resubmit. Any non-2xx is returned to
+/// the actor so a failed correction pass cannot be presented as a complete success.
 pub async fn resubmit_correct(
     client: &Client,
     ep: &Endpoints,
@@ -451,14 +452,11 @@ pub async fn resubmit_correct(
     _base_subjects: &[Value],
 ) -> Result<(), String> {
     let paper = fetch_paper(client, ep, Source::Exam, activity_id, "").await?; // fresh instance + subjects
-    let review: Value = client
-        .get(ep.exam_submission_review(activity_id, submission_id))
-        .send()
-        .await
-        .map_err(|e| format!("review: {e}"))?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let review = http::json_checked(
+        client.get(ep.exam_submission_review(activity_id, submission_id)),
+        "fetch exam review",
+    )
+    .await?;
     let corrects: std::collections::HashMap<String, Value> = review
         .pointer("/correct_answers_data/correct_answers")
         .and_then(Value::as_array)
@@ -480,7 +478,11 @@ pub async fn resubmit_correct(
         return Ok(());
     }
     let body = exam_body(&paper.instance_id, &entries);
-    let _ = client.post(ep.exam_submissions(activity_id)).json(&body).send().await; // dup 400 is fine
+    http::send_checked(
+        client.post(ep.exam_submissions(activity_id)).json(&body),
+        "resubmit corrected exam",
+    )
+    .await?;
     Ok(())
 }
 
@@ -554,6 +556,24 @@ fn subject_has_option(subject: &Value, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn one_shot_response(status: u16, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let reason = if status >= 400 { "Error" } else { "OK" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
+    }
 
     #[test]
     fn exam_body_shapes_verbatim() {
@@ -604,6 +624,35 @@ mod tests {
                 "7654321098".into(),
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn submit_exam_rejects_http_errors_and_missing_submission_id() {
+        let answers = std::collections::HashMap::new();
+
+        let base = one_shot_response(500, r#"{"error":"server failed"}"#).await;
+        let result = submit_exam(
+            &Client::new(),
+            &Endpoints::derive(&base),
+            "exam-1",
+            "instance-1",
+            &answers,
+            &[],
+        )
+        .await;
+        assert!(result.is_err(), "HTTP 500 must never be reported as a successful submit");
+
+        let base = one_shot_response(200, r#"{"allow_retake_exam":false}"#).await;
+        let result = submit_exam(
+            &Client::new(),
+            &Endpoints::derive(&base),
+            "exam-1",
+            "instance-1",
+            &answers,
+            &[],
+        )
+        .await;
+        assert!(result.is_err(), "a success response without submission_id is not a valid submit receipt");
     }
 
     #[test]

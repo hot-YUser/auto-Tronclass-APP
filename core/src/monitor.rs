@@ -1378,23 +1378,22 @@ fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, ins
                     // resubmit gate: EXAM + pref + the SUBMIT RESPONSE's allow_retake_exam + a submission
                     // id (v1 answer_flow.py:456) — a single-attempt exam must not burn its one graded attempt.
                     if resubmit && retake && !sid.is_empty() {
-                        let _ = answer::resubmit_correct(&acc.client, &ep, &activity_id, &sid, &answers, &subjects).await;
+                        match answer::resubmit_correct(&acc.client, &ep, &activity_id, &sid, &answers, &subjects).await {
+                            Ok(()) => Ok(format!("submitted {sid}; corrected resubmit completed")),
+                            Err(error) => Err(format!("initial submit {sid} succeeded; correction pass failed: {error}")),
+                        }
+                    } else {
+                        Ok(format!("submitted {sid}"))
                     }
-                    Ok(format!("submitted {sid}"))
                 }
                 Err(e) => Err(e),
             },
             Source::ClassroomExam => {
                 // per-subject POST with the full exam wrapper (flat body → 400). ponytail: v1 also gates
                 // on the server's started_subjects_count≥1 (R2.5); here each answered subject is posted.
-                for s in &subjects {
-                    let sid = crate::quiz::subject_id(s);
-                    if let Some(a) = answers.get(&sid) {
-                        let body = answer::classroom_body(&instance_id, s, a);
-                        let _ = acc.client.post(ep.classroom_submit(&activity_id, &sid)).json(&body).send().await;
-                    }
-                }
-                Ok("submitted (classroom)".into())
+                submit_classroom(&acc, &ep, &activity_id, &instance_id, &subjects, &answers)
+                    .await
+                    .map(|_| "submitted (classroom)".into())
             }
             Source::Questionnaire => {
                 // exam wrapper (NOT courseware), to the questionnaire endpoint.
@@ -1451,10 +1450,44 @@ fn find_quiz_mut<'a>(quizzes: &'a mut HashMap<ActivityKey, QuizActivity>, quiz_i
 }
 
 async fn get_json(client: &Client, url: &str) -> Result<Value, String> {
-    client.get(url).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())
+    crate::http::json_checked(client.get(url), "fetch activity").await
 }
 async fn post_json(client: &Client, url: &str, body: &Value) -> Result<(), String> {
-    client.post(url).json(body).send().await.map_err(|e| e.to_string()).map(|_| ())
+    crate::http::send_checked(client.post(url).json(body), "submit activity")
+        .await
+        .map(|_| ())
+}
+
+async fn submit_classroom(
+    account: &Account,
+    endpoints: &Endpoints,
+    activity_id: &str,
+    instance_id: &str,
+    subjects: &[Value],
+    answers: &Map<String, Answer>,
+) -> Result<(), String> {
+    let mut submitted = 0_usize;
+    for subject in subjects {
+        let subject_id = crate::quiz::subject_id(subject);
+        let Some(answer) = answers.get(&subject_id) else {
+            continue;
+        };
+        let body = answer::classroom_body(instance_id, subject, answer);
+        let operation = format!("submit classroom subject {subject_id}");
+        crate::http::send_checked(
+            account
+                .client
+                .post(endpoints.classroom_submit(activity_id, &subject_id))
+                .json(&body),
+            &operation,
+        )
+        .await?;
+        submitted += 1;
+    }
+    if submitted == 0 {
+        return Err("submit classroom: no answered subjects".to_string());
+    }
+    Ok(())
 }
 fn extract_array(v: &Value, key: &str) -> Vec<Value> {
     v.get(key).and_then(Value::as_array).or_else(|| v.as_array()).cloned().unwrap_or_default()
