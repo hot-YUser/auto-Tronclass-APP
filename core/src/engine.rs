@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 pub type EventCb = extern "C" fn(*const u8, usize);
 
@@ -27,9 +28,81 @@ struct CoreState {
     registry: Registry,
     config: Config,
     vault: Option<VaultFile>,             // Some(..) once unlocked
-    monitor: Option<monitor::MonitorHandle>, // Some(..) while monitoring
+    monitor: MonitorLifecycle,
+    monitor_generation: u64,
     /// In-flight captcha logins: account_id → the channel that delivers the user's typed answer.
     pending_captcha: HashMap<String, oneshot::Sender<String>>,
+}
+
+struct StartingMonitor {
+    generation: u64,
+    command_id: u64,
+    task: Option<JoinHandle<()>>,
+}
+
+struct RunningMonitor {
+    generation: u64,
+    handle: monitor::MonitorHandle,
+}
+
+enum MonitorLifecycle {
+    Idle,
+    Starting(StartingMonitor),
+    Running(RunningMonitor),
+}
+
+enum StoppedMonitor {
+    Idle,
+    Starting(StartingMonitor),
+    Running(monitor::MonitorHandle),
+}
+
+impl MonitorLifecycle {
+    fn begin_start(&mut self, generation: u64, command_id: u64) -> Result<(), &'static str> {
+        match self {
+            Self::Idle => {
+                *self = Self::Starting(StartingMonitor {
+                    generation,
+                    command_id,
+                    task: None,
+                });
+                Ok(())
+            }
+            Self::Starting(_) => Err("monitor is already starting"),
+            Self::Running(_) => Err("already monitoring"),
+        }
+    }
+
+    fn is_starting(&self, generation: u64) -> bool {
+        matches!(self, Self::Starting(starting) if starting.generation == generation)
+    }
+
+    fn attach_start_task(&mut self, generation: u64, task: JoinHandle<()>) {
+        match self {
+            Self::Starting(starting) if starting.generation == generation => {
+                starting.task = Some(task);
+            }
+            // The task committed Running and replied before the caller reacquired the lock. It is
+            // already finishing, so detaching is correct; aborting here could suppress its reply.
+            Self::Running(running) if running.generation == generation => drop(task),
+            _ => task.abort(),
+        }
+    }
+
+    fn running_handle(&self) -> Option<&monitor::MonitorHandle> {
+        match self {
+            Self::Running(running) => Some(&running.handle),
+            _ => None,
+        }
+    }
+
+    fn take_for_stop(&mut self) -> StoppedMonitor {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Idle => StoppedMonitor::Idle,
+            Self::Starting(starting) => StoppedMonitor::Starting(starting),
+            Self::Running(running) => StoppedMonitor::Running(running.handle),
+        }
+    }
 }
 
 impl CoreState {
@@ -143,7 +216,15 @@ fn handle_sync(core: &Core, cmd: Command) {
                 }
             };
             let unlocked = vault.is_some();
-            *guard = Some(CoreState { data_dir: dir, registry, config, vault, monitor: None, pending_captcha: HashMap::new() });
+            *guard = Some(CoreState {
+                data_dir: dir,
+                registry,
+                config,
+                vault,
+                monitor: MonitorLifecycle::Idle,
+                monitor_generation: 0,
+                pending_captcha: HashMap::new(),
+            });
             let st = guard.as_ref().unwrap();
             emit_providers(cb, st);
             emit_accounts(cb, st);
@@ -223,12 +304,7 @@ fn handle_sync(core: &Core, cmd: Command) {
 
         Command::StopMonitoring { .. } => {
             if let Some(st) = guard.as_mut() {
-                if let Some(h) = st.monitor.take() {
-                    let _ = h.tx.send(monitor::MonitorMsg::Stop);
-                    for t in h.tasks {
-                        t.abort();
-                    }
-                }
+                stop_monitor(&mut st.monitor, cb, "monitor start cancelled");
             }
             // The actor emits `idle` when it breaks on Stop, but the abort() above can cancel it before
             // it gets there — so emit `idle` here too (idempotent) to GUARANTEE the UI leaves the
@@ -362,9 +438,7 @@ fn handle_sync(core: &Core, cmd: Command) {
 
         Command::Shutdown { .. } => {
             if let Some(st) = guard.as_mut() {
-                if let Some(h) = st.monitor.take() {
-                    let _ = h.tx.send(monitor::MonitorMsg::Stop);
-                }
+                stop_monitor(&mut st.monitor, cb, "shutdown cancelled monitor start");
                 if let Some(v) = st.vault.as_mut() {
                     v.lock();
                 }
@@ -379,12 +453,37 @@ fn handle_sync(core: &Core, cmd: Command) {
 }
 
 fn route_to_monitor(cb: EventCb, state: Option<&CoreState>, id: u64, msg: monitor::MonitorMsg) {
-    match state.and_then(|s| s.monitor.as_ref()) {
+    match state.and_then(|s| s.monitor.running_handle()) {
         Some(h) => {
             let _ = h.tx.send(msg);
             reply(cb, id, true, None);
         }
         None => reply(cb, id, false, Some("not monitoring".into())),
+    }
+}
+
+fn stop_monitor(lifecycle: &mut MonitorLifecycle, cb: EventCb, cancelled_reason: &str) {
+    match lifecycle.take_for_stop() {
+        StoppedMonitor::Idle => {}
+        StoppedMonitor::Starting(mut starting) => {
+            // Complete the pending StartMonitoring request before aborting its task; otherwise the
+            // UI's correlated SendAsync would wait forever for a reply that can no longer be emitted.
+            reply(
+                cb,
+                starting.command_id,
+                false,
+                Some(cancelled_reason.to_string()),
+            );
+            if let Some(task) = starting.task.take() {
+                task.abort();
+            }
+        }
+        StoppedMonitor::Running(handle) => {
+            let _ = handle.tx.send(monitor::MonitorMsg::Stop);
+            for task in handle.tasks {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -531,7 +630,7 @@ fn monitor_config(st: &CoreState) -> MonitorConfig {
 /// Hand the just-changed settings to a RUNNING monitor. Without this the actor/pollers keep the snapshot
 /// they took at `StartMonitoring`, so a settings change only bit after a manual stop→start (user-reported).
 fn push_config(st: &CoreState) {
-    if let Some(h) = st.monitor.as_ref() {
+    if let Some(h) = st.monitor.running_handle() {
         let _ = h.tx.send(monitor::MonitorMsg::ConfigUpdated(Box::new(monitor_config(st))));
     }
 }
@@ -541,23 +640,28 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
     let cb = core.cb;
     let state = core.state.clone();
     let snap = {
-        let guard = state.lock().unwrap();
-        let Some(st) = guard.as_ref() else { return reply(cb, id, false, Some("not initialized".into())) };
+        let mut guard = state.lock().unwrap();
+        let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
         let Some(vault) = st.vault.as_ref() else { return reply(cb, id, false, Some("vault is locked".into())) };
-        if st.monitor.is_some() {
-            return reply(cb, id, false, Some("already monitoring".into()));
-        }
         let mut accts = Vec::new();
         for acc in &st.config.accounts {
             let Some(base_url) = st.registry.resolve(&acc.school_ref) else { continue };
             let secret = vault.get(&acc.id).unwrap_or_default();
             accts.push((acc.clone(), base_url, secret.password, secret.cookies));
         }
-        (accts, monitor_config(st))
+        let cfg = monitor_config(st);
+        st.monitor_generation = st.monitor_generation.wrapping_add(1).max(1);
+        let generation = st.monitor_generation;
+        if let Err(error) = st.monitor.begin_start(generation, id) {
+            return reply(cb, id, false, Some(error.to_string()));
+        }
+        emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "starting" }));
+        (accts, cfg, generation)
     };
-    let (accts, cfg) = snap;
+    let (accts, cfg, generation) = snap;
 
-    core.rt.spawn(async move {
+    let task_state = state.clone();
+    let task = core.rt.spawn(async move {
         let mut monitor_accounts = Vec::new();
         let mut refreshed: Vec<(String, String)> = Vec::new();
         for (meta, base_url, password, cookies) in accts {
@@ -582,10 +686,16 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                 Err(e) => emit(cb, &json!({ "id": null, "event": "AccountStatus",
                                             "account_id": meta.id, "state": "login_failed", "error": e })),
             }
+            if !monitor_start_is_current(&task_state, generation) {
+                return;
+            }
         }
 
-        if let Ok(mut guard) = state.lock() {
+        if let Ok(mut guard) = task_state.lock() {
             if let Some(st) = guard.as_mut() {
+                if !st.monitor.is_starting(generation) {
+                    return;
+                }
                 if let Some(v) = st.vault.as_mut() {
                     for (aid, ck) in &refreshed {
                         if let Some(mut sec) = v.get(aid) {
@@ -595,8 +705,11 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                     }
                 }
                 if monitor_accounts.is_empty() {
+                    st.monitor = MonitorLifecycle::Idle;
                     emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
                                       "code": "no_accounts_online", "message": "no account could authenticate" }));
+                    emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
+                    reply(cb, id, false, Some("no account could authenticate".into()));
                 } else {
                     // Fail-fast heads-up: with a monitored account but no LLM key, auto-answer can't run —
                     // say so up front instead of only after a quiz spins out 300s later. Rollcall is fine.
@@ -604,12 +717,30 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                         emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn", "code": "llm_key_missing",
                             "message": "尚未設定 LLM 金鑰：自動答題需要金鑰（設定 → 儲存金鑰）；點名不受影響。" }));
                     }
-                    st.monitor = Some(monitor::start(cb, monitor_accounts, cfg)); // start() only spawns; no await under lock
+                    let handle = monitor::start(cb, monitor_accounts, cfg); // start() only spawns; no await under lock
+                    st.monitor = MonitorLifecycle::Running(RunningMonitor { generation, handle });
+                    reply(cb, id, true, None);
                 }
             }
         }
-        reply(cb, id, true, None);
     });
+
+    if let Ok(mut guard) = state.lock() {
+        match guard.as_mut() {
+            Some(st) => st.monitor.attach_start_task(generation, task),
+            None => task.abort(),
+        }
+    } else {
+        task.abort();
+    };
+}
+
+fn monitor_start_is_current(state: &Arc<Mutex<Option<CoreState>>>, generation: u64) -> bool {
+    state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|st| st.monitor.is_starting(generation)))
+        .unwrap_or(false)
 }
 
 /// Import a supplied cookie set for an account → store in vault → verify (browser-cookie login).
@@ -708,4 +839,91 @@ fn dump_cookies(jar: &CookieStoreMutex) -> String {
     // Include session (non-persistent) cookies — the TronClass session cookie is one.
     let _ = cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut buf);
     String::from_utf8(buf).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    static TEST_EVENTS: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
+
+    extern "C" fn collect_event(ptr: *const u8, len: usize) {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        if let Ok(value) = serde_json::from_slice(bytes) {
+            TEST_EVENTS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push(value);
+        }
+    }
+
+    #[test]
+    fn monitor_lifecycle_rejects_duplicate_start_while_starting() {
+        let mut lifecycle = MonitorLifecycle::Idle;
+
+        assert!(lifecycle.begin_start(1, 101).is_ok());
+        assert_eq!(
+            lifecycle.begin_start(2, 102),
+            Err("monitor is already starting")
+        );
+        assert!(lifecycle.is_starting(1));
+    }
+
+    #[test]
+    fn cancelling_start_invalidates_stale_generation() {
+        let mut lifecycle = MonitorLifecycle::Idle;
+        lifecycle.begin_start(1, 101).unwrap();
+
+        match lifecycle.take_for_stop() {
+            StoppedMonitor::Starting(starting) => {
+                assert_eq!(starting.command_id, 101);
+                assert!(starting.task.is_none());
+            }
+            _ => panic!("starting lifecycle must be cancelled as Starting"),
+        }
+
+        lifecycle.begin_start(2, 102).unwrap();
+        assert!(!lifecycle.is_starting(1), "generation 1 completion is stale");
+        assert!(lifecycle.is_starting(2), "generation 2 remains authoritative");
+    }
+
+    #[test]
+    fn running_handle_is_removed_exactly_once() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = MonitorLifecycle::Running(RunningMonitor {
+            generation: 7,
+            handle: monitor::MonitorHandle { tx, tasks: vec![] },
+        });
+
+        assert!(lifecycle.running_handle().is_some());
+        assert!(matches!(
+            lifecycle.take_for_stop(),
+            StoppedMonitor::Running(_)
+        ));
+        assert!(matches!(
+            lifecycle.take_for_stop(),
+            StoppedMonitor::Idle
+        ));
+    }
+
+    #[test]
+    fn stopping_during_start_completes_pending_command() {
+        let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new()));
+        events.lock().unwrap().clear();
+        let mut lifecycle = MonitorLifecycle::Idle;
+        lifecycle.begin_start(1, 501).unwrap();
+
+        stop_monitor(&mut lifecycle, collect_event, "cancelled by test");
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| {
+            event["event"] == "Reply"
+                && event["id"] == 501
+                && event["ok"] == false
+                && event["error"] == "cancelled by test"
+        }));
+        assert!(matches!(lifecycle, MonitorLifecycle::Idle));
+    }
 }
