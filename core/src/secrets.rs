@@ -75,7 +75,7 @@ impl VaultFile {
         let mut salt = [0u8; SALT_LEN];
         getrandom::getrandom(&mut salt).map_err(|e| e.to_string())?;
         let vault = VaultFile { path: path.to_path_buf(), salt, key: Some(key), data: BTreeMap::new() };
-        vault.persist()?;
+        vault.persist_new()?;
         Ok(vault)
     }
 
@@ -111,8 +111,7 @@ impl VaultFile {
         Ok(VaultFile { path: path.to_path_buf(), salt, key: Some(key), data })
     }
 
-    /// Re-encrypt the whole map with a FRESH nonce and write it out. Called after every mutation.
-    fn persist(&self) -> Result<(), String> {
+    fn sealed_bytes(&self) -> Result<Vec<u8>, String> {
         let key = self.key.as_ref().ok_or("vault is locked")?;
 
         let mut nonce = [0u8; NONCE_LEN];
@@ -128,7 +127,20 @@ impl VaultFile {
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
-        std::fs::write(&self.path, out).map_err(|e| format!("write vault: {e}"))
+        Ok(out)
+    }
+
+    /// Re-encrypt the whole map with a FRESH nonce and atomically replace it. Called after every
+    /// mutation; a crash can expose either the complete old vault or the complete new vault, never a
+    /// partially truncated file.
+    fn persist(&self) -> Result<(), String> {
+        let out = self.sealed_bytes()?;
+        crate::atomic_file::replace(&self.path, &out).map_err(|e| format!("write vault: {e}"))
+    }
+
+    fn persist_new(&self) -> Result<(), String> {
+        let out = self.sealed_bytes()?;
+        crate::atomic_file::create_new(&self.path, &out).map_err(|e| format!("create vault: {e}"))
     }
 
     pub fn get(&self, account_id: &str) -> Option<AccountSecret> {
@@ -136,13 +148,27 @@ impl VaultFile {
     }
 
     pub fn set(&mut self, account_id: &str, secret: AccountSecret) -> Result<(), String> {
-        self.data.insert(account_id.to_string(), secret);
-        self.persist()
+        let account_id = account_id.to_string();
+        let previous = self.data.insert(account_id.clone(), secret);
+        if let Err(error) = self.persist() {
+            match previous {
+                Some(secret) => self.data.insert(account_id, secret),
+                None => self.data.remove(&account_id),
+            };
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn delete(&mut self, account_id: &str) -> Result<(), String> {
-        self.data.remove(account_id);
-        self.persist()
+        let Some(previous) = self.data.remove(account_id) else {
+            return Ok(());
+        };
+        if let Err(error) = self.persist() {
+            self.data.insert(account_id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(())
     }
 
     // The LLM API key rides in a reserved vault entry (never in config/logs).
@@ -172,15 +198,32 @@ impl Drop for VaultFile {
 /// just that file), NOT a full-device compromise — bind to the OS keystore (Windows DPAPI / Android
 /// Keystore) for real device-binding when that Phase-B integration lands.
 pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
-    if let Ok(bytes) = std::fs::read(key_path) {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
+    match std::fs::read(key_path) {
+        Ok(bytes) => return parse_device_key(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read device key: {error}")),
     }
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).map_err(|e| e.to_string())?;
-    std::fs::write(key_path, key).map_err(|e| format!("write device key: {e}"))?;
+    match crate::atomic_file::create_new(key_path, &key) {
+        Ok(()) => Ok(key),
+        // Another initializer won the race. Its complete key is authoritative; never replace it.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let bytes = std::fs::read(key_path).map_err(|e| format!("read raced device key: {e}"))?;
+            parse_device_key(&bytes)
+        }
+        Err(error) => Err(format!("write device key: {error}")),
+    }
+}
+
+fn parse_device_key(bytes: &[u8]) -> Result<[u8; 32], String> {
+    if bytes.len() != 32 {
+        return Err(format!(
+            "device key corrupt: expected 32 bytes, found {}",
+            bytes.len()
+        ));
+    }
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(bytes);
     Ok(key)
 }

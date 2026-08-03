@@ -5,6 +5,7 @@
 use std::ffi::c_void;
 
 mod answer;
+mod atomic_file;
 mod config;
 mod course_context;
 mod engine;

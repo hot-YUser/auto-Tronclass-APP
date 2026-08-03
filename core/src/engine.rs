@@ -112,19 +112,15 @@ impl CoreState {
 }
 
 /// Open (or first-run create) the vault with the persistent device key — auto-unlock, no master
-/// password (user decision 2026-07: "no lock password"). Returns (vault, reset): reset=true when a
-/// pre-existing vault couldn't be opened with the device key (an old password vault, or a lost
-/// device.key) and was recreated empty — the caller then tells the user to re-add accounts.
-fn open_vault_auto(dir: &std::path::Path) -> Result<(VaultFile, bool), String> {
+/// password. Only a genuinely missing vault may be created. Every failure opening an existing vault
+/// is returned without mutating either file so recovery remains possible.
+fn open_vault_auto(dir: &std::path::Path) -> Result<VaultFile, String> {
     let key = crate::secrets::load_or_create_device_key(&dir.join("device.key"))?;
     let vault_path = dir.join("vault.bin");
     if VaultFile::exists(&vault_path) {
-        match VaultFile::unlock_with_key(&vault_path, key) {
-            Ok(v) => Ok((v, false)),
-            Err(_) => VaultFile::create_with_key(&vault_path, key).map(|v| (v, true)),
-        }
+        VaultFile::unlock_with_key(&vault_path, key)
     } else {
-        VaultFile::create_with_key(&vault_path, key).map(|v| (v, false))
+        VaultFile::create_with_key(&vault_path, key)
     }
 }
 
@@ -207,12 +203,12 @@ fn handle_sync(core: &Core, cmd: Command) {
             let config = Config::load(&dir.join("config.json"));
             crate::redaction::set_level(&config.settings.log_level);
             // Auto-unlock: the vault opens with a persistent per-device key — no master password.
-            let (vault, reset) = match open_vault_auto(&dir) {
-                Ok((v, r)) => (Some(v), r),
+            let vault = match open_vault_auto(&dir) {
+                Ok(v) => Some(v),
                 Err(e) => {
                     emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
                                       "code": "vault_open_failed", "message": e }));
-                    (None, false)
+                    None
                 }
             };
             let unlocked = vault.is_some();
@@ -229,10 +225,6 @@ fn handle_sync(core: &Core, cmd: Command) {
             emit_providers(cb, st);
             emit_accounts(cb, st);
             emit_settings(cb, st);
-            if reset {
-                emit(cb, &json!({ "id": null, "event": "LogLine", "level": "warn",
-                                  "text": "先前的本機資料無法自動解鎖，已重新建立；請重新加入帳號。" }));
-            }
             emit(cb, &json!({ "id": null, "event": "VaultState", "exists": unlocked, "unlocked": unlocked }));
             emit_caps(cb);
             emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
@@ -925,5 +917,27 @@ mod tests {
                 && event["error"] == "cancelled by test"
         }));
         assert!(matches!(lifecycle, MonitorLifecycle::Idle));
+    }
+
+    #[test]
+    fn corrupt_vault_is_preserved_instead_of_recreated() {
+        let dir = std::env::temp_dir().join(format!(
+            "tron-corrupt-vault-{}",
+            crate::config::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = crate::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
+        drop(VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap());
+        let corrupt = b"existing vault evidence".to_vec();
+        std::fs::write(dir.join("vault.bin"), &corrupt).unwrap();
+
+        assert!(open_vault_auto(&dir).is_err());
+        assert_eq!(
+            std::fs::read(dir.join("vault.bin")).unwrap(),
+            corrupt,
+            "opening a corrupt vault must never replace its bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

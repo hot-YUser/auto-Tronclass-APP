@@ -3,7 +3,7 @@
 
 use crate::config::{new_id, AccountMeta, Config};
 use crate::providers::{Endpoints, Registry};
-use crate::secrets::{AccountSecret, VaultFile};
+use crate::secrets::{load_or_create_device_key, AccountSecret, VaultFile};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     // A per-test path under the OS temp dir; unique via a CSPRNG id so tests don't collide.
@@ -45,6 +45,45 @@ fn vault_never_reuses_a_nonce() {
     assert_ne!(first, second, "ciphertext differs under a fresh nonce");
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn malformed_device_key_is_never_overwritten() {
+    let path = tmp("malformed-device-key");
+    let malformed = vec![0x5a; 31];
+    std::fs::write(&path, &malformed).unwrap();
+
+    assert!(load_or_create_device_key(&path).is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        malformed,
+        "a malformed existing key is evidence to preserve, not permission to rotate it"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn failed_vault_persist_rolls_back_in_memory_mutation() {
+    let path = tmp("vault-rollback");
+    let mut vault = VaultFile::create_with_key(&path, [9_u8; 32]).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap(); // forces the atomic file replacement to fail
+
+    let result = vault.set(
+        "acc",
+        AccountSecret {
+            password: "must-roll-back".into(),
+            cookies: String::new(),
+        },
+    );
+    assert!(result.is_err());
+    assert!(
+        vault.get("acc").is_none(),
+        "memory and disk must not diverge after persistence fails"
+    );
+
+    let _ = std::fs::remove_dir(&path);
 }
 
 #[test]
