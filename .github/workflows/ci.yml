@@ -30,13 +30,12 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '11.0.100-preview.6.26359.118'
-          dotnet-quality: preview
       - name: Build Windows native core
         shell: pwsh
         run: ./build-core.ps1 -Head windows
       - name: Build Windows UI
         shell: pwsh
-        run: dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0 -c Release
+        run: dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0 -c Release -p:TargetFrameworks=net11.0-windows10.0.19041.0
       - name: Run protocol contract check
         shell: pwsh
         run: dotnet run --project checks/ProtocolContract.Check/ProtocolContract.Check.csproj -c Release
@@ -55,10 +54,9 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '11.0.100-preview.6.26359.118'
-          dotnet-quality: preview
       - name: Install MAUI Android workload
         shell: pwsh
-        run: dotnet workload install maui-android --skip-manifest-update
+        run: dotnet workload install maui-android --version 11.0.100-preview.6.26364.2 --skip-manifest-update
       - name: Install cargo-ndk
         shell: pwsh
         run: |
