@@ -104,7 +104,11 @@ pub(crate) enum MonitorMsg {
         code: String,
         message: String,
     },
-    QuizSubmitResult { key: ActivityKey, account_id: String, result: Result<String, String> },
+    QuizSubmitResult {
+        key: ActivityKey,
+        account_id: String,
+        result: Result<QuizSubmitReport, QuizSubmitFailure>,
+    },
     QuizSubmitNow { command_id: u64, activity_token: String },
     QuizHold { command_id: u64, activity_token: String },
     QuizDiscard { command_id: u64, activity_token: String },
@@ -493,43 +497,136 @@ fn exam_answerable(a: &Value, now: i64) -> bool {
     let started = field_or(a, "is_started", false);
     let closed = field_or(a, "is_closed", false);
     let in_progress = a.get("is_in_progress").and_then(Value::as_bool) != Some(false);
-    let past = end_epoch(a).map(|e| e < now).unwrap_or(false);
+    // An absent deadline preserves v1's open-ended semantics; a present but malformed deadline is
+    // unsafe to interpret and therefore fails closed.
+    let past = match end_time(a) {
+        EndTime::Absent => false,
+        EndTime::Valid(epoch) => epoch < now,
+        EndTime::Invalid => return false,
+    };
     let times = a.get("submit_times").and_then(Value::as_i64).unwrap_or(0);
     let used = a.get("submission_count").and_then(Value::as_i64).unwrap_or(0);
     let exhausted = times > 0 && used >= times;
     started && !closed && in_progress && !past && !already_submitted(a) && !exhausted
 }
 
-/// `end_time` as a UTC epoch — a real tenant sends an ISO-8601 string (v1 `_iso_before_now`); tolerate a
-/// bare integer epoch too. `None` (absent/unparseable) ⇒ the caller treats it as *not past* (never over-gate).
-fn end_epoch(a: &Value) -> Option<i64> {
-    let v = a.get("end_time")?;
-    v.as_i64().or_else(|| v.as_str().and_then(iso8601_to_epoch))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndTime {
+    Absent,
+    Valid(i64),
+    Invalid,
 }
 
-/// Parse `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]` to a UTC epoch (civil-date math; no date crate across the
-/// 4 ABIs). Lenient: missing tz → treated as UTC; anything unparseable → `None`.
+/// Classify `end_time` so absence remains distinct from a malformed present value.
+fn end_time(a: &Value) -> EndTime {
+    let Some(v) = a.get("end_time") else {
+        return EndTime::Absent;
+    };
+    // Several tenants (and the protocol fake that mirrors them) serialize an omitted optional
+    // deadline as null / an empty string. Those are absence, not malformed evidence. Any non-empty
+    // value that cannot be parsed still fails closed below.
+    if v.is_null() || v.as_str().is_some_and(|value| value.trim().is_empty()) {
+        return EndTime::Absent;
+    }
+    v.as_i64()
+        .map(EndTime::Valid)
+        .or_else(|| v.as_str().and_then(iso8601_to_epoch).map(EndTime::Valid))
+        .unwrap_or(EndTime::Invalid)
+}
+
+/// `end_time` as a UTC epoch — a real tenant sends an ISO-8601 string (v1 `_iso_before_now`); tolerate a
+/// bare integer epoch too. Invalid or absent values return `None` for callers that only need the epoch.
+#[cfg(test)]
+fn end_epoch(a: &Value) -> Option<i64> {
+    match end_time(a) {
+        EndTime::Valid(epoch) => Some(epoch),
+        EndTime::Absent | EndTime::Invalid => None,
+    }
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM|±HHMM]` to a UTC epoch (civil-date math; no date crate
+/// across the 4 ABIs). A missing timezone is retained as UTC for compatibility with existing tenants.
 fn iso8601_to_epoch(s: &str) -> Option<i64> {
     let s = s.trim();
     let (date, rest) = s.split_once(['T', ' '])?;
-    let mut d = date.split('-');
-    let (y, m, day) = (d.next()?.parse::<i64>().ok()?, d.next()?.parse::<i64>().ok()?, d.next()?.parse::<i64>().ok()?);
+    if date.len() != 10 || date.as_bytes().get(4) != Some(&b'-') || date.as_bytes().get(7) != Some(&b'-') {
+        return None;
+    }
+    if !date
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let y = date.get(0..4)?.parse::<i64>().ok()?;
+    let m = date.get(5..7)?.parse::<i64>().ok()?;
+    let day = date.get(8..10)?.parse::<i64>().ok()?;
+
     // Split the time from an optional trailing Z / ±HH:MM offset.
     let (time, off_secs) = if let Some(t) = rest.strip_suffix('Z') {
         (t, 0)
     } else if let Some(pos) = rest.rfind(['+', '-']) {
         let (t, off) = rest.split_at(pos);
         let sign = if off.starts_with('-') { -1 } else { 1 };
-        let (oh, om) = off[1..].split_once(':')?;
-        (t, sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60))
+        let offset = &off[1..];
+        let (oh, om) = if let Some((oh, om)) = offset.split_once(':') {
+            if oh.len() != 2 || om.len() != 2 {
+                return None;
+            }
+            (oh, om)
+        } else {
+            if offset.len() != 4 {
+                return None;
+            }
+            (offset.get(0..2)?, offset.get(2..4)?)
+        };
+        let oh = oh.parse::<i64>().ok()?;
+        let om = om.parse::<i64>().ok()?;
+        // ISO-8601's practical UTC-offset range is -14:00..+14:00; the boundary hour
+        // may not carry minutes (e.g. +14:01 is not a real civil offset).
+        if oh > 14 || om > 59 || (oh == 14 && om != 0) {
+            return None;
+        }
+        (t, sign * (oh * 3600 + om * 60))
     } else {
         (rest, 0)
     };
-    let mut tp = time.split(':');
-    let hh = tp.next()?.parse::<i64>().ok()?;
-    let mm = tp.next()?.parse::<i64>().ok()?;
-    let ss = tp.next().unwrap_or("0").split('.').next()?.parse::<i64>().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+
+    let clock = match time.split_once('.') {
+        Some((clock, fraction)) if !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit()) => {
+            clock
+        }
+        Some(_) => return None,
+        None => time,
+    };
+    let clock = clock.as_bytes();
+    if clock.len() != 8 || clock[2] != b':' || clock[5] != b':' {
+        return None;
+    }
+    if !clock
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| index == 2 || index == 5 || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let hh = std::str::from_utf8(&clock[0..2]).ok()?.parse::<i64>().ok()?;
+    let mm = std::str::from_utf8(&clock[3..5]).ok()?.parse::<i64>().ok()?;
+    let ss = std::str::from_utf8(&clock[6..8]).ok()?.parse::<i64>().ok()?;
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days_in_month = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if day < 1 || day > days_in_month {
         return None;
     }
     // days_from_civil (Howard Hinnant): days since 1970-01-01.
@@ -1172,6 +1269,9 @@ struct PerAccountAttempt {
     existing_answers: Map<String, Answer>,
     overrides: Map<String, Answer>,
     conflicts: HashSet<String>,
+    /// Classroom exams submit one subject per request. Preserve confirmed successes so a retry
+    /// never resends subjects that the server already accepted.
+    submitted_subjects: HashSet<String>,
 }
 
 impl PerAccountAttempt {
@@ -1188,8 +1288,20 @@ impl PerAccountAttempt {
             existing_answers: Map::new(),
             overrides: Map::new(),
             conflicts: HashSet::new(),
+            submitted_subjects: HashSet::new(),
         }
     }
+}
+
+pub(crate) struct QuizSubmitReport {
+    detail: String,
+    completed_subjects: Vec<String>,
+    warning: Option<String>,
+}
+
+pub(crate) struct QuizSubmitFailure {
+    error: String,
+    completed_subjects: Vec<String>,
 }
 
 pub(crate) struct PreparedAttempt {
@@ -1592,12 +1704,13 @@ fn dispatch_quiz_submits(
             attempt.instance_id.clone(),
             attempt.subjects.clone(),
             answers,
+            attempt.submitted_subjects.clone(),
         ));
     }
     for account_id in ready_ids {
         q.attempts.get_mut(&account_id).expect("ready attempt exists").state = AttemptState::Submitting;
     }
-    for (account, instance_id, subjects, answers) in jobs {
+    for (account, instance_id, subjects, answers, submitted_subjects) in jobs {
         spawn_quiz_submit(
             account,
             source,
@@ -1605,6 +1718,7 @@ fn dispatch_quiz_submits(
             instance_id,
             subjects,
             answers,
+            submitted_subjects,
             resubmit,
             tx.clone(),
             key.clone(),
@@ -1613,20 +1727,33 @@ fn dispatch_quiz_submits(
     Ok(())
 }
 
-fn on_quiz_submit_result(quizzes: &mut HashMap<ActivityKey, QuizActivity>, cb: EventCb, key: ActivityKey, account_id: String, result: Result<String, String>) {
+fn on_quiz_submit_result(
+    quizzes: &mut HashMap<ActivityKey, QuizActivity>,
+    cb: EventCb,
+    key: ActivityKey,
+    account_id: String,
+    result: Result<QuizSubmitReport, QuizSubmitFailure>,
+) {
     let Some(q) = quizzes.get_mut(&key) else { return };
     let Some(attempt) = q.attempts.get_mut(&account_id) else { return };
     match result {
-        Ok(detail) => {
+        Ok(report) => {
+            attempt.submitted_subjects.extend(report.completed_subjects);
             attempt.state = AttemptState::Submitted;
             emit(cb, &json!({ "id": null, "event": "QuizSubmitted", "quiz_id": q.activity_id,
-                "activity_token": q.activity_token, "account_id": account_id, "result": detail }));
+                "activity_token": q.activity_token, "account_id": account_id, "result": report.detail }));
+            if let Some(warning) = report.warning {
+                emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
+                    "code": "quiz_correction_failed", "activity_token": q.activity_token,
+                    "account_id": account_id, "message": warning }));
+            }
         }
-        Err(e) => {
+        Err(failure) => {
+            attempt.submitted_subjects.extend(failure.completed_subjects);
             attempt.state = AttemptState::Ready;
             emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
                 "code": "quiz_submit_failed", "activity_token": q.activity_token,
-                "account_id": account_id, "message": format!("{account_id}: {e}") }));
+                "account_id": account_id, "message": format!("{account_id}: {}", failure.error) }));
         }
     }
 }
@@ -1811,31 +1938,62 @@ fn compatible_prior(prior: Option<&PriorAnswers>, contract: &[Value]) -> Map<Str
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, instance_id: String, subjects: Vec<Value>, answers: Map<String, Answer>, resubmit: bool, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
+fn spawn_quiz_submit(
+    acc: Arc<Account>,
+    source: Source,
+    activity_id: String,
+    instance_id: String,
+    subjects: Vec<Value>,
+    answers: Map<String, Answer>,
+    submitted_subjects: HashSet<String>,
+    resubmit: bool,
+    tx: UnboundedSender<MonitorMsg>,
+    key: ActivityKey,
+) {
     tokio::spawn(async move {
         let ep = Endpoints::derive(&acc.base_url);
-        let result: Result<String, String> = match source {
+        let result: Result<QuizSubmitReport, QuizSubmitFailure> = match source {
             Source::Exam => match answer::submit_exam(&acc.client, &ep, &activity_id, &instance_id, &answers, &subjects).await {
                 Ok((sid, retake)) => {
                     // resubmit gate: EXAM + pref + the SUBMIT RESPONSE's allow_retake_exam + a submission
                     // id (v1 answer_flow.py:456) — a single-attempt exam must not burn its one graded attempt.
                     if resubmit && retake && !sid.is_empty() {
-                        match answer::resubmit_correct(&acc.client, &ep, &activity_id, &sid, &answers, &subjects).await {
-                            Ok(()) => Ok(format!("submitted {sid}; corrected resubmit completed")),
-                            Err(error) => Err(format!("initial submit {sid} succeeded; correction pass failed: {error}")),
-                        }
+                        let correction = answer::resubmit_correct(
+                            &acc.client,
+                            &ep,
+                            &activity_id,
+                            &sid,
+                            &answers,
+                            &subjects,
+                        )
+                        .await;
+                        // The graded initial submit is already committed. A correction failure is
+                        // visible but terminal; retrying the initial paper could burn another attempt.
+                        Ok(finalize_exam_submit(&sid, correction))
                     } else {
-                        Ok(format!("submitted {sid}"))
+                        Ok(submit_report(format!("submitted {sid}")))
                     }
                 }
-                Err(e) => Err(e),
+                Err(error) => Err(submit_failure(error)),
             },
             Source::ClassroomExam => {
                 // per-subject POST with the full exam wrapper (flat body → 400). ponytail: v1 also gates
                 // on the server's started_subjects_count≥1 (R2.5); here each answered subject is posted.
-                submit_classroom(&acc, &ep, &activity_id, &instance_id, &subjects, &answers)
+                submit_classroom(
+                    &acc,
+                    &ep,
+                    &activity_id,
+                    &instance_id,
+                    &subjects,
+                    &answers,
+                    &submitted_subjects,
+                )
                     .await
-                    .map(|_| "submitted (classroom)".into())
+                    .map(|completed_subjects| QuizSubmitReport {
+                        detail: "submitted (classroom)".into(),
+                        completed_subjects,
+                        warning: None,
+                    })
             }
             Source::Questionnaire => {
                 // exam wrapper (NOT courseware), to the questionnaire endpoint.
@@ -1843,26 +2001,66 @@ fn spawn_quiz_submit(acc: Arc<Account>, source: Source, activity_id: String, ins
                     .iter()
                     .filter_map(|s| answers.get(&crate::quiz::subject_id(s)).map(|a| answer::exam_subject_entry(s, a)))
                     .collect();
-                post_json(&acc.client, &ep.questionnaire_submissions(&activity_id), &answer::questionnaire_body(&instance_id, &entries)).await.map(|_| "submitted (questionnaire)".into())
+                post_json(&acc.client, &ep.questionnaire_submissions(&activity_id), &answer::questionnaire_body(&instance_id, &entries)).await
+                    .map(|_| submit_report("submitted (questionnaire)"))
+                    .map_err(submit_failure)
             }
             Source::Vote => {
                 let letters: Vec<String> = answers.values().flat_map(vote_letters).collect();
-                post_json(&acc.client, &ep.vote_cast(&activity_id), &answer::vote_body(&letters)).await.map(|_| "voted".into())
+                post_json(&acc.client, &ep.vote_cast(&activity_id), &answer::vote_body(&letters)).await
+                    .map(|_| submit_report("voted"))
+                    .map_err(submit_failure)
             }
             Source::CoursewareQuiz => {
                 let items = source_items(&subjects, &answers);
-                post_json(&acc.client, &ep.courseware_submissions(&activity_id), &answer::courseware_body(&items)).await.map(|_| "submitted (courseware)".into())
+                post_json(&acc.client, &ep.courseware_submissions(&activity_id), &answer::courseware_body(&items)).await
+                    .map(|_| submit_report("submitted (courseware)"))
+                    .map_err(submit_failure)
             }
             Source::Homework => {
                 let text = answers.values().filter_map(answer_text).collect::<Vec<_>>().join("\n");
-                post_json(&acc.client, &ep.homework_submissions(&activity_id), &answer::homework_body(&text)).await.map(|_| "submitted (homework)".into())
+                post_json(&acc.client, &ep.homework_submissions(&activity_id), &answer::homework_body(&text)).await
+                    .map(|_| submit_report("submitted (homework)"))
+                    .map_err(submit_failure)
             }
         };
         tx.send(MonitorMsg::QuizSubmitResult { key, account_id: acc.id.clone(), result }).ok();
     });
 }
 
+fn submit_report(detail: impl Into<String>) -> QuizSubmitReport {
+    QuizSubmitReport {
+        detail: detail.into(),
+        completed_subjects: Vec::new(),
+        warning: None,
+    }
+}
+
+fn finalize_exam_submit(sid: &str, correction: Result<(), String>) -> QuizSubmitReport {
+    match correction {
+        Ok(()) => submit_report(format!("submitted {sid}; corrected resubmit completed")),
+        Err(error) => QuizSubmitReport {
+            detail: format!("submitted {sid}"),
+            completed_subjects: Vec::new(),
+            warning: Some(format!(
+                "initial submit {sid} succeeded; correction pass failed: {error}"
+            )),
+        },
+    }
+}
+
+fn submit_failure(error: impl Into<String>) -> QuizSubmitFailure {
+    QuizSubmitFailure {
+        error: error.into(),
+        completed_subjects: Vec::new(),
+    }
+}
+
 fn emit_quiz_prepared(cb: EventCb, q: &QuizActivity) {
+    emit(cb, &quiz_prepared_event(q));
+}
+
+fn quiz_prepared_event(q: &QuizActivity) -> Value {
     let per_account: Vec<Value> = q
         .attempts
         .iter()
@@ -1925,11 +2123,11 @@ fn emit_quiz_prepared(cb: EventCb, q: &QuizActivity) {
         })
         .collect();
     let conflict_count: usize = q.attempts.values().map(|attempt| attempt.conflicts.len()).sum();
-    emit(cb, &json!({ "id": null, "event": "QuizPrepared", "schema_version": 1,
+    json!({ "id": null, "event": "QuizPrepared", "schema_version": 1,
         "activity_token": q.activity_token, "quiz_id": q.activity_id,
         "activity": { "external_id": q.activity_id, "source": q.source.as_str(),
             "course_id": q.course_id, "course": q.course },
-        "course": q.course, "per_account": per_account, "conflict_count": conflict_count }));
+        "course": q.course, "per_account": per_account, "conflict_count": conflict_count })
 }
 
 fn subject_stem(subject: &Value) -> &str {
@@ -1968,9 +2166,7 @@ async fn get_json(client: &Client, url: &str) -> Result<Value, String> {
     crate::http::json_checked(client.get(url), "fetch activity").await
 }
 async fn post_json(client: &Client, url: &str, body: &Value) -> Result<(), String> {
-    crate::http::send_checked(client.post(url).json(body), "submit activity")
-        .await
-        .map(|_| ())
+    crate::http::mutation_checked(client.post(url).json(body), "submit activity").await
 }
 
 async fn submit_classroom(
@@ -1980,29 +2176,41 @@ async fn submit_classroom(
     instance_id: &str,
     subjects: &[Value],
     answers: &Map<String, Answer>,
-) -> Result<(), String> {
-    let mut submitted = 0_usize;
+    already_submitted: &HashSet<String>,
+) -> Result<Vec<String>, QuizSubmitFailure> {
+    let mut completed = Vec::new();
+    let mut answered = 0_usize;
     for subject in subjects {
         let subject_id = crate::quiz::subject_id(subject);
         let Some(answer) = answers.get(&subject_id) else {
             continue;
         };
+        answered += 1;
+        if already_submitted.contains(&subject_id) {
+            continue;
+        }
         let body = answer::classroom_body(instance_id, subject, answer);
         let operation = format!("submit classroom subject {subject_id}");
-        crate::http::send_checked(
+        if let Err(error) = crate::http::mutation_checked(
             account
                 .client
                 .post(endpoints.classroom_submit(activity_id, &subject_id))
                 .json(&body),
             &operation,
         )
-        .await?;
-        submitted += 1;
+        .await
+        {
+            return Err(QuizSubmitFailure {
+                error,
+                completed_subjects: completed,
+            });
+        }
+        completed.push(subject_id);
     }
-    if submitted == 0 {
-        return Err("submit classroom: no answered subjects".to_string());
+    if answered == 0 {
+        return Err(submit_failure("submit classroom: no answered subjects"));
     }
-    Ok(())
+    Ok(completed)
 }
 fn extract_array(v: &Value, key: &str) -> Vec<Value> {
     v.get(key).and_then(Value::as_array).or_else(|| v.as_array()).cloned().unwrap_or_default()
@@ -2051,11 +2259,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn production_quiz_prepared_emitter_matches_v1_contract() {
+        let fixture: Value = serde_json::from_str(include_str!("../../protocol/fixtures/quiz_prepared_v1.json"))
+            .expect("valid shared fixture");
+        let fixture_attempt = &fixture["per_account"][0];
+        let subjects = fixture_attempt["questions"]
+            .as_array()
+            .expect("fixture questions")
+            .iter()
+            .map(|question| {
+                json!({
+                    "id": question["subject_id"],
+                    "parent_id": question["parent_id"],
+                    "type": question["type"],
+                    "answer_type": question["answer_type"],
+                    "description": question["stem"],
+                    "options": question["options"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let generated_answers = fixture_attempt["questions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|question| {
+                let id = question["subject_id"].as_str().unwrap().to_string();
+                let answer = serde_json::from_value::<AnswerWire>(question["answer"].clone())
+                    .unwrap()
+                    .into_answer()
+                    .unwrap();
+                (id, answer)
+            })
+            .collect();
+        let existing_answers = fixture_attempt["questions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|question| {
+                serde_json::from_value::<AnswerWire>(question["existing_answer"].clone())
+                    .ok()
+                    .and_then(|wire| wire.into_answer().ok())
+                    .map(|answer| (question["subject_id"].as_str().unwrap().to_string(), answer))
+            })
+            .collect();
+        let mut attempts = HashMap::new();
+        attempts.insert(
+            "a1".to_string(),
+            PerAccountAttempt {
+                state: AttemptState::Ready,
+                prepare_generation: 1,
+                prepare_at: Instant::now(),
+                prepare_deadline: None,
+                answer_contract: None,
+                instance_id: "attempt-a1".to_string(),
+                subjects,
+                generated_answers,
+                existing_answers,
+                overrides: Map::new(),
+                conflicts: HashSet::from(["1".to_string()]),
+                submitted_subjects: HashSet::new(),
+            },
+        );
+        let activity = QuizActivity {
+            activity_token: "fixture-quiz-prepared-v1".to_string(),
+            source: Source::Exam,
+            course: "行銷管理".to_string(),
+            course_id: "55379".to_string(),
+            activity_id: "32877".to_string(),
+            stem: String::new(),
+            attempts,
+            countdown_deadline: None,
+            held: false,
+            discarded: false,
+        };
+        let emitted = quiz_prepared_event(&activity);
+        for field in ["event", "schema_version", "activity_token", "quiz_id", "activity", "course"] {
+            assert_eq!(emitted.get(field), fixture.get(field), "field {field}");
+        }
+        assert_eq!(emitted["conflict_count"], 1);
+        let emitted_account = &emitted["per_account"][0];
+        assert_eq!(emitted_account["account_id"], fixture_attempt["account_id"]);
+        assert_eq!(emitted_account["instance_id"], fixture_attempt["instance_id"]);
+        assert_eq!(emitted_account["questions"], fixture_attempt["questions"]);
+    }
+
+    #[test]
     fn iso8601_epoch_parses_z_offset_and_int() {
         // 2021-01-01T00:00:00Z = 1609459200.
         assert_eq!(iso8601_to_epoch("2021-01-01T00:00:00Z"), Some(1_609_459_200));
         // same instant expressed as +08:00 local (08:00 local == 00:00 UTC).
         assert_eq!(iso8601_to_epoch("2021-01-01T08:00:00+08:00"), Some(1_609_459_200));
+        // The compact ISO-8601 offset form denotes the same instant.
+        assert_eq!(iso8601_to_epoch("2021-01-01T08:00:00+0800"), Some(1_609_459_200));
         // fractional seconds + space separator tolerated.
         assert_eq!(iso8601_to_epoch("2021-01-01 00:00:00.500Z"), Some(1_609_459_200));
         assert_eq!(iso8601_to_epoch("not-a-date"), None);
@@ -2063,6 +2358,25 @@ mod tests {
         assert_eq!(end_epoch(&json!({"end_time": 1_609_459_200_i64})), Some(1_609_459_200));
         assert_eq!(end_epoch(&json!({"end_time": "2021-01-01T00:00:00Z"})), Some(1_609_459_200));
         assert_eq!(end_epoch(&json!({})), None);
+        assert_eq!(end_time(&json!({})), EndTime::Absent);
+        assert_eq!(end_time(&json!({"end_time": null})), EndTime::Absent);
+        assert_eq!(end_time(&json!({"end_time": "  "})), EndTime::Absent);
+        assert_eq!(end_time(&json!({"end_time": "not-a-date"})), EndTime::Invalid);
+    }
+
+    #[test]
+    fn iso8601_rejects_impossible_dates_times_and_offsets() {
+        assert!(iso8601_to_epoch("2024-02-29T00:00:00Z").is_some());
+        assert_eq!(iso8601_to_epoch("2023-02-29T00:00:00Z"), None);
+        assert_eq!(iso8601_to_epoch("2024-04-31T00:00:00Z"), None);
+        assert_eq!(iso8601_to_epoch("2024-01-01T24:00:00Z"), None);
+        assert_eq!(iso8601_to_epoch("2024-01-01T23:60:00Z"), None);
+        assert_eq!(iso8601_to_epoch("2024-01-01T23:59:60Z"), None);
+        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+24:00"), None);
+        assert!(iso8601_to_epoch("2024-01-01T00:00:00+14:00").is_some());
+        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+14:01"), None);
+        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+2360"), None);
+        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+08:60"), None);
     }
 
     #[test]
@@ -2076,6 +2390,15 @@ mod tests {
         assert!(!exam_answerable(&json!({"end_time": "2099-01-01T00:00:00Z"}), now));
         // absent end_time → not past → answerable.
         assert!(exam_answerable(&json!({"is_started": true}), now));
+        // A present but malformed deadline must fail closed; it must not be treated like absence.
+        assert!(!exam_answerable(
+            &json!({"is_started": true, "end_time": "2023-02-29T00:00:00Z"}),
+            now
+        ));
+        assert!(!exam_answerable(
+            &json!({"is_started": true, "end_time": "2024-01-01T24:00:00+0800"}),
+            now
+        ));
     }
 
     extern "C" fn noop_cb(_: *const u8, _: usize) {}
@@ -2122,6 +2445,7 @@ mod tests {
             existing_answers: Map::from([("subj1".to_string(), Answer::Text("old".to_string()))]),
             overrides: Map::new(),
             conflicts: HashSet::from(["subj1".to_string()]),
+            submitted_subjects: HashSet::new(),
         };
         let q = QuizActivity {
             activity_token: "token1".to_string(),
@@ -2313,11 +2637,88 @@ mod tests {
             existing_answers: Map::new(),
             overrides: Map::new(),
             conflicts: HashSet::new(),
+            submitted_subjects: HashSet::new(),
         });
 
         on_quiz_prepare_gone(&mut quizzes, &cfg_countdown(15), key.clone(), "acc2".to_string(), 3);
 
         assert_eq!(quizzes[&key].attempts["acc2"].state, AttemptState::Gone);
         assert!(quizzes[&key].countdown_deadline.is_some());
+    }
+
+    #[test]
+    fn failed_classroom_submit_retains_completed_subjects_for_retry() {
+        let (mut quizzes, key) = quiz_with_conflict();
+        let attempt = quizzes.get_mut(&key).unwrap().attempts.get_mut("acc1").unwrap();
+        attempt.conflicts.clear();
+        attempt.state = AttemptState::Submitting;
+
+        on_quiz_submit_result(
+            &mut quizzes,
+            noop_cb,
+            key.clone(),
+            "acc1".to_string(),
+            Err(QuizSubmitFailure {
+                error: "second subject failed".to_string(),
+                completed_subjects: vec!["subj1".to_string()],
+            }),
+        );
+
+        let attempt = &quizzes[&key].attempts["acc1"];
+        assert_eq!(attempt.state, AttemptState::Ready);
+        assert_eq!(attempt.submitted_subjects, HashSet::from(["subj1".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn classroom_retry_skips_every_subject_already_confirmed_by_the_server() {
+        let account = Account {
+            id: "acc1".to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher: false,
+            course_id: None,
+            base_url: "http://127.0.0.1:1".to_string(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        };
+        let endpoints = Endpoints::derive(&account.base_url);
+        let subjects = vec![
+            json!({"id": "s1", "type": "short_answer"}),
+            json!({"id": "s2", "type": "short_answer"}),
+        ];
+        let answers = Map::from([
+            ("s1".to_string(), Answer::Text("a".to_string())),
+            ("s2".to_string(), Answer::Text("b".to_string())),
+        ]);
+        let already_submitted = HashSet::from(["s1".to_string(), "s2".to_string()]);
+
+        let completed = match submit_classroom(
+            &account,
+            &endpoints,
+            "quiz",
+            "instance",
+            &subjects,
+            &answers,
+            &already_submitted,
+        )
+        .await
+        {
+            Ok(completed) => completed,
+            Err(failure) => panic!("unexpected retry failure: {}", failure.error),
+        };
+
+        // Port 1 is deliberately unreachable: success proves the retry did not resend either
+        // server-confirmed mutation.
+        assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn correction_failure_is_terminal_after_the_initial_exam_submit_commits() {
+        let report = finalize_exam_submit("submission-1", Err("review unavailable".to_string()));
+        assert_eq!(report.detail, "submitted submission-1");
+        assert!(report.warning.as_deref().is_some_and(|warning| {
+            warning.contains("review unavailable") && warning.contains("initial submit")
+        }));
     }
 }

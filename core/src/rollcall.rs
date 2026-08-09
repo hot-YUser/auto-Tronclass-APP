@@ -267,6 +267,26 @@ pub fn response_auth_lost(status: u16, url: &reqwest::Url, body: &str) -> bool {
     classify_response(status, body) == CodeResult::Fatal || response_url_is_login(url)
 }
 
+/// Every mutating sign request must prove HTTP success before a roster recheck can confirm this
+/// attempt. Otherwise a pre-existing present row could turn an HTTP 400/500 into a false success.
+fn validate_sign_response(
+    operation: &str,
+    status: u16,
+    url: &reqwest::Url,
+    body: &str,
+) -> Result<(), String> {
+    if response_auth_lost(status, url, body) {
+        return Err(format!("{operation}: {SESSION_INVALID}"));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("{operation}: HTTP {status}"));
+    }
+    if crate::http::explicit_business_error(body) {
+        return Err(format!("{operation}: server rejected the request"));
+    }
+    Ok(())
+}
+
 /// Does a sign error signal a lost session (→ re-login + re-sign)? Keyed on the shared `SESSION_INVALID`.
 pub fn is_auth_lost(err: &str) -> bool {
     err.contains(SESSION_INVALID)
@@ -389,9 +409,7 @@ pub async fn sign_radar(
                 // Session lost mid-sign → abort with the shared marker so the monitor re-logins + re-signs.
                 let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
                 let body = resp.text().await.unwrap_or_default();
-                if response_auth_lost(status, &rurl, &body) {
-                    return Err(format!("radar: {SESSION_INVALID}"));
-                }
+                validate_sign_response("radar", status, &rurl, &body)?;
                 if recheck_on_call_fine(client, ep, id, user_no).await {
                     return Ok(SignOutcome { method: "radar(empty)".into(), ..Default::default() });
                 }
@@ -567,9 +585,7 @@ pub async fn sign_self_registration(client: &Client, ep: &Endpoints, id: &str, u
         .map_err(|e| format!("self_registration: {e}"))?;
     let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
     let body = resp.text().await.unwrap_or_default();
-    if response_auth_lost(status, &rurl, &body) {
-        return Err(format!("self_registration: {SESSION_INVALID}"));
-    }
+    validate_sign_response("self_registration", status, &rurl, &body)?;
     if recheck_on_call_fine(client, ep, id, user_no).await {
         Ok(SignOutcome { method: "self_registration".into(), ..Default::default() })
     } else {
@@ -588,12 +604,15 @@ pub async fn sign_qr_with_teacher_data(
     data: &str,
     user_no: &str,
 ) -> Result<SignOutcome, String> {
-    student
+    let resp = student
         .put(ep.answer_qr(student_rollcall_id))
         .json(&json!({ "deviceId": device_id, "data": data }))
         .send()
         .await
         .map_err(|e| format!("qr: {e}"))?;
+    let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
+    let body = resp.text().await.unwrap_or_default();
+    validate_sign_response("qr", status, &rurl, &body)?;
     if recheck_on_call_fine(student, ep, student_rollcall_id, user_no).await {
         Ok(SignOutcome { method: "qr(teacher-assist)".into(), ..Default::default() })
     } else {
@@ -622,6 +641,28 @@ pub async fn teacher_source_qr_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutating_sign_response_rejects_non_success_before_roster_recheck() {
+        let answer = reqwest::Url::parse("https://tenant.example/api/rollcalls/1/answer").unwrap();
+        let login = reqwest::Url::parse("https://tenant.example/login").unwrap();
+        assert!(validate_sign_response("radar", 204, &answer, "").is_ok());
+        assert!(validate_sign_response("radar", 200, &answer, r#"{"success":false}"#)
+            .unwrap_err()
+            .contains("server rejected"));
+        assert!(validate_sign_response("qr", 200, &answer, r#"{"error_code":"qr_invalid"}"#)
+            .unwrap_err()
+            .contains("server rejected"));
+        assert!(validate_sign_response("radar", 400, &answer, r#"{"ok":false}"#)
+            .unwrap_err()
+            .contains("HTTP 400"));
+        assert!(validate_sign_response("qr", 500, &answer, "server error")
+            .unwrap_err()
+            .contains("HTTP 500"));
+        assert!(validate_sign_response("self_registration", 200, &login, "")
+            .unwrap_err()
+            .contains(SESSION_INVALID));
+    }
 
     #[test]
     fn number_code_read_from_every_observed_shape() {

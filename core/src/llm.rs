@@ -1,7 +1,8 @@
-//! LLM client (docs 31). Default NVIDIA NIM + a `minimax` reasoning model. Reasoning is always on
-//! (`chat_template_kwargs`), an explicit `max_tokens` is always sent (reasoning models return empty
-//! `choices` without it), reasoning is streamed as `ReasoningChunk` events, and only the **clean
-//! final answer** is returned. The API key comes from the vault and never enters a log.
+//! LLM client (docs 31). OpenAI-compatible endpoints use the standard request shape by default;
+//! the NVIDIA NIM reasoning extensions are sent only for the explicitly recognised NIM endpoint.
+//! Reasoning is streamed as `ReasoningChunk` events when a provider returns the optional
+//! `reasoning_content` field, and only the **clean final answer** is returned. The API key comes
+//! from the vault and never enters a log.
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -55,6 +56,89 @@ If the question relies on material you were not given (a passage, figure, datase
 
 const TOP_K: u32 = 40;
 
+/// Provider-specific request capabilities. OpenAI-compatible endpoints are deliberately the
+/// conservative default: unknown vendor fields can make an otherwise compatible API reject the
+/// request instead of ignoring it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderCapabilities {
+    top_k: Option<u32>,
+    thinking_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LlmProvider {
+    OpenAiCompatible,
+    NvidiaNim,
+}
+
+impl LlmProvider {
+    fn for_endpoint(endpoint: &str) -> Self {
+        // NVIDIA's hosted NIM endpoint is the only endpoint we can identify without an explicit
+        // provider setting. A path such as `/v1/chat/completions` is intentionally not enough:
+        // it is shared by virtually every OpenAI-compatible server.
+        let endpoint = endpoint.trim().to_ascii_lowercase();
+        let authority = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&endpoint)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
+        let host = authority
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('.');
+        if host == "integrate.api.nvidia.com" {
+            Self::NvidiaNim
+        } else {
+            Self::OpenAiCompatible
+        }
+    }
+
+    fn capabilities(self) -> ProviderCapabilities {
+        match self {
+            Self::OpenAiCompatible => ProviderCapabilities {
+                top_k: None,
+                thinking_mode: false,
+            },
+            Self::NvidiaNim => ProviderCapabilities {
+                top_k: (TOP_K > 0).then_some(TOP_K),
+                thinking_mode: true,
+            },
+        }
+    }
+}
+
+/// Build every chat-completions request in one place so streaming and tool rounds cannot drift.
+/// `tools` controls only the standard tool-calling fields; provider capabilities are applied to
+/// both request modes uniformly.
+fn build_request_body(cfg: &LlmConfig, messages: &[Value], stream: bool, tools: bool) -> Value {
+    let capabilities = LlmProvider::for_endpoint(&cfg.endpoint).capabilities();
+    let mut body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "max_tokens": resolve_max_tokens(cfg.max_tokens),
+        "stream": stream,
+    });
+    if let Some(top_k) = capabilities.top_k {
+        body["top_k"] = json!(top_k);
+    }
+    if capabilities.thinking_mode {
+        body["chat_template_kwargs"] = json!({ "thinking_mode": "enabled" });
+    }
+    if tools {
+        body["tools"] = json!([crate::course_context::tool_spec()]);
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
 /// Answer one question given the non-system `messages` (the user question, plus assistant+correction
 /// turns on a re-ask). Prepends the system prompt. Returns the clean answer text, or `None` on
 /// failure/empty (caller must then skip the subject — never blank). With `tools` set, runs the
@@ -90,19 +174,7 @@ async fn stream_answer(
     activity_token: &str,
     subject_id: &str,
 ) -> Option<String> {
-    let mut body = json!({
-        "model": cfg.model,
-        "messages": full,
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "max_tokens": resolve_max_tokens(cfg.max_tokens), // else HTTP 200 with empty choices
-        "stream": true,
-        // reasoning on — the VALUE is the string "enabled" (a wrong key → HTTP 200 + empty choices).
-        "chat_template_kwargs": { "thinking_mode": "enabled" }
-    });
-    if TOP_K > 0 {
-        body["top_k"] = json!(TOP_K);
-    }
+    let body = build_request_body(cfg, &full, true, false);
 
     let mut resp = client
         .post(&cfg.endpoint)
@@ -123,19 +195,24 @@ async fn stream_answer(
         while let Some(nl) = pending.find('\n') {
             let line: String = pending.drain(..=nl).collect();
             let line = line.trim();
-            let Some(data) = line.strip_prefix("data:") else { continue };
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
             let data = data.trim();
             if data == "[DONE]" {
                 break;
             }
-            let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
             let delta = &v["choices"][0]["delta"];
-            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
-                if !r.is_empty() {
-                    emit(cb, &json!({ "id": null, "event": "ReasoningChunk",
-                                      "activity_token": activity_token,
-                                      "subject_id": subject_id, "text": r }));
-                }
+            if let Some(r) = reasoning_content(delta) {
+                emit(
+                    cb,
+                    &json!({ "id": null, "event": "ReasoningChunk",
+                                  "activity_token": activity_token,
+                                  "subject_id": subject_id, "text": r }),
+                );
             }
             if let Some(c) = delta.get("content").and_then(Value::as_str) {
                 content.push_str(c);
@@ -165,35 +242,33 @@ async fn tool_loop(
 ) -> Option<String> {
     let mut fallback = String::new();
     for _ in 0..ctx.max_iterations + 2 {
-        let mut body = json!({
-            "model": cfg.model,
-            "messages": messages,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": resolve_max_tokens(cfg.max_tokens),
-            "stream": false,
-            "chat_template_kwargs": { "thinking_mode": "enabled" },
-            "tools": [crate::course_context::tool_spec()],
-            "tool_choice": "auto"
-        });
-        if TOP_K > 0 {
-            body["top_k"] = json!(TOP_K);
-        }
-        let resp = match client.post(&cfg.endpoint).bearer_auth(&cfg.api_key).json(&body).send().await {
+        let body = build_request_body(cfg, &messages, false, true);
+        let resp = match client
+            .post(&cfg.endpoint)
+            .bearer_auth(&cfg.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => r,
             _ => return clean_or(&fallback),
         };
-        let Ok(v) = resp.json::<Value>().await else { return clean_or(&fallback) };
+        let Ok(v) = resp.json::<Value>().await else {
+            return clean_or(&fallback);
+        };
         let msg = &v["choices"][0]["message"];
 
-        if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
-            if !r.is_empty() {
-                emit(cb, &json!({ "id": null, "event": "ReasoningChunk",
-                                  "activity_token": activity_token,
-                                  "subject_id": subject_id, "text": r }));
-            }
+        if let Some(r) = reasoning_content(msg) {
+            emit(
+                cb,
+                &json!({ "id": null, "event": "ReasoningChunk",
+                              "activity_token": activity_token,
+                              "subject_id": subject_id, "text": r }),
+            );
         }
-        let content = strip_think(msg.get("content").and_then(Value::as_str).unwrap_or("")).trim().to_string();
+        let content = strip_think(msg.get("content").and_then(Value::as_str).unwrap_or(""))
+            .trim()
+            .to_string();
         if !content.is_empty() {
             fallback = content.clone();
         }
@@ -204,13 +279,28 @@ async fn tool_loop(
                 messages.push(json!({ "role": "assistant", "content": msg.get("content").cloned().unwrap_or(Value::Null), "tool_calls": calls }));
                 for call in calls {
                     let id = call.get("id").and_then(Value::as_str).unwrap_or("");
-                    let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-                    let args = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
+                    let name = call
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let args = call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}");
                     let result = if name == "search_course_materials" {
-                        let query = serde_json::from_str::<Value>(args).ok()
-                            .and_then(|a| a.get("query").and_then(Value::as_str).map(str::to_string))
+                        let query = serde_json::from_str::<Value>(args)
+                            .ok()
+                            .and_then(|a| {
+                                a.get("query").and_then(Value::as_str).map(str::to_string)
+                            })
                             .unwrap_or_default();
-                        crate::course_context::search_course_materials(client, ctx.base_url, ctx.course_id, &query).await
+                        crate::course_context::search_course_materials(
+                            client,
+                            ctx.base_url,
+                            ctx.course_id,
+                            &query,
+                        )
+                        .await
                     } else {
                         String::new()
                     };
@@ -230,6 +320,15 @@ fn clean_or(fallback: &str) -> Option<String> {
     (!fallback.is_empty()).then(|| fallback.to_string())
 }
 
+/// Reasoning is optional across OpenAI-compatible APIs. Ignore missing, null, non-string, and
+/// empty values so providers that omit the extension still produce a normal final answer.
+fn reasoning_content(value: &Value) -> Option<&str> {
+    value
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
 /// Strip reasoning wrappers (both `<think>` and minimax's `<mm:think>`): every CLOSED block is removed —
 /// tolerating opening-tag attributes like `<think signature="…">` and multiple blocks; an UNCLOSED
 /// opener means the model was truncated mid-reasoning → drop from the opener onward (return whatever
@@ -243,7 +342,10 @@ fn strip_think(s: &str) -> String {
             // Only a real tag: the prefix must be followed by `>`, `/`, or whitespace (attributes) —
             // not a longer word like `<thinking>` in the actual answer.
             let after = &out[a + open_prefix.len()..];
-            if !(after.starts_with('>') || after.starts_with('/') || after.starts_with(char::is_whitespace)) {
+            if !(after.starts_with('>')
+                || after.starts_with('/')
+                || after.starts_with(char::is_whitespace))
+            {
                 from = a + open_prefix.len();
                 continue;
             }
@@ -270,7 +372,71 @@ fn strip_think(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_think;
+    use super::{build_request_body, strip_think, LlmConfig};
+    use serde_json::json;
+
+    fn config(endpoint: &str) -> LlmConfig {
+        LlmConfig {
+            endpoint: endpoint.to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            max_tokens: 100,
+            enable_tools: false,
+            max_tool_iterations: 0,
+        }
+    }
+
+    #[test]
+    fn generic_openai_body_omits_nim_fields() {
+        let cfg = config("https://api.openai.com/v1/chat/completions");
+        let body = build_request_body(
+            &cfg,
+            &[json!({"role": "user", "content": "hello"})],
+            true,
+            false,
+        );
+        assert_eq!(body["stream"], true);
+        assert!(body.get("top_k").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("tools").is_none());
+
+        let tool_body = build_request_body(&cfg, &[], false, true);
+        assert!(tool_body.get("top_k").is_none());
+        assert!(tool_body.get("chat_template_kwargs").is_none());
+        assert!(tool_body["tools"].is_array());
+    }
+
+    #[test]
+    fn nvidia_nim_body_adds_vendor_fields() {
+        let body = build_request_body(
+            &config("https://integrate.api.nvidia.com/v1/chat/completions"),
+            &[],
+            false,
+            true,
+        );
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["top_k"], 40);
+        assert_eq!(body["chat_template_kwargs"]["thinking_mode"], "enabled");
+        assert!(body["tools"].is_array());
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn request_builder_keeps_stream_and_tools_consistent() {
+        let cfg = config("https://integrate.api.nvidia.com/v1/chat/completions");
+        let stream = build_request_body(&cfg, &[], true, false);
+        let tools = build_request_body(&cfg, &[], false, true);
+        assert_eq!(stream["stream"], true);
+        assert_eq!(tools["stream"], false);
+        assert_eq!(stream["top_k"], tools["top_k"]);
+        assert_eq!(
+            stream["chat_template_kwargs"],
+            tools["chat_template_kwargs"]
+        );
+        assert!(stream.get("tools").is_none());
+        assert!(tools["tools"].is_array());
+        assert_eq!(tools["tool_choice"], "auto");
+    }
 
     #[test]
     fn strip_think_closed_unclosed_and_mm() {
@@ -284,6 +450,9 @@ mod tests {
         // multiple closed blocks → all removed.
         assert_eq!(strip_think("<think>a</think>X<think>b</think>Y"), "XY");
         // `<think`-prefixed word that isn't a tag is left alone.
-        assert_eq!(strip_think("the answer is <thinking>"), "the answer is <thinking>");
+        assert_eq!(
+            strip_think("the answer is <thinking>"),
+            "the answer is <thinking>"
+        );
     }
 }

@@ -114,8 +114,8 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     (hz, dave)
 }
 
-/// The LLM request must carry `chat_template_kwargs.thinking_mode == "enabled"` (string) and a system
-/// message — else a reasoning model returns HTTP 200 + empty choices ("m3 returns nothing").
+/// An unknown OpenAI-compatible endpoint receives only standard fields. NVIDIA-only tuning must not
+/// leak into a generic provider request; the system prompt remains the first message.
 #[test]
 fn llm_request_body_contract() {
     let _g = SEQ.lock().unwrap();
@@ -126,7 +126,8 @@ fn llm_request_body_contract() {
     post(&base, "/_test/open_quiz", quiz);
     assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["account_id"].as_str() == Some(&dave), 25).is_some());
     let req = get_json(&base, "/_test/last_llm_request");
-    assert_eq!(req["chat_template_kwargs"]["thinking_mode"], "enabled", "thinking_mode must be the string \"enabled\", got {req}");
+    assert!(req.get("chat_template_kwargs").is_none(), "generic endpoint received NVIDIA thinking_mode: {req}");
+    assert!(req.get("top_k").is_none(), "generic endpoint received NVIDIA top_k: {req}");
     assert_eq!(req["messages"][0]["role"], "system", "first message must be the system prompt");
     drop(hz);
 }
