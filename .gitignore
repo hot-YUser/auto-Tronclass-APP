@@ -4,6 +4,8 @@
 
 # .NET
 [Bb]in/
+!/core/src/bin/
+!/core/src/bin/*.rs
 [Oo]bj/
 /ui/AppPackages/
 
