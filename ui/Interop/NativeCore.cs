@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -17,8 +18,11 @@ public sealed class NativeCore : ICore
     private static NativeCore? _self; // the instance the native callback routes events to
     private static unsafe void* _handle;
     private static long _nextId;
-    private static int _booted;
+    private static readonly object BootGate = new();
+    private static Task? _bootTask;
     private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<JsonElement>> Pending = new();
+    private static readonly ConcurrentQueue<JsonElement> EventQueue = new();
+    private static int _eventDrainScheduled;
 
     public event Action<JsonElement>? EventReceived;
 
@@ -28,14 +32,48 @@ public sealed class NativeCore : ICore
     public JsonElement? LastVaultState { get; private set; }
     public JsonElement? LastNextClass { get; private set; }
 
-    public NativeCore() => _self = this;
+    public NativeCore()
+    {
+        var existing = Interlocked.CompareExchange(ref _self, this, null);
+        if (existing is not null && !ReferenceEquals(existing, this))
+            throw new InvalidOperationException("NativeCore 每個程序只能建立一個實例。");
+    }
 
     /// <summary>Start the core and load state from <paramref name="dataDir"/> — exactly once.</summary>
-    public async Task BootAsync(string dataDir)
+    public Task BootAsync(string dataDir)
     {
-        if (Interlocked.Exchange(ref _booted, 1) == 1) return;
-        Start();
-        await SendAsync("Init", ("data_dir", dataDir));
+        lock (BootGate) return _bootTask ??= BootCoreAsync(dataDir);
+    }
+
+    private async Task BootCoreAsync(string dataDir)
+    {
+        byte[]? deviceKey = null;
+        try
+        {
+            // Android Keystore may involve secure hardware and must not block the UI thread.
+            deviceKey = await Task.Run(() => DeviceKeyProvider.LoadOrCreate(dataDir));
+            Start();
+            var reply = await SendAsync(
+                "Init",
+                ("data_dir", dataDir),
+                ("device_key_b64", Convert.ToBase64String(deviceKey)));
+            if (reply.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False)
+            {
+                var error = reply.TryGetProperty("error", out var value) ? value.GetString() : null;
+                throw new InvalidOperationException(error ?? "核心初始化失敗。");
+            }
+        }
+        catch
+        {
+            // A transient keystore/core error may be retried; callers racing the first boot still
+            // observe this same Task rather than returning early from a half-initialized process.
+            lock (BootGate) _bootTask = null;
+            throw;
+        }
+        finally
+        {
+            if (deviceKey is not null) CryptographicOperations.ZeroMemory(deviceKey);
+        }
     }
 
     private unsafe void Start()
@@ -53,12 +91,21 @@ public sealed class NativeCore : ICore
     public async Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
     {
         var id = (ulong)Interlocked.Increment(ref _nextId);
+        if (!HasNativeHandle()) return CoreUnavailableReply(id, cmd);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = tcs;
 
         var dict = new Dictionary<string, object?> { ["id"] = id, ["cmd"] = cmd };
         foreach (var (k, v) in fields) dict[k] = v;
-        Send(JsonSerializer.Serialize(dict));
+        try
+        {
+            Send(JsonSerializer.Serialize(dict));
+        }
+        catch
+        {
+            Pending.TryRemove(id, out _);
+            throw;
+        }
 
         using var cts = new CancellationTokenSource(CommandTimeout);
         using var reg = cts.Token.Register(() =>
@@ -77,19 +124,51 @@ public sealed class NativeCore : ICore
         error = $"命令逾時：核心未在 {CommandTimeout.TotalSeconds:0} 秒內回覆（{cmd}）",
     });
 
+    private static JsonElement CoreUnavailableReply(ulong id, string cmd) => JsonSerializer.SerializeToElement(new
+    {
+        id,
+        @event = "Reply",
+        ok = false,
+        error = $"核心尚未完成啟動，無法執行 {cmd}。",
+    });
+
+    private static unsafe bool HasNativeHandle() => _handle != null;
+
     private unsafe void Send(string json)
     {
         var bytes = Encoding.UTF8.GetBytes(json);
-        fixed (byte* p = bytes)
+        try
         {
-            NativeMethods.core_send(_handle, p, (nuint)bytes.Length);
+            fixed (byte* p = bytes)
+            {
+                NativeMethods.core_send(_handle, p, (nuint)bytes.Length);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(bytes);
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static unsafe void OnEvent(byte* ptr, nuint len)
     {
-        var json = Encoding.UTF8.GetString(new ReadOnlySpan<byte>(ptr, (int)len));
+        // No managed exception may cross an UnmanagedCallersOnly ABI boundary. With the Rust core's
+        // panic=abort profile that would be a process-level failure, not a recoverable UI error.
+        try
+        {
+            ProcessEvent(new ReadOnlySpan<byte>(ptr, checked((int)len)));
+        }
+        catch (Exception error)
+        {
+            try { System.Diagnostics.Debug.WriteLine($"Native callback 已隔離 {error.GetType().Name}"); }
+            catch { /* the ABI boundary itself must remain no-throw */ }
+        }
+    }
+
+    private static void ProcessEvent(ReadOnlySpan<byte> bytes)
+    {
+        var json = Encoding.UTF8.GetString(bytes);
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
@@ -114,6 +193,41 @@ public sealed class NativeCore : ICore
                 case "NextClass": self.LastNextClass = clone; break;
             }
         }
-        self.EventReceived?.Invoke(clone);
+        // Never invoke managed subscribers while Rust may still hold its state mutex. Queue all
+        // unsolicited events onto one FIFO drain: preserves event order and makes callback reentry safe.
+        EventQueue.Enqueue(clone);
+        ScheduleEventDrain();
+    }
+
+    private static void ScheduleEventDrain()
+    {
+        if (Interlocked.CompareExchange(ref _eventDrainScheduled, 1, 0) != 0) return;
+        ThreadPool.QueueUserWorkItem(static _ => DrainEvents());
+    }
+
+    private static void DrainEvents()
+    {
+        try
+        {
+            while (EventQueue.TryDequeue(out var coreEvent))
+            {
+                var subscribers = _self?.EventReceived;
+                if (subscribers is null) continue;
+                foreach (Action<JsonElement> subscriber in subscribers.GetInvocationList())
+                {
+                    try { subscriber(coreEvent); }
+                    catch (Exception error)
+                    {
+                        try { System.Diagnostics.Debug.WriteLine($"Core event subscriber 已隔離 {error.GetType().Name}"); }
+                        catch { }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _eventDrainScheduled, 0);
+            if (!EventQueue.IsEmpty) ScheduleEventDrain();
+        }
     }
 }

@@ -47,13 +47,42 @@ impl std::fmt::Display for Secret {
     }
 }
 
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// Per-account secret blob. This is what callers store; the vault encrypts the whole map.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AccountSecret {
     pub password: String,
     /// Serialized cookie-store JSON for session restore (empty until first login).
     #[serde(default)]
     pub cookies: String,
+}
+
+impl AccountSecret {
+    /// Transfer ownership without leaving an additional copy for Drop to wipe.
+    pub fn into_parts(mut self) -> (String, String) {
+        (std::mem::take(&mut self.password), std::mem::take(&mut self.cookies))
+    }
+}
+
+impl std::fmt::Debug for AccountSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountSecret")
+            .field("password", &"***")
+            .field("cookies", &"***")
+            .finish()
+    }
+}
+
+impl Drop for AccountSecret {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.cookies.zeroize();
+    }
 }
 
 pub struct VaultFile {
@@ -71,9 +100,12 @@ impl VaultFile {
     /// Create a brand-new empty vault encrypted under a raw 32-byte key — the auto-unlock path (a
     /// device key, no master password / Argon2). The salt is vestigial for a raw-key vault but kept
     /// so the on-disk layout (salt||nonce||ct) is identical to a password vault.
-    pub fn create_with_key(path: &Path, key: [u8; 32]) -> Result<VaultFile, String> {
+    pub fn create_with_key(path: &Path, mut key: [u8; 32]) -> Result<VaultFile, String> {
         let mut salt = [0u8; SALT_LEN];
-        getrandom::getrandom(&mut salt).map_err(|e| e.to_string())?;
+        if let Err(error) = getrandom::getrandom(&mut salt) {
+            key.zeroize();
+            return Err(error.to_string());
+        }
         let vault = VaultFile { path: path.to_path_buf(), salt, key: Some(key), data: BTreeMap::new() };
         vault.persist_new()?;
         Ok(vault)
@@ -82,8 +114,16 @@ impl VaultFile {
     /// Unlock using the raw 32-byte device key. A wrong key fails the AEAD authentication tag → clean
     /// error, no partial read.
     pub fn unlock_with_key(path: &Path, key: [u8; 32]) -> Result<VaultFile, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("read vault: {e}"))?;
+        let mut key = key;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                key.zeroize();
+                return Err(format!("read vault: {error}"));
+            }
+        };
         if bytes.len() < SALT_LEN + NONCE_LEN {
+            key.zeroize();
             return Err("vault file corrupt".into());
         }
         let mut salt = [0u8; SALT_LEN];
@@ -98,16 +138,28 @@ impl VaultFile {
     fn open_with_key(
         path: &Path,
         salt: [u8; SALT_LEN],
-        key: [u8; 32],
+        mut key: [u8; 32],
         nonce: &[u8],
         ciphertext: &[u8],
         err: &str,
     ) -> Result<VaultFile, String> {
         let cipher = XChaCha20Poly1305::new((&key).into());
-        let plaintext = cipher
-            .decrypt(XNonce::from_slice(nonce), ciphertext)
-            .map_err(|_| err.to_string())?;
-        let data = serde_json::from_slice(&plaintext).map_err(|e| e.to_string())?;
+        let mut plaintext = match cipher.decrypt(XNonce::from_slice(nonce), ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                key.zeroize();
+                return Err(err.to_string());
+            }
+        };
+        let data = match serde_json::from_slice(&plaintext) {
+            Ok(data) => data,
+            Err(error) => {
+                plaintext.zeroize();
+                key.zeroize();
+                return Err(error.to_string());
+            }
+        };
+        plaintext.zeroize();
         Ok(VaultFile { path: path.to_path_buf(), salt, key: Some(key), data })
     }
 
@@ -117,11 +169,11 @@ impl VaultFile {
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?; // fresh, every write
 
-        let plaintext = serde_json::to_vec(&self.data).map_err(|e| e.to_string())?;
+        let mut plaintext = serde_json::to_vec(&self.data).map_err(|e| e.to_string())?;
         let cipher = XChaCha20Poly1305::new(key.into());
-        let ciphertext = cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
-            .map_err(|e| e.to_string())?;
+        let ciphertext_result = cipher.encrypt(XNonce::from_slice(&nonce), plaintext.as_ref());
+        plaintext.zeroize();
+        let ciphertext = ciphertext_result.map_err(|e| e.to_string())?;
 
         let mut out = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
         out.extend_from_slice(&self.salt);
@@ -176,7 +228,10 @@ impl VaultFile {
         self.set(LLM_KEY_ID, AccountSecret { password: key, cookies: String::new() })
     }
     pub fn get_llm_key(&self) -> Option<String> {
-        self.get(LLM_KEY_ID).map(|s| s.password).filter(|k| !k.is_empty())
+        self.data
+            .get(LLM_KEY_ID)
+            .map(|secret| secret.password.clone())
+            .filter(|key| !key.is_empty())
     }
 
     pub fn lock(&mut self) {
@@ -192,14 +247,16 @@ impl Drop for VaultFile {
     }
 }
 
-/// Load the persistent 32-byte device key from `key_path`, generating + storing it on first run.
-/// This is what makes the vault auto-unlock with no master password: the key lives beside the vault.
-/// ponytail: a keyfile next to the vault protects a stolen vault.bin alone (a stray backup/sync of
-/// just that file), NOT a full-device compromise — bind to the OS keystore (Windows DPAPI / Android
-/// Keystore) for real device-binding when that Phase-B integration lands.
+/// Headless/test compatibility path: load a persistent 32-byte device key from `key_path`,
+/// generating + storing it on first run. Production GUI hosts supply the same raw key in memory
+/// after recovering it through Windows DPAPI or Android Keystore and never call this function.
 pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
     match std::fs::read(key_path) {
-        Ok(bytes) => return parse_device_key(&bytes),
+        Ok(mut bytes) => {
+            let result = parse_device_key(&bytes);
+            bytes.zeroize();
+            return result;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("read device key: {error}")),
     }
@@ -209,10 +266,17 @@ pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
         Ok(()) => Ok(key),
         // Another initializer won the race. Its complete key is authoritative; never replace it.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let bytes = std::fs::read(key_path).map_err(|e| format!("read raced device key: {e}"))?;
-            parse_device_key(&bytes)
+            key.zeroize();
+            let mut bytes = std::fs::read(key_path)
+                .map_err(|e| format!("read raced device key: {e}"))?;
+            let result = parse_device_key(&bytes);
+            bytes.zeroize();
+            result
         }
-        Err(error) => Err(format!("write device key: {error}")),
+        Err(error) => {
+            key.zeroize();
+            Err(format!("write device key: {error}"))
+        }
     }
 }
 
@@ -226,4 +290,89 @@ fn parse_device_key(bytes: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0_u8; 32];
     key.copy_from_slice(bytes);
     Ok(key)
+}
+
+/// Decode the one exact standard-Base64 shape used by a 32-byte host key. Keeping this decoder
+/// deliberately narrow avoids another direct dependency and rejects alternate/non-canonical forms
+/// at the FFI trust boundary.
+pub fn decode_device_key_base64(encoded: &str) -> Result<[u8; 32], String> {
+    let input = encoded.as_bytes();
+    if input.len() != 44 || input[43] != b'=' || input[..43].contains(&b'=') {
+        return Err("device key must be canonical base64 for exactly 32 bytes".into());
+    }
+
+    fn sextet(value: u8) -> Option<u8> {
+        match value {
+            b'A'..=b'Z' => Some(value - b'A'),
+            b'a'..=b'z' => Some(value - b'a' + 26),
+            b'0'..=b'9' => Some(value - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut key = [0_u8; 32];
+    let result = (|| {
+        let mut output = 0;
+        for (index, chunk) in input.chunks_exact(4).enumerate() {
+            let a = sextet(chunk[0]).ok_or("device key contains invalid base64")?;
+            let b = sextet(chunk[1]).ok_or("device key contains invalid base64")?;
+            let c = sextet(chunk[2]).ok_or("device key contains invalid base64")?;
+            key[output] = (a << 2) | (b >> 4);
+            key[output + 1] = (b << 4) | (c >> 2);
+            output += 2;
+
+            if index < 10 {
+                let d = sextet(chunk[3]).ok_or("device key contains invalid base64")?;
+                key[output] = (c << 6) | d;
+                output += 1;
+            } else if c & 0b11 != 0 {
+                return Err("device key base64 is not canonical".to_string());
+            }
+        }
+        debug_assert_eq!(output, key.len());
+        Ok(())
+    })();
+    if let Err(error) = result {
+        key.zeroize();
+        return Err(error);
+    }
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_strict_32_byte_device_key_base64() {
+        let decoded = decode_device_key_base64(
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        )
+        .unwrap();
+        assert_eq!(decoded, std::array::from_fn::<_, 32, _>(|index| index as u8));
+
+        for malformed in [
+            "",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh==",
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh!=",
+        ] {
+            assert!(decode_device_key_base64(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn secret_debug_output_never_contains_plaintext() {
+        let secret = Secret::new("super-secret-password");
+        let account = AccountSecret {
+            password: "account-password".into(),
+            cookies: "session-cookie".into(),
+        };
+        let output = format!("{secret:?} {account:?}");
+        assert!(!output.contains("super-secret-password"));
+        assert!(!output.contains("account-password"));
+        assert!(!output.contains("session-cookie"));
+    }
 }

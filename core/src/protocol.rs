@@ -71,7 +71,14 @@ impl AnswerWire {
 pub enum Command {
     /// Load registry + config from `data_dir`; the vault auto-unlocks with the device key here, then
     /// emit Providers/Accounts/VaultState/Caps.
-    Init { id: u64, data_dir: String },
+    Init {
+        id: u64,
+        data_dir: String,
+        /// UI hosts pass a raw vault key recovered through DPAPI / Android Keystore. None retains
+        /// the headless/test compatibility path that owns `device.key` itself.
+        #[serde(default)]
+        device_key_b64: Option<String>,
+    },
     /// Idempotent no-ops: the vault auto-unlocks at Init (no master password). Kept for wire back-compat.
     CreateVault { id: u64 },
     Unlock { id: u64 },
@@ -195,6 +202,21 @@ mod tests {
         assert!(AnswerWire::Options { option_ids: vec![] }
             .into_answer()
             .is_err());
+    }
+
+    #[test]
+    fn init_accepts_an_os_protected_device_key_from_the_host() {
+        let command: Command = serde_json::from_str(
+            r#"{"id":1,"cmd":"Init","data_dir":"data","device_key_b64":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::Init {
+                device_key_b64: Some(key),
+                ..
+            } if key.ends_with('=')
+        ));
     }
 
     #[test]

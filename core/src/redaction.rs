@@ -21,6 +21,7 @@ const SENSITIVE_KEYS: &[&str] = &[
     "cookies_json",
     "api_key",
     "llm_key",
+    "device_key_b64",
     "authorization",
     "secret",
 ];

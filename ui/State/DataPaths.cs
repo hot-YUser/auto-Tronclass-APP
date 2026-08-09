@@ -1,10 +1,12 @@
 namespace Ui;
 
 /// <summary>
-/// 決定核心資料（config.json / vault.bin / device.key / providers.json）落在哪 —— 全 App 唯一決策點。
+/// 決定核心資料（config.json / vault.bin / OS-protected device.key.os / providers.json）落在哪
+/// —— 全 App 唯一決策點。
 ///
 /// Windows 有兩種形態，由 <c>Ui.exe</c> 旁的 <c>.portable</c> 標記檔決定：
-///   • 有標記（免安裝 zip）→ 寫在 exe 旁的 <c>Data\</c>，刪掉整個資料夾即零系統殘留 ＝ <b>真 portable</b>。
+///   • 有標記（免安裝 zip）→ 寫在 exe 旁的 <c>Data\</c>；vault key 仍由目前 Windows
+///     使用者的 DPAPI 綁定，因此資料目錄不可跨使用者／裝置解密。
 ///   • 無標記（Inno 安裝版／開發跑）→ <c>%LOCALAPPDATA%\AutoTronclass\Data</c>（自算路徑，避開 MAUI
 ///     <c>FileSystem.AppDataDirectory</c> 在未設 Publisher 時產生的裸 "User Name" 資料夾）。
 /// 其餘平台（Android/iOS）一律走平台沙盒 <c>FileSystem.AppDataDirectory</c>，不更動。

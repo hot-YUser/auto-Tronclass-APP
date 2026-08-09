@@ -115,8 +115,14 @@ impl CoreState {
 /// Open (or first-run create) the vault with the persistent device key — auto-unlock, no master
 /// password. Only a genuinely missing vault may be created. Every failure opening an existing vault
 /// is returned without mutating either file so recovery remains possible.
-fn open_vault_auto(dir: &std::path::Path) -> Result<VaultFile, String> {
-    let key = crate::secrets::load_or_create_device_key(&dir.join("device.key"))?;
+fn open_vault_auto(
+    dir: &std::path::Path,
+    host_key: Option<[u8; 32]>,
+) -> Result<VaultFile, String> {
+    let key = match host_key {
+        Some(key) => key,
+        None => crate::secrets::load_or_create_device_key(&dir.join("device.key"))?,
+    };
     let vault_path = dir.join("vault.bin");
     if VaultFile::exists(&vault_path) {
         VaultFile::unlock_with_key(&vault_path, key)
@@ -221,7 +227,11 @@ fn handle_sync(core: &Core, cmd: Command) {
     let mut guard = core.state.lock().unwrap();
 
     match cmd {
-        Command::Init { data_dir, .. } => {
+        Command::Init {
+            data_dir,
+            mut device_key_b64,
+            ..
+        } => {
             let dir = PathBuf::from(&data_dir);
             let _ = std::fs::create_dir_all(&dir);
             let registry = Registry::load_or_seed(&dir.join("providers.json"));
@@ -242,13 +252,25 @@ fn handle_sync(core: &Core, cmd: Command) {
                 }
             };
             crate::redaction::set_level(&config.settings.log_level);
-            // Auto-unlock: the vault opens with a persistent per-device key — no master password.
-            let mut vault = match open_vault_auto(&dir) {
-                Ok(v) => Some(v),
+            // GUI hosts recover the vault key through their OS keystore and pass it only in memory.
+            // Headless tests may omit it and retain the legacy keyfile path.
+            let vault_result = (|| {
+                let host_key = device_key_b64
+                    .as_deref()
+                    .map(crate::secrets::decode_device_key_base64)
+                    .transpose()?;
+                open_vault_auto(&dir, host_key)
+            })();
+            if let Some(encoded) = device_key_b64.as_mut() {
+                use zeroize::Zeroize;
+                encoded.zeroize();
+            }
+            let (mut vault, vault_error) = match vault_result {
+                Ok(v) => (Some(v), None),
                 Err(e) => {
                     emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
                                       "code": "vault_open_failed", "message": e }));
-                    None
+                    (None, Some(e))
                 }
             };
             if config_healthy {
@@ -279,7 +301,7 @@ fn handle_sync(core: &Core, cmd: Command) {
             emit(cb, &json!({ "id": null, "event": "VaultState", "exists": unlocked, "unlocked": unlocked }));
             emit_caps(cb);
             emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
-            reply(cb, id, true, None);
+            reply(cb, id, vault_error.is_none(), vault_error);
         }
 
         // The vault auto-unlocks with the device key at Init (no master password), so CreateVault and
@@ -620,7 +642,8 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
             return reply(cb, id, false, Some(format!("unknown school: {}", acc.school_ref)));
         };
         let secret = vault.get(&account_id).unwrap_or_default();
-        (base_url, acc.username.clone(), secret.password, secret.cookies)
+        let (password, cookies) = secret.into_parts();
+        (base_url, acc.username.clone(), password, cookies)
     };
     let (base_url, username, password, cached_cookies) = snap;
 
@@ -763,7 +786,8 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
         for acc in &st.config.accounts {
             let Some(base_url) = st.registry.resolve(&acc.school_ref) else { continue };
             let secret = vault.get(&acc.id).unwrap_or_default();
-            accts.push((acc.clone(), base_url, secret.password, secret.cookies));
+            let (password, cookies) = secret.into_parts();
+            accts.push((acc.clone(), base_url, password, cookies));
         }
         let cfg = monitor_config(st);
         st.monitor_generation = st.monitor_generation.wrapping_add(1).max(1);
@@ -873,7 +897,8 @@ fn spawn_import_cookies(core: &Core, id: u64, account_id: String, cookies_json: 
         let Some(vault) = st.vault.as_ref() else { return reply(cb, id, false, Some("vault is locked".into())) };
         let Some(acc) = st.config.account(&account_id) else { return reply(cb, id, false, Some("no such account".into())) };
         let Some(base_url) = st.registry.resolve(&acc.school_ref) else { return reply(cb, id, false, Some("unknown school".into())) };
-        (base_url, vault.get(&account_id).unwrap_or_default().password)
+        let (password, _) = vault.get(&account_id).unwrap_or_default().into_parts();
+        (base_url, password)
     };
     let (base_url, password) = snap;
 
@@ -919,14 +944,19 @@ fn emit_accounts(cb: EventCb, st: &CoreState) {
 }
 
 fn emit_caps(cb: EventCb) {
+    emit(cb, &caps_payload());
+}
+
+fn caps_payload() -> Value {
     // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false. QR teacher-assist IS implemented
     // (monitor::spawn_qr_teacher_assist) — the build supports it; it just needs a teacher account added.
-    emit(cb, &json!({ "id": null, "event": "Caps", "caps": {
+    json!({ "id": null, "event": "Caps", "caps": {
         "background_monitoring": true,
-        "self_update": true,
+        // No updater exists in this repository; never advertise a capability the product cannot run.
+        "self_update": false,
         "qr_teacher_assist": true,
         "ocr_captcha": false
-    }}));
+    }})
 }
 
 /// The current user-facing settings, so a Settings screen reflects what is actually saved (not just
@@ -1004,6 +1034,13 @@ mod tests {
     }
 
     #[test]
+    fn caps_never_advertise_an_unimplemented_self_updater() {
+        let caps = caps_payload();
+        assert_eq!(caps["caps"]["self_update"], false);
+        assert_eq!(caps["caps"]["background_monitoring"], true);
+    }
+
+    #[test]
     fn cancelling_start_invalidates_stale_generation() {
         let mut lifecycle = MonitorLifecycle::Idle;
         lifecycle.begin_start(1, 101).unwrap();
@@ -1071,13 +1108,58 @@ mod tests {
         let corrupt = b"existing vault evidence".to_vec();
         std::fs::write(dir.join("vault.bin"), &corrupt).unwrap();
 
-        assert!(open_vault_auto(&dir).is_err());
+        assert!(open_vault_auto(&dir, None).is_err());
         assert_eq!(
             std::fs::read(dir.join("vault.bin")).unwrap(),
             corrupt,
             "opening a corrupt vault must never replace its bytes"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn supplied_os_key_never_creates_a_plaintext_device_key_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tron-os-key-vault-{}",
+            crate::config::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = std::array::from_fn::<_, 32, _>(|index| index as u8);
+
+        drop(open_vault_auto(&dir, Some(key)).unwrap());
+        assert!(!dir.join("device.key").exists());
+        drop(open_vault_auto(&dir, Some(key)).unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_os_key_fails_init_instead_of_reporting_boot_success() {
+        const COMMAND_ID: u64 = 9_223_372_036_854_700_001;
+        let dir = std::env::temp_dir().join(format!(
+            "tron-invalid-os-key-init-{}",
+            crate::config::new_id()
+        ));
+        let core = init(collect_event);
+        send(
+            &core,
+            format!(
+                r#"{{"id":{COMMAND_ID},"cmd":"Init","data_dir":{},"device_key_b64":"invalid"}}"#,
+                serde_json::to_string(&dir).unwrap()
+            )
+            .as_bytes(),
+        );
+
+        let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+        assert!(events.iter().any(|event| {
+            event["event"] == "Reply"
+                && event["id"] == COMMAND_ID
+                && event["ok"] == false
+                && event["error"].as_str().is_some_and(|error| error.contains("device key"))
+        }));
+        assert!(!dir.join("device.key").exists());
+        drop(events);
         let _ = std::fs::remove_dir_all(dir);
     }
 
