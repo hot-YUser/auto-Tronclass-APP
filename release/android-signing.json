@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "certificateSha256": "50F019154AFDFA4CB464339CF7F6D62DD603FAA68136E97FF01E8D7C09FD2CF7",
+  "subject": "CN=Auto TronClass, OU=Dev, O=hot-YUser, C=TW",
+  "note": "公開憑證指紋，不含私鑰；更新簽章金鑰時必須以獨立 commit 更新。"
+}
