@@ -371,10 +371,14 @@ public sealed record AnswerWire
         var kind = kindElement.GetString() ?? "";
         return kind switch
         {
-            "options" => new AnswerWire { Kind = kind, OptionIds = StringArray(element, "option_ids") },
-            "blanks" => new AnswerWire { Kind = kind, Values = StringArray(element, "values") },
-            "text" => new AnswerWire { Kind = kind, Value = String(element, "value") },
-            "vote" => new AnswerWire { Kind = kind, Letters = StringArray(element, "letters") },
+            "options" when NonEmptyStringArray(element, "option_ids") is { } values =>
+                new AnswerWire { Kind = kind, OptionIds = values },
+            "blanks" when NonEmptyStringArray(element, "values") is { } values =>
+                new AnswerWire { Kind = kind, Values = values },
+            "text" when NonEmptyString(element, "value") is { } value =>
+                new AnswerWire { Kind = kind, Value = value },
+            "vote" when NonEmptyStringArray(element, "letters") is { } values =>
+                new AnswerWire { Kind = kind, Letters = values },
             _ => null,
         };
     }
@@ -398,17 +402,23 @@ public sealed record AnswerWire
     static string[] SplitList(string input) =>
         input.Split([',', '，', ' ', '\t', '\r', '\n'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 
-    static string[] StringArray(JsonElement element, string property) =>
-        element.TryGetProperty(property, out var values) && values.ValueKind == JsonValueKind.Array
-            ? values.EnumerateArray()
-                .Where(value => value.ValueKind == JsonValueKind.String)
-                .Select(value => value.GetString() ?? "")
-                .Where(value => value.Length > 0)
-                .ToArray()
-            : [];
+    static string[]? NonEmptyStringArray(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var values) || values.ValueKind != JsonValueKind.Array)
+            return null;
+        var parsed = new List<string>();
+        foreach (var value in values.EnumerateArray())
+        {
+            if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString()))
+                return null;
+            parsed.Add(value.GetString()!);
+        }
+        return parsed.Count > 0 ? parsed.ToArray() : null;
+    }
 
-    static string? String(JsonElement element, string property) =>
-        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+    static string? NonEmptyString(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String &&
+        !string.IsNullOrWhiteSpace(value.GetString())
             ? value.GetString()
             : null;
 }

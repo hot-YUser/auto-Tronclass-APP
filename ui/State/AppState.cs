@@ -12,6 +12,7 @@ public sealed class AppState : ObservableObject
 {
     readonly ICore _core;
     readonly Dictionary<(string ActivityToken, string SubjectId), string> _pendingReasoning = [];
+    bool _bootReady;
 
     public AppState(ICore core)
     {
@@ -19,7 +20,23 @@ public sealed class AppState : ObservableObject
         core.EventReceived += e => MainThread.BeginInvokeOnMainThread(() => Route(e));
     }
 
-    public Task BootAsync() => _core.BootAsync(DataPaths.Resolve());
+    public async Task BootAsync()
+    {
+        try
+        {
+            await _core.BootAsync(DataPaths.Resolve());
+            _bootReady = true;
+            Raise(nameof(CanToggleMonitoring));
+        }
+        catch (Exception error)
+        {
+            _bootReady = false;
+            MonitoringServiceLifetime.Stop();
+            MonitorState = "idle";
+            AddLog("error", $"初始化失敗：{error.Message}");
+            Toast?.Invoke("error", $"初始化失敗：{error.Message}");
+        }
+    }
 
     // ---------------- 標量 ----------------
 
@@ -27,13 +44,23 @@ public sealed class AppState : ObservableObject
     public string MonitorState
     {
         get => _monitorState;
-        private set { if (Set(ref _monitorState, value)) { Raise(nameof(IsMonitoring)); Raise(nameof(MonitorStateText)); } }
+        private set
+        {
+            if (Set(ref _monitorState, value))
+            {
+                Raise(nameof(IsMonitoring));
+                Raise(nameof(MonitorStateText));
+                Raise(nameof(CanToggleMonitoring));
+            }
+        }
     }
     public bool IsMonitoring => MonitorState == "monitoring";
+    public bool CanToggleMonitoring => _bootReady && MonitorState is not ("starting" or "stopping");
     public string MonitorStateText => MonitorState switch
     {
         "monitoring" => "監控中",
         "starting" => "啟動中",
+        "stopping" => "停止中",
         "login_failed" => "登入失敗",
         "offline" => "離線",
         _ => "閒置",
@@ -280,63 +307,45 @@ public sealed class AppState : ObservableObject
 
     void OnQuizPrepared(JsonElement e)
     {
-        if (Int(e, "schema_version") != 1)
+        if (!QuizPreparedContract.TryParse(e, out var prepared, out var contractError))
         {
-            ContractError("QuizPrepared schema_version 不受支援");
+            ContractError(contractError);
             return;
         }
-        var activityToken = Str(e, "activity_token");
-        if (string.IsNullOrWhiteSpace(activityToken))
-        {
-            ContractError("QuizPrepared 缺少 activity_token");
-            return;
-        }
-        var id = Str(e, "quiz_id") ?? "";
+        var activityToken = prepared.ActivityToken;
+        var id = prepared.QuizId;
         var vm = FindQuiz(activityToken);
         var announce = vm is null;
         if (vm is null) Quizzes.Insert(0, vm = new QuizVm { ActivityToken = activityToken, Id = id });
-        vm.Course = Str(e, "course") ?? vm.Course;
+        vm.Course = prepared.Course;
         // conflict_count 只作參考;送出閘門由逐題 QuestionVm.Conflict 推導(見 QuizVm.AnyConflict)
         var seenAccounts = new HashSet<string>();
-        if (e.TryGetProperty("per_account", out var perAcc))
-            foreach (var a in perAcc.EnumerateArray())
+        foreach (var a in prepared.Accounts)
+        {
+            var accId = a.AccountId;
+            seenAccounts.Add(accId);
+            var accVm = vm.PerAccount.FirstOrDefault(x => x.AccountId == accId);
+            if (accVm is null) vm.PerAccount.Add(accVm = new QuizAccountVm { AccountId = accId });
+            accVm.Label = AccountLabel(accId);
+            accVm.Questions.Clear(); // 重備答=以新題面為準;SubmitResult 保留
+            foreach (var q in a.Questions)
             {
-                var accId = Str(a, "account_id") ?? "";
-                seenAccounts.Add(accId);
-                var accVm = vm.PerAccount.FirstOrDefault(x => x.AccountId == accId);
-                if (accVm is null) vm.PerAccount.Add(accVm = new QuizAccountVm { AccountId = accId });
-                accVm.Label = AccountLabel(accId);
-                accVm.Questions.Clear(); // 重備答=以新題面為準;SubmitResult 保留
-                if (a.TryGetProperty("questions", out var qs))
-                    foreach (var q in qs.EnumerateArray())
-                    {
-                        var subjectId = Str(q, "subject_id") ?? "";
-                        if (!vm.Reasoning.TryGetValue(subjectId, out var reasoning))
-                            vm.Reasoning[subjectId] = reasoning = new ReasoningVm();
-                        AnswerWire? answer = null;
-                        if (q.TryGetProperty("answer", out var answerElement))
-                            answer = AnswerWire.FromJson(answerElement);
-                        if (answer is null)
-                            ContractError($"QuizPrepared 的 {subjectId} 缺少合法型別答案");
-                        var options = q.TryGetProperty("options", out var optionElements) && optionElements.ValueKind == JsonValueKind.Array
-                            ? optionElements.EnumerateArray()
-                                .Select(option => new QuestionOptionVm(Str(option, "id") ?? "", Str(option, "text") ?? ""))
-                                .ToArray()
-                            : [];
-                        accVm.Questions.Add(new QuestionVm
-                        {
-                            SubjectId = subjectId,
-                            Stem = Str(q, "stem") ?? "",
-                            QuestionType = Str(q, "type") ?? "",
-                            AnswerType = Str(q, "answer_type") ?? "",
-                            Options = options,
-                            AnswerPayload = answer,
-                            Conflict = Bool(q, "conflict"),
-                            Source = Str(q, "source") ?? "llm",
-                            Reasoning = reasoning,
-                        });
-                    }
+                if (!vm.Reasoning.TryGetValue(q.SubjectId, out var reasoning))
+                    vm.Reasoning[q.SubjectId] = reasoning = new ReasoningVm();
+                accVm.Questions.Add(new QuestionVm
+                {
+                    SubjectId = q.SubjectId,
+                    Stem = q.Stem,
+                    QuestionType = q.Type,
+                    AnswerType = q.AnswerType,
+                    Options = q.Options,
+                    AnswerPayload = q.Answer,
+                    Conflict = q.Conflict,
+                    Source = q.Source,
+                    Reasoning = reasoning,
+                });
             }
+        }
         foreach (var gone in vm.PerAccount.Where(account => !seenAccounts.Contains(account.AccountId)).ToList())
             vm.PerAccount.Remove(gone);
         foreach (var pending in _pendingReasoning.Where(item => item.Key.ActivityToken == activityToken).ToList())
@@ -417,14 +426,33 @@ public sealed class AppState : ObservableObject
 
     public async Task StartMonitoring()
     {
+        if (!_bootReady || MonitorState is "monitoring" or "starting" or "stopping") return;
+        MonitorState = "starting";
         // Android 12+ 只允許在使用者前景互動時啟動多數 FGS；按鈕呼叫路徑就是授權時點。
-        MonitoringServiceLifetime.Start();
-        if (!OkReply(await Send("StartMonitoring"))) MonitoringServiceLifetime.Stop();
+        try
+        {
+            MonitoringServiceLifetime.Start();
+        }
+        catch (Exception error)
+        {
+            MonitorState = "idle";
+            AddLog("error", $"無法啟動背景監控服務：{error.Message}");
+            Toast?.Invoke("error", $"無法啟動背景監控服務：{error.Message}");
+            return;
+        }
+        if (!OkReply(await Send("StartMonitoring")))
+        {
+            MonitoringServiceLifetime.Stop();
+            if (MonitorState == "starting") MonitorState = "idle";
+        }
     }
 
     public async Task StopMonitoring()
     {
+        if (MonitorState != "monitoring") return;
+        MonitorState = "stopping";
         if (OkReply(await Send("StopMonitoring"))) MonitoringServiceLifetime.Stop();
+        else if (MonitorState == "stopping") MonitorState = "monitoring";
     }
 
     public async Task<bool> AddAccount(string label, string school, string username, string password,

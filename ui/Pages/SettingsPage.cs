@@ -1,3 +1,4 @@
+using System.Collections.Specialized;
 using System.ComponentModel;
 
 namespace Ui;
@@ -22,9 +23,12 @@ public sealed class SettingsPage : ContentPage
     readonly Entry _maxTokens = NumEntry();
     readonly Switch _resubmit = new();
     readonly Switch _tools = new();
+    readonly Label _logEmpty = Theme.Dim("尚無日誌。", 12);
 
     readonly Action _onSettings;
     readonly PropertyChangedEventHandler _onCaps;
+    readonly NotifyCollectionChangedEventHandler _onLogs;
+    bool _subscribed;
 
     public SettingsPage(AppState state)
     {
@@ -106,8 +110,9 @@ public sealed class SettingsPage : ContentPage
         });
 
         // --- 能力(core 判定,UI 只呈現) ---
-        _onCaps = (_, _) => BuildCaps();
-        state.Caps.PropertyChanged += _onCaps;
+        _onLogs = OnLogsChanged;
+        _onCaps = OnCapsChanged;
+        _onSettings = OnSettingsChanged;
         BuildCaps();
 
         // --- 日誌 ---
@@ -119,14 +124,9 @@ public sealed class SettingsPage : ContentPage
             l.SetBinding(Label.TextProperty, nameof(LogEntry.Display));
             return l;
         }));
-        var logEmpty = Theme.Dim("尚無日誌。", 12);
-        void SyncLogEmpty() => logEmpty.IsVisible = state.Logs.Count == 0;
-        state.Logs.CollectionChanged += (_, _) => SyncLogEmpty();
         SyncLogEmpty();
 
         // 以核心現值回填(現在 + 每次 SettingsChanged)。
-        _onSettings = () => MainThread.BeginInvokeOnMainThread(Populate);
-        state.SettingsChanged += _onSettings;
         Populate();
 
         Content = new ScrollView
@@ -147,10 +147,26 @@ public sealed class SettingsPage : ContentPage
                     Theme.Section("此裝置的能力(由核心偵測)"),
                     Theme.Card(_capsRows),
                     Theme.Section("日誌"),
-                    Theme.Card(new VerticalStackLayout { Spacing = 4, Children = { logEmpty, logs } }),
+                    Theme.Card(new VerticalStackLayout { Spacing = 4, Children = { _logEmpty, logs } }),
                 },
             },
         };
+    }
+
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        if (_subscribed) return;
+
+        _state.SettingsChanged += _onSettings;
+        _state.Caps.PropertyChanged += _onCaps;
+        _state.Logs.CollectionChanged += _onLogs;
+        _subscribed = true;
+
+        // 每次重新顯示都以核心現值同步畫面，避免頁面暫離期間遺漏更新。
+        Populate();
+        BuildCaps();
+        SyncLogEmpty();
     }
 
     /// <summary>以核心現值填入所有欄位(修正舊版「開啟設定頁只顯示預設、不反映已存值」)。</summary>
@@ -172,9 +188,21 @@ public sealed class SettingsPage : ContentPage
     protected override void OnDisappearing()
     {
         base.OnDisappearing();
+        if (!_subscribed) return;
+
         _state.SettingsChanged -= _onSettings;
         _state.Caps.PropertyChanged -= _onCaps;
+        _state.Logs.CollectionChanged -= _onLogs;
+        _subscribed = false;
     }
+
+    void OnSettingsChanged() => MainThread.BeginInvokeOnMainThread(Populate);
+
+    void OnCapsChanged(object? _, PropertyChangedEventArgs __) => BuildCaps();
+
+    void OnLogsChanged(object? _, NotifyCollectionChangedEventArgs __) => SyncLogEmpty();
+
+    void SyncLogEmpty() => _logEmpty.IsVisible = _state.Logs.Count == 0;
 
     static Entry NumEntry() => new() { Keyboard = Keyboard.Numeric, WidthRequest = 140, HorizontalTextAlignment = TextAlignment.End };
 

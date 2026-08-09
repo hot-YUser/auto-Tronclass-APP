@@ -52,7 +52,7 @@ public sealed class MockCore : ICore
     public Task BootAsync(string dataDir)
     {
         Emit(new { id = (object?)null, @event = "Caps", caps = new {
-            background_monitoring = true, self_update = true,
+            background_monitoring = true, self_update = false,
             qr_teacher_assist = true, ocr_captcha = false } });
         Emit(new { id = (object?)null, @event = "StateChanged", state = "idle" });
         // 核心以 device-key 自動解鎖：Init 後即 unlocked（使用者不需輸入主密碼）。

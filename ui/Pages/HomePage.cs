@@ -35,10 +35,11 @@ public sealed class HomePage : ContentPage
             };
             dot.SetAppTheme<Brush>(Shape.FillProperty, new SolidColorBrush(l), new SolidColorBrush(d));
             toggle.Text = state.IsMonitoring ? "停止監控" : "開始監控";
+            toggle.IsEnabled = state.CanToggleMonitoring;
         }
         state.PropertyChanged += (_, a) =>
         {
-            if (a.PropertyName == nameof(AppState.MonitorState)) SyncMonitor();
+            if (a.PropertyName is nameof(AppState.MonitorState) or nameof(AppState.CanToggleMonitoring)) SyncMonitor();
             else if (a.PropertyName == nameof(AppState.NextClass)) BuildNextClass();
         };
         SyncMonitor();

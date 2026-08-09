@@ -21,6 +21,7 @@ public class CoreForegroundService : Service
 {
     private const string ChannelId = "tronclass_monitor";
     private const int NotificationId = 1;
+    private const int TimeoutNotificationId = 2;
     private ICore? _core;
     private string _status = "待命中"; // shown in the ongoing notification; updated on state/activity events
 
@@ -58,16 +59,53 @@ public class CoreForegroundService : Service
     [SupportedOSPlatform("android35.0")]
     public override void OnTimeout(int startId, global::Android.Content.PM.ForegroundService fgsType)
     {
-        // SendAsync 在第一次 await 前會同步送出 StopMonitoring；不可等待最長 300 秒的 Reply，
-        // 系統只給數秒 grace period，必須立刻離開前景並 stopSelf。
+        StopCoreBestEffort();
+        try
+        {
+            NotifySystemTimeout();
+        }
+        catch (Exception ex)
+        {
+            global::Android.Util.Log.Warn(nameof(CoreForegroundService), $"無法顯示逾時通知：{ex.Message}");
+        }
+        finally
+        {
+            StopForeground(StopForegroundFlags.Remove);
+            StopSelf(startId);
+        }
+    }
+
+    private void StopCoreBestEffort()
+    {
+        _core ??= IPlatformApplication.Current?.Services.GetService<ICore>();
         if (_core is not null) _ = _core.SendAsync("StopMonitoring");
-        StopForeground(StopForegroundFlags.Remove);
-        StopSelf(startId);
+    }
+
+    private void NotifySystemTimeout()
+    {
+        var openApp = new Intent(this, typeof(MainActivity));
+        openApp.AddFlags(ActivityFlags.SingleTop | ActivityFlags.ClearTop);
+        var pending = PendingIntent.GetActivity(
+            this,
+            0,
+            openApp,
+            PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent);
+        var notification = new NotificationCompat.Builder(this, ChannelId);
+        notification.SetSmallIcon(global::Android.Resource.Drawable.IcDialogInfo);
+        notification.SetContentTitle("背景監控已由 Android 暫停");
+        notification.SetContentText("已達系統允許的背景時數；請開啟 App 後重新啟動監控。");
+        notification.SetContentIntent(pending);
+        notification.SetAutoCancel(true);
+        notification.SetPriority(NotificationCompat.PriorityHigh);
+        var manager = NotificationManagerCompat.From(this)
+            ?? throw new InvalidOperationException("Android notification manager 不可用。");
+        manager.Notify(TimeoutNotificationId, notification.Build());
     }
 
     public override void OnDestroy()
     {
         if (_core is not null) _core.EventReceived -= OnCoreEvent;
+        StopCoreBestEffort();
         StopForeground(StopForegroundFlags.Remove);
         base.OnDestroy();
     }
