@@ -29,7 +29,7 @@
 | ISO-8601 parser 不完整 | fixed / verified | parser 現在驗證年月日、閏年、時間範圍、Z/±HH:MM/±HHMM 與 ±14:00 邊界；Rust monitor tests 目前 11 項通過。 |
 | LLM body 綁死 NVIDIA/MiniMax 方言 | fixed / verified | `LlmProvider` 只在精確 NVIDIA host 傳 vendor fields；generic OpenAI-compatible request 共用 builder，3 個 provider tests 通過。 |
 | README 是 v1 CLI 文件 | fixed | 本文件與 README 已改為 v2 Rust + MAUI GUI 說明；使用者操作、平台限制與證據仍以實際 release gate 為準。 |
-| 測試與 CI 斷層 | fixed locally / remote unverified | `.github/workflows/ci.yml` 已含 Rust test/clippy、Windows production contract/device-key check 與雙平台 build，官方 actions 以 SHA 固定；cargo-ndk 固定為 4.1.2 並驗版本。2026-08-10 本機等價命令通過，但 workflow 尚未 push/遠端執行，完整 release artifact identity gate 仍只在 `release.ps1`。 |
+| 測試與 CI 斷層 | fixed / verified | `.github/workflows/ci.yml` 已含 Rust test/clippy、Windows production contract/device-key check 與雙平台 build，官方 actions 以 SHA 固定；cargo-ndk 固定為 4.1.2，.NET 11 preview.6 與 MAUI workload set 亦精確固定。2026-08-10 [CI run 31325769517](https://github.com/hot-YUser/auto-Tronclass-APP/actions/runs/31325769517) 三個 jobs 全綠；完整 release artifact identity gate 仍由本機 `release.ps1` dry-run 提供。 |
 | 裝置金鑰/秘密記憶體生命週期 | fixed in code / verification pending | Windows DPAPI、Android Keystore、外部 key 注入、毀損隔離及 DeviceKey runnable check 已具備；`AccountSecret`/LLM 字串的完整 zeroization 與跨程序失敗路徑仍需最後審閱。 |
 
 ## 多模型證據界線
