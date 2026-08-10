@@ -70,7 +70,7 @@
 		<!-- Raw Assets (also remove the "Resources\Raw" prefix) -->
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
 		<!-- Rust 與 C# Mock 共用的跨語言 golden contract。 -->
-		<MauiAsset Include="..\protocol\fixtures\quiz_prepared_v1.json" LogicalName="contract/quiz_prepared_v1.json" />
+		<MauiAsset Include="..\core\src\assets\quiz_prepared_v1.json" LogicalName="contract/quiz_prepared_v1.json" />
 	</ItemGroup>
 
 	<ItemGroup>

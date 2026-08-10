@@ -8,6 +8,6 @@
   <ItemGroup>
     <Compile Include="..\..\..\ui\State\Models.cs" Link="Models.cs" />
     <Compile Include="..\..\..\ui\Interop\QuizPreparedContract.cs" Link="QuizPreparedContract.cs" />
-    <None Include="..\..\..\protocol\fixtures\quiz_prepared_v1.json" Link="quiz_prepared_v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\..\core\src\assets\quiz_prepared_v1.json" Link="quiz_prepared_v1.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

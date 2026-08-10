@@ -2305,7 +2305,7 @@ mod tests {
 
     #[test]
     fn production_quiz_prepared_emitter_matches_v1_contract() {
-        let fixture: Value = serde_json::from_str(include_str!("../../protocol/fixtures/quiz_prepared_v1.json"))
+        let fixture: Value = serde_json::from_str(include_str!("assets/quiz_prepared_v1.json"))
             .expect("valid shared fixture");
         let fixture_attempt = &fixture["per_account"][0];
         let subjects = fixture_attempt["questions"]
