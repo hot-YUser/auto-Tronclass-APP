@@ -234,7 +234,14 @@ fn handle_sync(core: &Core, cmd: Command) {
         } => {
             let dir = PathBuf::from(&data_dir);
             let _ = std::fs::create_dir_all(&dir);
-            let registry = Registry::load_or_seed(&dir.join("providers.json"));
+            let registry = match Registry::load_or_seed(&dir.join("providers.json")) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                        "code": "providers_unavailable", "message": error }));
+                    return reply(cb, id, false, Some("providers registry unavailable".to_string()));
+                }
+            };
             let config_path = dir.join("config.json");
             let (config, config_healthy) = match Config::load(&config_path) {
                 Ok(config) => (config, true),
@@ -490,6 +497,9 @@ fn handle_sync(core: &Core, cmd: Command) {
 
         Command::UpdateConfig { patch, .. } => {
             let Some(st) = guard.as_mut() else { return reply(cb, id, false, Some("not initialized".into())) };
+            if let Err(error) = validate_config_patch(&patch) {
+                return reply(cb, id, false, Some(error));
+            }
             let previous_config = st.config.clone();
             let s = &mut st.config.settings;
             if let Some(v) = patch.get("countdown_secs").and_then(Value::as_u64) {
@@ -961,6 +971,48 @@ fn caps_payload() -> Value {
 
 /// The current user-facing settings, so a Settings screen reflects what is actually saved (not just
 /// defaults). The LLM key itself is a secret and NEVER crosses the seam — only a `has_llm_key` bool does.
+fn validate_config_patch(patch: &Value) -> Result<(), String> {
+    let patch = patch.as_object().ok_or_else(|| "config patch 必須是物件".to_string())?;
+    let u64_range = |key: &str, min: u64, max: u64| -> Result<(), String> {
+        if let Some(value) = patch.get(key) {
+            let number = value.as_u64().ok_or_else(|| format!("{key} 必須是非負整數"))?;
+            if !(min..=max).contains(&number) {
+                return Err(format!("{key} 必須介於 {min} 與 {max}"));
+            }
+        }
+        Ok(())
+    };
+    u64_range("countdown_secs", 1, 86_400)?;
+    u64_range("llm_max_tokens", 1, 1_000_000)?;
+    u64_range("max_answer_reask", 1, 100)?;
+    u64_range("prepare_retry_budget_secs", 1, 86_400)?;
+    u64_range("max_tool_iterations", 0, 100)?;
+    u64_range("number_concurrency", 1, 256)?;
+    u64_range("number_min_concurrency", 1, 256)?;
+    u64_range("number_cooldown_ms", 1, 3_600_000)?;
+    u64_range("number_max_cooldowns", 0, 1_000)?;
+    u64_range("poll_idle_secs", 1, 86_400)?;
+    u64_range("quiz_detect_secs", 1, 86_400)?;
+    if let Some(value) = patch.get("attendance_gate_percent") {
+        let number = value.as_f64().ok_or_else(|| "attendance_gate_percent 必須是數字".to_string())?;
+        if !number.is_finite() || !(0.0..=100.0).contains(&number) {
+            return Err("attendance_gate_percent 必須介於 0 與 100".to_string());
+        }
+    }
+    if let Some(value) = patch.get("tz_offset_minutes") {
+        let minutes = value.as_i64().ok_or_else(|| "tz_offset_minutes 必須是整數".to_string())?;
+        if !(-840..=840).contains(&minutes) {
+            return Err("tz_offset_minutes 必須介於 -840 與 840".to_string());
+        }
+    }
+    let concurrency = patch.get("number_concurrency").and_then(Value::as_u64);
+    let minimum = patch.get("number_min_concurrency").and_then(Value::as_u64);
+    if matches!((concurrency, minimum), (Some(max), Some(min)) if min > max) {
+        return Err("number_min_concurrency 不得大於 number_concurrency".to_string());
+    }
+    Ok(())
+}
+
 fn emit_settings(cb: EventCb, st: &CoreState) {
     let s = &st.config.settings;
     let has_llm_key = st

@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use crate::atomic_file;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct School {
@@ -37,15 +39,23 @@ impl Registry {
 
     /// Load the user's registry, seeding it from the factory on first run. Deleting the file
     /// re-seeds it (docs 40: the on-disk copy is the single source of truth once written).
-    pub fn load_or_seed(path: &Path) -> Registry {
-        if let Ok(bytes) = fs::read(path) {
-            if let Ok(reg) = serde_json::from_slice::<Registry>(&bytes) {
-                return reg;
+    pub fn load_or_seed(path: &Path) -> Result<Registry, String> {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<Registry>(&bytes).map_err(|error| {
+                let quarantine = quarantine(path)
+                    .map(|saved| format!("；原檔已保留為 {}", saved.display()))
+                    .unwrap_or_else(|move_error| format!("；無法保留原檔：{move_error}"));
+                format!("providers.json 損毀：{error}{quarantine}")
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let registry = Registry::factory();
+                let bytes = serde_json::to_vec_pretty(&registry).map_err(|error| error.to_string())?;
+                atomic_file::create_new(path, &bytes)
+                    .map_err(|error| format!("無法建立 providers.json：{error}"))?;
+                Ok(registry)
             }
+            Err(error) => Err(format!("無法讀取 providers.json：{error}")),
         }
-        let reg = Registry::factory();
-        let _ = fs::write(path, serde_json::to_vec_pretty(&reg).unwrap_or_default());
-        reg
     }
 
     /// Resolve an account's `school_ref` to a base_url: a raw URL passes through; otherwise it's
@@ -62,6 +72,12 @@ impl Registry {
             })
             .map(|s| s.base_url.clone())
     }
+}
+
+fn quarantine(path: &Path) -> io::Result<PathBuf> {
+    let saved = path.with_extension(format!("corrupt-{}.json", crate::config::new_id()));
+    fs::rename(path, &saved)?;
+    Ok(saved)
 }
 
 /// Endpoints derived from a single base_url (docs 40) — no per-school logic anywhere.

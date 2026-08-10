@@ -53,19 +53,43 @@ public static class DataPaths
         catch { return false; }
     }
 
-    // 舊 → 新一次性複製（僅在目的地尚無 vault 時）。搬遷是便利性，絕不能因它讓 App 開不起來。
     static void MigrateLegacy(string dest)
     {
+        var marker = Path.Combine(dest, ".legacy-migration-complete");
+        if (File.Exists(marker) || File.Exists(Path.Combine(dest, "vault.bin"))) return;
+        var legacy = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "User Name", "com.autotronclass.app", "Data");
+        if (!File.Exists(Path.Combine(legacy, "vault.bin"))) return;
+
+        var stage = Path.Combine(Path.GetDirectoryName(dest)!, $".{Path.GetFileName(dest)}.migration-{Guid.NewGuid():N}");
+        var moved = new List<string>();
         try
         {
-            if (File.Exists(Path.Combine(dest, "vault.bin"))) return; // 目的地已有資料，別覆蓋
-            var legacy = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "User Name", "com.autotronclass.app", "Data");
-            if (!File.Exists(Path.Combine(legacy, "vault.bin"))) return; // 舊位置也沒有，無需搬
-            foreach (var f in Directory.GetFiles(legacy))
-                File.Copy(f, Path.Combine(dest, Path.GetFileName(f)), overwrite: false);
+            Directory.CreateDirectory(stage);
+            foreach (var file in Directory.GetFiles(legacy))
+                File.Copy(file, Path.Combine(stage, Path.GetFileName(file)), overwrite: false);
+            if (!File.Exists(Path.Combine(stage, "vault.bin")))
+                throw new InvalidDataException("舊資料缺少 vault.bin");
+            var completion = Path.Combine(stage, ".legacy-migration-complete");
+            File.WriteAllText(completion, "1");
+            foreach (var file in Directory.GetFiles(stage).Where(file => !string.Equals(file, completion, StringComparison.OrdinalIgnoreCase)))
+            {
+                var target = Path.Combine(dest, Path.GetFileName(file));
+                File.Move(file, target, overwrite: false);
+                moved.Add(target);
+            }
+            File.Move(completion, marker, overwrite: false);
+            moved.Add(marker);
         }
-        catch { /* 搬遷失敗就當全新起步，不影響開啟 */ }
+        catch
+        {
+            foreach (var partial in moved)
+                if (File.Exists(partial) && !File.Exists(marker)) File.Delete(partial);
+        }
+        finally
+        {
+            if (Directory.Exists(stage)) Directory.Delete(stage, recursive: true);
+        }
     }
 }
