@@ -37,6 +37,15 @@ keystore.properties
 # Local backup of this project's Claude memory (research notes + test-account refs) — never commit.
 Claude Memory/
 
+# Claude Code working directory (session notes, release-note drafts) — never commit.
+.claude/
+
+# Local AI handover / review notes (untracked process artifacts)
+/AI交接紀錄-*.md
+
+# Default build marker written by tools/build-core.ps1 when run standalone
+/core/.native-build-*.json
+
 # IDE / OS
 .vs/
 .idea/
