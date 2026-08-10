@@ -227,8 +227,9 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     public required string Id { get; init; }
     public DateTime DetectedAt { get; } = DateTime.Now;
     public ObservableCollection<QuizAccountVm> PerAccount { get; } = [];
-    /// <summary>subject_id → 共享推理串流(跨帳號同題共用一份,ReasoningChunk 無 account_id)。</summary>
-    public Dictionary<string, ReasoningVm> Reasoning { get; } = [];
+    public HashSet<string> ExpectedAccountIds { get; } = new(StringComparer.Ordinal);
+    /// <summary>(account_id, subject_id) → 該帳號該題的推理串流。</summary>
+    public Dictionary<(string AccountId, string SubjectId), ReasoningVm> Reasoning { get; } = [];
 
     string _course = "";
     int? _remaining; int _total; string _status = "reviewing"; // reviewing | held | discarded | done
@@ -281,7 +282,13 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
 public sealed class QuizAccountVm : ObservableObject
 {
     public required string AccountId { get; init; }
-    string _label = ""; string? _submitResult;
+    string _label = ""; string? _submitResult; string _attemptState = "waiting";
+
+    public string AttemptState
+    {
+        get => _attemptState;
+        set { if (Set(ref _attemptState, value)) Raise(nameof(ChipText)); }
+    }
 
     public string Label { get => _label; set { if (Set(ref _label, value)) Raise(nameof(ChipText)); } }
     public ObservableCollection<QuestionVm> Questions { get; } = [];
@@ -292,7 +299,13 @@ public sealed class QuizAccountVm : ObservableObject
     }
     public bool Submitted => SubmitResult != null;
     /// 列表卡的逐帳號膠囊文字。
-    public string ChipText => Submitted ? $"✓ {Label}" : $"{Label} · 待送出";
+    public string ChipText => Submitted ? $"✓ {Label}" : AttemptState switch
+    {
+        "failed" => $"✕ {Label} · 準備失敗",
+        "gone" => $"— {Label} · 活動已結束",
+        "preparing" or "waiting" => $"{Label} · 準備中",
+        _ => $"{Label} · 待送出",
+    };
 }
 
 public sealed class QuestionVm : ObservableObject

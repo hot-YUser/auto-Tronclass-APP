@@ -11,14 +11,16 @@ namespace Ui;
 public sealed class AppState : ObservableObject
 {
     readonly ICore _core;
-    readonly Dictionary<(string ActivityToken, string SubjectId), string> _pendingReasoning = [];
+    readonly Dictionary<(string ActivityToken, string AccountId, string SubjectId), string> _pendingReasoning = [];
     bool _bootReady;
 
     public AppState(ICore core)
     {
         _core = core;
-        core.EventReceived += e => MainThread.BeginInvokeOnMainThread(() => Route(e));
+        core.EventReceived += e => MainThread.BeginInvokeOnMainThread(() => RouteSafely(e));
     }
+
+    public bool BootReady => _bootReady;
 
     public async Task BootAsync()
     {
@@ -26,12 +28,13 @@ public sealed class AppState : ObservableObject
         {
             await _core.BootAsync(DataPaths.Resolve());
             _bootReady = true;
+            Raise(nameof(BootReady));
             Raise(nameof(CanToggleMonitoring));
         }
         catch (Exception error)
         {
             _bootReady = false;
-            MonitoringServiceLifetime.Stop();
+            Raise(nameof(BootReady));
             MonitorState = "idle";
             AddLog("error", $"初始化失敗：{error.Message}");
             Toast?.Invoke("error", $"初始化失敗：{error.Message}");
@@ -100,6 +103,18 @@ public sealed class AppState : ObservableObject
     public void Notify(string severity, string message) => Toast?.Invoke(severity, message);
 
     // ---------------- 事件路由 ----------------
+
+    void RouteSafely(JsonElement e)
+    {
+        try
+        {
+            Route(e);
+        }
+        catch (Exception error)
+        {
+            ContractError($"事件格式無效：{error.Message}");
+        }
+    }
 
     void Route(JsonElement e)
     {
@@ -318,20 +333,30 @@ public sealed class AppState : ObservableObject
         var announce = vm is null;
         if (vm is null) Quizzes.Insert(0, vm = new QuizVm { ActivityToken = activityToken, Id = id });
         vm.Course = prepared.Course;
+        vm.ExpectedAccountIds.Clear();
+        foreach (var expected in prepared.ExpectedAccounts)
+        {
+            vm.ExpectedAccountIds.Add(expected.AccountId);
+            var expectedVm = vm.PerAccount.FirstOrDefault(account => account.AccountId == expected.AccountId);
+            if (expectedVm is null)
+                vm.PerAccount.Add(expectedVm = new QuizAccountVm { AccountId = expected.AccountId });
+            expectedVm.Label = AccountLabel(expected.AccountId);
+            expectedVm.AttemptState = expected.State;
+        }
         // conflict_count 只作參考;送出閘門由逐題 QuestionVm.Conflict 推導(見 QuizVm.AnyConflict)
-        var seenAccounts = new HashSet<string>();
         foreach (var a in prepared.Accounts)
         {
             var accId = a.AccountId;
-            seenAccounts.Add(accId);
             var accVm = vm.PerAccount.FirstOrDefault(x => x.AccountId == accId);
             if (accVm is null) vm.PerAccount.Add(accVm = new QuizAccountVm { AccountId = accId });
             accVm.Label = AccountLabel(accId);
+            accVm.AttemptState = a.State;
             accVm.Questions.Clear(); // 重備答=以新題面為準;SubmitResult 保留
             foreach (var q in a.Questions)
             {
-                if (!vm.Reasoning.TryGetValue(q.SubjectId, out var reasoning))
-                    vm.Reasoning[q.SubjectId] = reasoning = new ReasoningVm();
+                var reasoningKey = (accId, q.SubjectId);
+                if (!vm.Reasoning.TryGetValue(reasoningKey, out var reasoning))
+                    vm.Reasoning[reasoningKey] = reasoning = new ReasoningVm();
                 accVm.Questions.Add(new QuestionVm
                 {
                     SubjectId = q.SubjectId,
@@ -346,12 +371,13 @@ public sealed class AppState : ObservableObject
                 });
             }
         }
-        foreach (var gone in vm.PerAccount.Where(account => !seenAccounts.Contains(account.AccountId)).ToList())
+        foreach (var gone in vm.PerAccount.Where(account => !vm.ExpectedAccountIds.Contains(account.AccountId)).ToList())
             vm.PerAccount.Remove(gone);
         foreach (var pending in _pendingReasoning.Where(item => item.Key.ActivityToken == activityToken).ToList())
         {
-            if (!vm.Reasoning.TryGetValue(pending.Key.SubjectId, out var reasoning))
-                vm.Reasoning[pending.Key.SubjectId] = reasoning = new ReasoningVm();
+            var reasoningKey = (pending.Key.AccountId, pending.Key.SubjectId);
+            if (!vm.Reasoning.TryGetValue(reasoningKey, out var reasoning))
+                vm.Reasoning[reasoningKey] = reasoning = new ReasoningVm();
             reasoning.Append(pending.Value);
             _pendingReasoning.Remove(pending.Key);
         }
@@ -364,15 +390,22 @@ public sealed class AppState : ObservableObject
     void OnReasoningChunk(JsonElement e)
     {
         var activityToken = Str(e, "activity_token") ?? "";
+        var accountId = Str(e, "account_id") ?? "";
         var subjectId = Str(e, "subject_id") ?? "";
+        if (string.IsNullOrWhiteSpace(activityToken) || string.IsNullOrWhiteSpace(accountId) || string.IsNullOrWhiteSpace(subjectId))
+        {
+            ContractError("ReasoningChunk 缺少 activity_token、account_id 或 subject_id");
+            return;
+        }
         if (FindQuiz(activityToken) is not { } vm)
         {
-            var key = (activityToken, subjectId);
+            var key = (activityToken, accountId, subjectId);
             _pendingReasoning[key] = _pendingReasoning.GetValueOrDefault(key) + (Str(e, "text") ?? "");
             return;
         }
-        if (!vm.Reasoning.TryGetValue(subjectId, out var reasoning))
-            vm.Reasoning[subjectId] = reasoning = new ReasoningVm();
+        var reasoningKey = (accountId, subjectId);
+        if (!vm.Reasoning.TryGetValue(reasoningKey, out var reasoning))
+            vm.Reasoning[reasoningKey] = reasoning = new ReasoningVm();
         reasoning.Append(Str(e, "text") ?? "");
     }
 
@@ -403,7 +436,8 @@ public sealed class AppState : ObservableObject
         if (accVm is null) return;
         accVm.SubmitResult = Str(e, "result") ?? "已送出";
         vm.RaiseProgress();
-        if (vm.PerAccount.All(a => a.Submitted))
+        if (vm.ExpectedAccountIds.Count > 0 && vm.ExpectedAccountIds.All(id =>
+                vm.PerAccount.FirstOrDefault(account => account.AccountId == id)?.Submitted == true))
         {
             vm.Status = "done";
             vm.RemainingSecs = null;
@@ -542,7 +576,8 @@ public sealed class AppState : ObservableObject
     }
 
     static bool OkReply(JsonElement? r) =>
-        r is { } el && !(el.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False);
+        r is { ValueKind: JsonValueKind.Object } el &&
+        el.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True;
 
     // ---------------- JSON 取值 ----------------
 

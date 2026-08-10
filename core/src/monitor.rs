@@ -1119,7 +1119,7 @@ fn spawn_sign(acc: Arc<Account>, kind: RollcallKind, code: Option<String>, rollc
     tokio::spawn(async move {
         let ep = Endpoints::derive(&acc.base_url);
         let result = match kind {
-            RollcallKind::Number => rollcall::sign_number(&acc.client, &ep, &rollcall_id, &acc.device_id, code.as_deref(), ncfg).await,
+            RollcallKind::Number => rollcall::sign_number(&acc.client, &ep, &rollcall_id, &acc.user_no, &acc.device_id, code.as_deref(), ncfg).await,
             RollcallKind::Radar => rollcall::sign_radar(&acc.client, &ep, &rollcall_id, &radar_strategy, &acc.user_no, &acc.device_id).await,
             RollcallKind::SelfRegistration => rollcall::sign_self_registration(&acc.client, &ep, &rollcall_id, &acc.user_no).await,
             RollcallKind::Qr | RollcallKind::Unknown => Err("unsupported here".into()),
@@ -1839,6 +1839,7 @@ fn spawn_quiz_prepare(
                         &llm,
                         cb,
                         &activity_token,
+                        &account_id,
                         &course_id,
                         &account.base_url,
                         &paper.subjects,
@@ -2119,15 +2120,42 @@ fn quiz_prepared_event(q: &QuizActivity) -> Value {
                     })
                 })
                 .collect();
-            json!({ "account_id": account_id, "instance_id": attempt.instance_id, "questions": questions })
+            json!({ "account_id": account_id, "instance_id": attempt.instance_id,
+                "state": match attempt.state {
+                    AttemptState::Ready => "ready",
+                    AttemptState::Submitting => "submitting",
+                    AttemptState::Submitted => "submitted",
+                    AttemptState::Failed => "failed",
+                    AttemptState::Gone => "gone",
+                    AttemptState::Waiting => "waiting",
+                    AttemptState::Preparing => "preparing",
+                },
+                "questions": questions })
         })
+        .collect();
+    let expected_accounts: Vec<Value> = q
+        .attempts
+        .iter()
+        .map(|(account_id, attempt)| json!({
+            "account_id": account_id,
+            "state": match attempt.state {
+                AttemptState::Ready => "ready",
+                AttemptState::Submitting => "submitting",
+                AttemptState::Submitted => "submitted",
+                AttemptState::Failed => "failed",
+                AttemptState::Gone => "gone",
+                AttemptState::Waiting => "waiting",
+                AttemptState::Preparing => "preparing",
+            }
+        }))
         .collect();
     let conflict_count: usize = q.attempts.values().map(|attempt| attempt.conflicts.len()).sum();
     json!({ "id": null, "event": "QuizPrepared", "schema_version": 1,
         "activity_token": q.activity_token, "quiz_id": q.activity_id,
         "activity": { "external_id": q.activity_id, "source": q.source.as_str(),
             "course_id": q.course_id, "course": q.course },
-        "course": q.course, "per_account": per_account, "conflict_count": conflict_count })
+        "course": q.course, "per_account": per_account, "expected_accounts": expected_accounts,
+        "conflict_count": conflict_count })
 }
 
 fn subject_stem(subject: &Value) -> &str {
@@ -2166,7 +2194,19 @@ async fn get_json(client: &Client, url: &str) -> Result<Value, String> {
     crate::http::json_checked(client.get(url), "fetch activity").await
 }
 async fn post_json(client: &Client, url: &str, body: &Value) -> Result<(), String> {
-    crate::http::mutation_checked(client.post(url).json(body), "submit activity").await
+    let payload = crate::http::mutation_checked(client.post(url).json(body), "submit activity").await?;
+    if payload_bool_success(&payload) {
+        Ok(())
+    } else {
+        Err("submit activity: response did not confirm success".to_string())
+    }
+}
+
+fn payload_bool_success(payload: &Value) -> bool {
+    ["success", "ok", "is_success"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_bool))
+        == Some(true)
 }
 
 async fn submit_classroom(
@@ -2191,14 +2231,19 @@ async fn submit_classroom(
         }
         let body = answer::classroom_body(instance_id, subject, answer);
         let operation = format!("submit classroom subject {subject_id}");
-        if let Err(error) = crate::http::mutation_checked(
+        let response = crate::http::mutation_checked(
             account
                 .client
                 .post(endpoints.classroom_submit(activity_id, &subject_id))
                 .json(&body),
             &operation,
         )
-        .await
+        .await;
+        if let Err(error) = response.and_then(|payload| {
+            payload_bool_success(&payload)
+                .then_some(())
+                .ok_or_else(|| format!("{operation}: response did not confirm success"))
+        })
         {
             return Err(QuizSubmitFailure {
                 error,
@@ -2340,7 +2385,9 @@ mod tests {
         let emitted_account = &emitted["per_account"][0];
         assert_eq!(emitted_account["account_id"], fixture_attempt["account_id"]);
         assert_eq!(emitted_account["instance_id"], fixture_attempt["instance_id"]);
+        assert_eq!(emitted_account["state"], "ready");
         assert_eq!(emitted_account["questions"], fixture_attempt["questions"]);
+        assert_eq!(emitted["expected_accounts"], json!([{ "account_id": "a1", "state": "ready" }]));
     }
 
     #[test]

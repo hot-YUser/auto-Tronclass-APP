@@ -37,9 +37,13 @@ public sealed class AppShell : Shell
     protected override void OnAppearing()
     {
         base.OnAppearing();
-        if (_booted) return;
+        if (_booted && _state.BootReady) return;
         _booted = true;
-        Dispatcher.Dispatch(async () => await _state.BootAsync());
+        Dispatcher.Dispatch(async () =>
+        {
+            await _state.BootAsync();
+            if (!_state.BootReady) _booted = false;
+        });
     }
 
     public Task OpenRollcallDetail(RollcallVm vm)

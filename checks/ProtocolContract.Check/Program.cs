@@ -10,6 +10,7 @@ Assert(quiz.Course == "行銷管理", "course");
 Assert(quiz.Activity is { ExternalId: "32877", Source: "exam", CourseId: "55379", Course: "行銷管理" }, "activity fields");
 Assert(quiz.ConflictCount == 2, "conflict_count");
 Assert(quiz.Accounts.Count == 2, "account count");
+Assert(quiz.ExpectedAccounts.Count == 2 && quiz.ExpectedAccounts.All(account => account.State == "ready"), "expected accounts");
 
 foreach (var account in quiz.Accounts)
 {
@@ -50,7 +51,36 @@ foreach (var invalidAnswer in new[]
     Assert(!QuizPreparedContract.TryParse(malformed.RootElement, out _, out _), $"malformed answer must fail closed: {invalidAnswer}");
 }
 
-foreach (var requiredField in new[] { "quiz_id", "activity", "conflict_count" })
+foreach (var source in new[] { "courseware-quiz", "vote", "homework" })
+{
+    using var mutable = JsonDocument.Parse(File.ReadAllText(fixturePath));
+    var root = JsonSerializer.Deserialize<Dictionary<string, object?>>(mutable.RootElement.GetRawText())!;
+    var activity = JsonSerializer.Deserialize<Dictionary<string, object?>>(((JsonElement)root["activity"]!).GetRawText())!;
+    activity["source"] = source;
+    root["activity"] = activity;
+    var accounts = JsonSerializer.Deserialize<List<Dictionary<string, object?>>>(((JsonElement)root["per_account"]!).GetRawText())!;
+    foreach (var account in accounts) account["instance_id"] = "";
+    root["per_account"] = accounts;
+    using var valid = JsonDocument.Parse(JsonSerializer.Serialize(root));
+    Assert(QuizPreparedContract.TryParse(valid.RootElement, out var parsed, out var sourceError), $"{source}: {sourceError}");
+    Assert(parsed.Accounts.All(account => account.InstanceId == ""), $"{source} empty instance");
+}
+
+foreach (var source in new[] { "exam", "classroom-exam", "questionnaire" })
+{
+    using var mutable = JsonDocument.Parse(File.ReadAllText(fixturePath));
+    var root = JsonSerializer.Deserialize<Dictionary<string, object?>>(mutable.RootElement.GetRawText())!;
+    var activity = JsonSerializer.Deserialize<Dictionary<string, object?>>(((JsonElement)root["activity"]!).GetRawText())!;
+    activity["source"] = source;
+    root["activity"] = activity;
+    var accounts = JsonSerializer.Deserialize<List<Dictionary<string, object?>>>(((JsonElement)root["per_account"]!).GetRawText())!;
+    accounts[0]["instance_id"] = "";
+    root["per_account"] = accounts;
+    using var invalid = JsonDocument.Parse(JsonSerializer.Serialize(root));
+    Assert(!QuizPreparedContract.TryParse(invalid.RootElement, out _, out _), $"{source} requires instance");
+}
+
+foreach (var requiredField in new[] { "quiz_id", "activity", "expected_accounts", "conflict_count" })
 {
     using var mutable = JsonDocument.Parse(File.ReadAllText(fixturePath));
     var root = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(mutable.RootElement.GetRawText())!;

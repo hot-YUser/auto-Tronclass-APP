@@ -143,12 +143,14 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], stream: bool, tools: 
 /// turns on a re-ask). Prepends the system prompt. Returns the clean answer text, or `None` on
 /// failure/empty (caller must then skip the subject — never blank). With `tools` set, runs the
 /// non-streaming tool-calling loop (course-material lookup); otherwise the streaming path (R3b).
+#[allow(clippy::too_many_arguments)]
 pub async fn answer_question(
     client: &Client,
     cfg: &LlmConfig,
     messages: &[Value],
     cb: EventCb,
     activity_token: &str,
+    account_id: &str,
     subject_id: &str,
     tools: Option<&ToolCtx<'_>>,
 ) -> Option<String> {
@@ -160,8 +162,8 @@ pub async fn answer_question(
     let mut full = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
     full.extend(messages.iter().cloned());
     match tools {
-        Some(ctx) => tool_loop(client, cfg, full, cb, activity_token, subject_id, ctx).await,
-        None => stream_answer(client, cfg, full, cb, activity_token, subject_id).await,
+        Some(ctx) => tool_loop(client, cfg, full, cb, activity_token, account_id, subject_id, ctx).await,
+        None => stream_answer(client, cfg, full, cb, activity_token, account_id, subject_id).await,
     }
 }
 
@@ -172,6 +174,7 @@ async fn stream_answer(
     full: Vec<Value>,
     cb: EventCb,
     activity_token: &str,
+    account_id: &str,
     subject_id: &str,
 ) -> Option<String> {
     let body = build_request_body(cfg, &full, true, false);
@@ -210,7 +213,7 @@ async fn stream_answer(
                 emit(
                     cb,
                     &json!({ "id": null, "event": "ReasoningChunk",
-                                  "activity_token": activity_token,
+                                  "activity_token": activity_token, "account_id": account_id,
                                   "subject_id": subject_id, "text": r }),
                 );
             }
@@ -237,6 +240,7 @@ async fn tool_loop(
     mut messages: Vec<Value>,
     cb: EventCb,
     activity_token: &str,
+    account_id: &str,
     subject_id: &str,
     ctx: &ToolCtx<'_>,
 ) -> Option<String> {
@@ -262,7 +266,7 @@ async fn tool_loop(
             emit(
                 cb,
                 &json!({ "id": null, "event": "ReasoningChunk",
-                              "activity_token": activity_token,
+                              "activity_token": activity_token, "account_id": account_id,
                               "subject_id": subject_id, "text": r }),
             );
         }

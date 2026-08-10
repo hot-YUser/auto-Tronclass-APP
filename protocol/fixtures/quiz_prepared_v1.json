@@ -15,6 +15,7 @@
     {
       "account_id": "a1",
       "instance_id": "attempt-a1",
+      "state": "ready",
       "questions": [
         {
           "subject_id": "1",
@@ -47,6 +48,7 @@
     {
       "account_id": "a2",
       "instance_id": "attempt-a2",
+      "state": "ready",
       "questions": [
         {
           "subject_id": "1",
@@ -76,6 +78,10 @@
         }
       ]
     }
+  ],
+  "expected_accounts": [
+    { "account_id": "a1", "state": "ready" },
+    { "account_id": "a2", "state": "ready" }
   ],
   "conflict_count": 2
 }

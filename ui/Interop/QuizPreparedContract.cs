@@ -32,6 +32,12 @@ public static class QuizPreparedContract
             return Fail("QuizPrepared 缺少 activity 物件", out error);
         var externalId = RequiredStr(activityElement, "external_id");
         var source = RequiredStr(activityElement, "source");
+        var knownSources = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "exam", "classroom-exam", "questionnaire", "courseware-quiz", "vote", "homework",
+        };
+        if (source is null || !knownSources.Contains(source))
+            return Fail("QuizPrepared activity source 不受支援", out error);
         var courseId = RequiredStr(activityElement, "course_id");
         var activityCourse = RequiredStr(activityElement, "course");
         if (string.IsNullOrWhiteSpace(externalId) || string.IsNullOrWhiteSpace(source) ||
@@ -53,9 +59,11 @@ public static class QuizPreparedContract
             if (!accountIds.Add(accountId))
                 return Fail($"QuizPrepared 重複 account_id：{accountId}", out error);
             if (!account.TryGetProperty("instance_id", out var instanceElement) ||
-                instanceElement.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(instanceElement.GetString()))
+                instanceElement.ValueKind != JsonValueKind.String)
                 return Fail($"QuizPrepared 的 {accountId} 缺少 instance_id", out error);
             var instanceId = instanceElement.GetString()!;
+            if (source is "exam" or "classroom-exam" or "questionnaire" && string.IsNullOrWhiteSpace(instanceId))
+                return Fail($"QuizPrepared 的 {accountId} 缺少必要 instance_id", out error);
             if (!account.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
                 return Fail($"QuizPrepared 的 {accountId} 缺少 questions 陣列", out error);
 
@@ -114,14 +122,36 @@ public static class QuizPreparedContract
                     answerSource,
                     conflictElement.GetBoolean()));
             }
-            parsedAccounts.Add(new PreparedAccount(accountId, instanceId, parsedQuestions));
+            var accountState = RequiredStr(account, "state");
+            if (accountState is not ("ready" or "submitting" or "submitted"))
+                return Fail($"QuizPrepared 的 {accountId} state 無效", out error);
+            parsedAccounts.Add(new PreparedAccount(accountId, instanceId, accountState, parsedQuestions));
         }
+
+        if (!element.TryGetProperty("expected_accounts", out var expectedElements) || expectedElements.ValueKind != JsonValueKind.Array)
+            return Fail("QuizPrepared 缺少 expected_accounts 陣列", out error);
+        var expectedAccounts = new List<PreparedAccountState>();
+        var expectedIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var expected in expectedElements.EnumerateArray())
+        {
+            if (expected.ValueKind != JsonValueKind.Object)
+                return Fail("QuizPrepared expected_accounts 含有非物件", out error);
+            var expectedId = RequiredStr(expected, "account_id");
+            var state = RequiredStr(expected, "state");
+            if (string.IsNullOrWhiteSpace(expectedId) ||
+                state is not ("waiting" or "preparing" or "ready" or "submitting" or "submitted" or "failed" or "gone") ||
+                !expectedIds.Add(expectedId))
+                return Fail("QuizPrepared expected_accounts 欄位無效", out error);
+            expectedAccounts.Add(new PreparedAccountState(expectedId, state));
+        }
+        if (expectedAccounts.Count == 0)
+            return Fail("QuizPrepared expected_accounts 不得為空", out error);
 
         if (!element.TryGetProperty("conflict_count", out var conflictCountElement) ||
             conflictCountElement.ValueKind != JsonValueKind.Number || !conflictCountElement.TryGetInt32(out var conflictCount) ||
             conflictCount < 0)
             return Fail("QuizPrepared conflict_count 必須是非負整數", out error);
-        quiz = new PreparedQuiz(activityToken, quizId, course, activity, parsedAccounts, conflictCount);
+        quiz = new PreparedQuiz(activityToken, quizId, course, activity, parsedAccounts, expectedAccounts, conflictCount);
         return true;
     }
 
@@ -142,11 +172,14 @@ public sealed record PreparedQuiz(
     string Course,
     ActivityInfo? Activity,
     IReadOnlyList<PreparedAccount> Accounts,
+    IReadOnlyList<PreparedAccountState> ExpectedAccounts,
     int ConflictCount);
+
+public sealed record PreparedAccountState(string AccountId, string State);
 
 public sealed record ActivityInfo(string ExternalId, string Source, string CourseId, string Course);
 
-public sealed record PreparedAccount(string AccountId, string InstanceId, IReadOnlyList<PreparedQuestion> Questions);
+public sealed record PreparedAccount(string AccountId, string InstanceId, string State, IReadOnlyList<PreparedQuestion> Questions);
 
 public sealed record PreparedQuestion(
     string SubjectId,
