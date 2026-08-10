@@ -1,4 +1,13 @@
-# 第一輪審查修復矩陣
+## 第二輪審查追蹤（2026-08-10）
+
+第二輪確認的四項 P1 已在目前工作樹封閉並通過本機正式路徑測試：
+
+- Vote／Courseware／Homework 允許存在但為空的 `instance_id`；Exam／Classroom／Questionnaire 仍要求非空，未知 source fail-closed。共享 fixture 與 production emitter 同時覆蓋 source matrix。
+- Mutation 現在拒絕 login／SSO final URL、空或非 JSON body、非 object schema、明確 error envelope；generic/classroom 要求明確 `ok/success:true`，exam／correction 要求非空 submission receipt。
+- `QuizPrepared` 新增完整 `expected_accounts` 與 attempt state；UI 保留 Failed／Gone／Waiting placeholder，整體完成以 expected participant 集合計算。
+- 數字點名只接受結構化成功回應，未知／HTML／空 body／`error_code` 均不再成功；提交後必須以指定帳號 roster 再確認。
+
+第二輪 P2 已完成的低歧義項目：Reply envelope 僅接受 `ok:true`、native event dispatcher 有總體例外邊界、AppShell boot 失敗後可在同 process 再嘗試、reasoning key 納入 account id、Windows legacy migration 使用 staging 與最後完成 marker、providers 損毀不再靜默 fallback、UpdateConfig 具集中式範圍驗證。Atomic rename 後 parent-sync 的雙階段錯誤語義、完整秘密 zeroization、真租戶 C1–C5 仍維持未驗證／條件性，不宣稱完成。
 
 本文件是 `第一輪審查.md` 的現況對照，不是新的審查結論。`confirmed` 代表原報告中的問題已由程式碼重查證；`fixed` 代表目前工作樹已有對應修正；`verified` 只在有可重跑的測試、建置或人工檢查證據時使用；`remaining` 代表仍不能宣稱完成。若一列同時出現多個標記，後者是交付門檻：例如 `fixed / verification pending` 仍不能當成發布證據。
 

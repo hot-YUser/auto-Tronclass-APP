@@ -249,9 +249,9 @@ $winMarkerPath = Join-Path $markerRoot "windows.json"
 $androidMarkerPath = Join-Path $markerRoot "android.json"
 
 Step "cargo test"
-Invoke-Native -FilePath "cargo" -Arguments @("test", "--manifest-path", "$core/Cargo.toml", "--all-targets", "--all-features") -FailureMessage "Rust cargo test 失敗"
+Invoke-Native -FilePath "cargo" -Arguments @("test", "--manifest-path", "$core/Cargo.toml", "--locked", "--all-targets", "--all-features") -FailureMessage "Rust cargo test 失敗"
 Step "cargo clippy"
-Invoke-Native -FilePath "cargo" -Arguments @("clippy", "--manifest-path", "$core/Cargo.toml", "--all-targets", "--all-features", "--", "-D", "warnings") -FailureMessage "Rust cargo clippy 失敗"
+Invoke-Native -FilePath "cargo" -Arguments @("clippy", "--manifest-path", "$core/Cargo.toml", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings") -FailureMessage "Rust cargo clippy 失敗"
 
 if (-not $SkipWindows) {
     # 兩個檢查直接連結 production source，防止 OS key 與 Rust↔C# wire contract 在發版前漂移。

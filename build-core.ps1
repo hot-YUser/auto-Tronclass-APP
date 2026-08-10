@@ -97,7 +97,7 @@ if ($Head -eq "windows") {
     if (Test-Path -LiteralPath $output -PathType Leaf) {
         Remove-Item -LiteralPath $output -Force
     }
-    Invoke-Native -FilePath $cargo -Arguments @("build", "--manifest-path", "$core/Cargo.toml", "--release") -FailureMessage "Windows 原生核心 cargo build 失敗"
+    Invoke-Native -FilePath $cargo -Arguments @("build", "--manifest-path", "$core/Cargo.toml", "--release", "--locked") -FailureMessage "Windows 原生核心 cargo build 失敗"
     $artifacts += Get-ArtifactRecord -Path $output -BuildStartedUtc $buildStartedUtc
 }
 else {
@@ -128,7 +128,11 @@ else {
                 Remove-Item -LiteralPath $output -Force
             }
         }
-        Invoke-Native -FilePath $cargo -Arguments @("ndk", "-t", "arm64-v8a", "-t", "x86_64", "-o", "jniLibs", "build", "--release") -FailureMessage "Android 原生核心 cargo ndk 失敗"
+        $cargoNdkVersion = & $cargo ndk --version
+        if ($LASTEXITCODE -ne 0 -or $cargoNdkVersion -notmatch 'cargo-ndk 4\.1\.2') {
+            throw "cargo-ndk 必須是 4.1.2；目前：$cargoNdkVersion"
+        }
+        Invoke-Native -FilePath $cargo -Arguments @("ndk", "-t", "arm64-v8a", "-t", "x86_64", "-o", "jniLibs", "build", "--release", "--locked") -FailureMessage "Android 原生核心 cargo ndk 失敗"
         foreach ($output in $outputs) {
             $artifacts += Get-ArtifactRecord -Path $output -BuildStartedUtc $buildStartedUtc
         }

@@ -3,7 +3,7 @@
 > [!WARNING]
 > v2 是以 Rust 核心與 .NET MAUI GUI 重寫的實驗性版本，尚不是「任何學校、任何活動都保證可用」的產品。請只在你本人有權限、且符合學校與課程規範的帳號與租戶上使用；自動簽到或自動作答可能違反校規、課程規則或當地法律。你必須自行取得授權並承擔使用結果。
 
-這個 Repository 是原 Python CLI 的 GUI 重寫版，使用 Rust 處理 TronClass 通訊、監控與答題流程，再由 .NET MAUI 提供 Windows 與 Android 介面。v1 研究與行為基準仍保留在 [ARTT-clean-git](https://github.com/hot-YUser/ARTT-clean-git)，v1 原始專案則是 [auto-rollcall-thu-tronclass](https://github.com/hot-YUser/auto-rollcall-thu-tronclass)。
+v1 行為基準保留在 [auto-rollcall-thu-tronclass](https://github.com/hot-YUser/auto-rollcall-thu-tronclass)。
 
 ## 目前支援範圍
 
@@ -28,7 +28,7 @@
 
 ### setup / MSIX
 
-setup/MSIX 是目前的發行或開發路徑，請以 Releases 的說明為準。未受信任的自簽憑證不代表官方發布；安裝前應檢查檔案來源、版本與簽章。開發者可執行 `package-windows.ps1 -Mode msix` 產生開發用套件，但這不是可直接對外發布的商業簽章。
+setup/MSIX 是目前的發行或開發路徑，請以 Releases 的說明為準。未受信任的自簽憑證不代表官方發布；安裝前應檢查檔案來源、版本與簽章。開發者可執行 `package-windows.ps1 -Mode msix -DevelopmentOnly` 產生開發用套件，但這不是可直接對外發布的商業簽章。
 
 ### Windows 資料與秘密
 
@@ -45,7 +45,7 @@ Android API 35 以上的 `dataSync` 前景服務有系統配額：每個滾動 2
 
 ## LLM 設定
 
-LLM 只在你明確啟用自動答題並提供合法的 provider 金鑰時使用。預設可使用 NVIDIA NIM 相容端點；目前通用 OpenAI-compatible 端點只送標準欄位，NVIDIA 專用欄位只對確定的 NVIDIA host 啟用。金鑰可由 UI 設定或受控環境變數提供，禁止提交至 Git。
+LLM 只在你明確啟用自動答題並透過 UI 將合法的 provider 金鑰保存至加密 vault 時使用。預設可使用 NVIDIA NIM 相容端點；目前通用 OpenAI-compatible 端點只送標準欄位，NVIDIA 專用欄位只對確定的 NVIDIA host 啟用。金鑰禁止提交至 Git。
 
 自動答題涉及真實成績活動，請先確認教師/學校允許。若題目、答案型別、租戶或 HTTP 狀態不符合契約，應保留可見錯誤並停止該次提交，而不是把錯誤當成成功。
 
@@ -72,8 +72,8 @@ Rust core（登入、持久化、監控、點名、測驗、LLM、redaction）
 
 ```powershell
 # Rust 核心單元/整合測試與 lint
-cargo test --manifest-path core/Cargo.toml --all-targets --all-features
-cargo clippy --manifest-path core/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --manifest-path core/Cargo.toml --locked --all-targets --all-features
+cargo clippy --manifest-path core/Cargo.toml --locked --all-targets --all-features -- -D warnings
 
 # 產生目前平台的 native core
 ./build-core.ps1 -Head windows
