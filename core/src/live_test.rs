@@ -80,7 +80,7 @@ async fn live_llm() {
     let client = new_client();
     let messages =
         vec![serde_json::json!({"role":"user","content":"單選題：2+2=? A) 3  B) 4  C) 5  D) 6"})];
-    let ans = llm::answer_question(&client, &cfg, &messages, noop_cb as EventCb, "live", "q1", None).await;
+    let ans = llm::answer_question(&client, &cfg, &messages, noop_cb as EventCb, "live", "live-account", "q1", None).await;
     println!("llm answer = {ans:?}");
     let ans = ans.expect("llm returned None — empty choices? check max_tokens/thinking_mode");
     assert!(ans.to_uppercase().contains('B'), "expected the letter B, got {ans:?}");
@@ -229,7 +229,7 @@ async fn live_exam_answer() {
     };
     let prior = HashMap::new();
     let answers =
-        answer::shared_answers(&client, &cfg, noop_cb as EventCb, &exam, &course, &base, &paper.subjects, 4, &prior).await;
+        answer::shared_answers(&client, &cfg, noop_cb as EventCb, &exam, "live-account", &course, &base, &paper.subjects, 4, &prior).await;
     let missing = answer::missing_subjects(&paper.subjects, &answers);
     println!("answered {}/{} subjects; missing={missing:?}", answers.len(), paper.subjects.len());
     assert!(missing.is_empty(), "LLM left subjects unanswered: {missing:?}");
@@ -267,7 +267,7 @@ async fn live_number_rollcall() {
 
     // Sign with the known code (avoid brute-forcing the real server). cfg is unused on this path.
     let cfg = NumberCfg { concurrency: 8, min_concurrency: 2, cooldown_ms: 200, max_cooldowns: 2 };
-    let signed = rollcall::sign_number(&client, &ep, &id, "v2-live-test", Some(&code), cfg).await;
+    let signed = rollcall::sign_number(&client, &ep, &id, &user_no, "v2-live-test", Some(&code), cfg).await;
     println!("sign_number = {signed:?}");
 
     // The real success criterion is the roster: am I actually marked present?

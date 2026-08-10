@@ -192,10 +192,6 @@ pub fn classify_response(status: u16, body: &str) -> CodeResult {
 }
 
 // Number-answer body markers (v1 `number_rollcall`), matched case-insensitively against body+message.
-const SUCCESS_MARKERS: &[&str] =
-    &["success", "ok", "on_call", "on_call_fine", "accepted", "completed", "已完成", "成功", "點名成功", "簽到成功"];
-const WRONG_CODE_MARKERS: &[&str] =
-    &["wrong", "incorrect", "invalid number", "invalid code", "not match", "mismatch", "錯誤", "錯碼", "不正確", "失敗", "不存在", "過期"];
 const UNAUTHORIZED_MARKERS: &[&str] =
     &["unauthorized", "forbidden", "login", "sign in", "session expired", "未登入", "請登入", "登入逾時", "權限"];
 
@@ -206,30 +202,33 @@ const UNAUTHORIZED_MARKERS: &[&str] =
 fn classify_number_2xx(body: &str) -> CodeResult {
     let text = body.trim();
     if text.is_empty() {
-        return CodeResult::Success;
+        return CodeResult::Wrong;
     }
-    let payload: Option<Value> = serde_json::from_str::<Value>(text).ok().filter(Value::is_object);
-    let message = payload.as_ref().map(payload_message).unwrap_or_default();
+    if has_marker(&text.to_lowercase(), UNAUTHORIZED_MARKERS) {
+        return CodeResult::Fatal;
+    }
+    let Ok(payload) = serde_json::from_str::<Value>(text) else {
+        return CodeResult::Wrong;
+    };
+    let Some(object) = payload.as_object() else {
+        return CodeResult::Wrong;
+    };
+    let message = payload_message(&payload);
     let combined = format!("{text} {message}").to_lowercase();
-
     if has_marker(&combined, UNAUTHORIZED_MARKERS) {
-        return CodeResult::Fatal; // a 2xx that is really the login page / an auth error = session expired
+        return CodeResult::Fatal;
     }
-    let success_flag = payload.as_ref().and_then(|p| payload_bool(p, &["success", "ok", "is_success"]));
-    if success_flag == Some(true) {
-        return CodeResult::Success;
-    }
-    if has_marker(&combined, WRONG_CODE_MARKERS) {
+    if crate::http::explicit_business_error_value(&payload) {
         return CodeResult::Wrong;
     }
-    if success_flag == Some(false) {
-        return CodeResult::Wrong;
-    }
-    let marker_text = if payload.is_some() { message.to_lowercase() } else { combined };
-    if has_marker(&marker_text, SUCCESS_MARKERS) {
+    if payload_bool(&payload, &["success", "ok", "is_success"]) == Some(true) {
         return CodeResult::Success;
     }
-    CodeResult::Success // v1's 2xx default
+    let status = object.get("status").and_then(Value::as_str).unwrap_or("");
+    if matches!(status, "on_call" | "on_call_fine" | "accepted" | "completed") {
+        return CodeResult::Success;
+    }
+    CodeResult::Wrong
 }
 
 /// The human message a payload carries (v1 `_payload_message`) — the first non-empty of these keys.
@@ -298,20 +297,26 @@ pub async fn sign_number(
     client: &Client,
     ep: &Endpoints,
     id: &str,
+    user_no: &str,
     device_id: &str,
     code: Option<&str>,
     cfg: NumberCfg,
 ) -> Result<SignOutcome, String> {
     let url = ep.answer_number(id);
-    if let Some(code) = code {
-        return match submit_number_code(client, &url, device_id, code).await {
+    let outcome = if let Some(code) = code {
+        match submit_number_code(client, &url, device_id, code).await {
             CodeResult::Success => Ok(SignOutcome { method: "number".into(), discovered_code: Some(code.to_string()) }),
             CodeResult::Fatal => Err(format!("number: fatal response ({SESSION_INVALID})")),
             CodeResult::Transient => Err("number: transient error submitting shared code".into()),
             CodeResult::Wrong => Err("number: shared code rejected".into()),
-        };
+        }
+    } else {
+        brute_force_number(client, &url, device_id, cfg).await
+    }?;
+    if !recheck_on_call_fine(client, ep, id, user_no).await {
+        return Err("number: submission was not confirmed by the roster".into());
     }
-    brute_force_number(client, &url, device_id, cfg).await
+    Ok(outcome)
 }
 
 async fn submit_number_code(client: &Client, url: &str, device_id: &str, code: &str) -> CodeResult {
@@ -690,10 +695,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_number_2xx_defaults_to_success() {
-        // A real accept is `{"status":"on_call"}` with no success bool → Success (docs 30).
+    fn classify_number_2xx_requires_structured_success() {
         assert_eq!(classify_response(200, r#"{"id":1,"status":"on_call"}"#), CodeResult::Success);
-        assert_eq!(classify_response(200, ""), CodeResult::Success);
+        assert_eq!(classify_response(200, r#"{"success":true}"#), CodeResult::Success);
+        for rejected in [
+            "",
+            "unsuccessful",
+            "not ok",
+            r#"{}"#,
+            r#"{"error_code":"denied"}"#,
+            r#"{"error":"wrong"}"#,
+        ] {
+            assert_eq!(classify_response(200, rejected), CodeResult::Wrong, "{rejected}");
+        }
+        assert_eq!(classify_response(200, "<html>login</html>"), CodeResult::Fatal);
         assert_eq!(classify_response(400, "wrong code"), CodeResult::Wrong);
         assert_eq!(classify_response(403, ""), CodeResult::Fatal);
         assert_eq!(classify_response(429, ""), CodeResult::Transient);

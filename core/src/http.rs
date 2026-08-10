@@ -19,19 +19,32 @@ pub async fn send_checked(request: RequestBuilder, operation: &str) -> Result<Re
     Ok(response)
 }
 
-pub async fn mutation_checked(request: RequestBuilder, operation: &str) -> Result<(), String> {
+pub async fn mutation_checked(request: RequestBuilder, operation: &str) -> Result<Value, String> {
     let response = send_checked(request, operation).await?;
+    if response_url_is_login(response.url()) {
+        return Err(format!("{operation}: session redirected to login"));
+    }
     let body = response.text().await.map_err(|error| format!("{operation}: invalid response: {error}"))?;
-    if explicit_business_error(&body) {
+    let payload = serde_json::from_str::<Value>(&body)
+        .map_err(|_| format!("{operation}: response was not JSON"))?;
+    if !payload.is_object() {
+        return Err(format!("{operation}: response JSON was not an object"));
+    }
+    if explicit_business_error_value(&payload) {
         return Err(format!("{operation}: server rejected the request"));
     }
-    Ok(())
+    Ok(payload)
+}
+
+pub fn response_url_is_login(url: &reqwest::Url) -> bool {
+    url.path().split('/').any(|segment| segment.eq_ignore_ascii_case("login") || segment.eq_ignore_ascii_case("sso"))
 }
 
 pub fn explicit_business_error(body: &str) -> bool {
-    let Ok(payload) = serde_json::from_str::<Value>(body) else {
-        return false;
-    };
+    serde_json::from_str::<Value>(body).is_ok_and(|payload| explicit_business_error_value(&payload))
+}
+
+pub fn explicit_business_error_value(payload: &Value) -> bool {
     let Some(object) = payload.as_object() else {
         return false;
     };
@@ -43,7 +56,12 @@ pub fn explicit_business_error(body: &str) -> bool {
     }
     object.get("error_code").is_some_and(|value| match value {
         Value::Null => false,
-        Value::String(code) => !code.trim().is_empty(),
+        Value::Number(number) => number.as_i64() != Some(0) && number.as_u64() != Some(0),
+        Value::String(code) => !code.trim().is_empty() && code.trim() != "0",
+        _ => true,
+    }) || object.get("error").is_some_and(|value| match value {
+        Value::Null => false,
+        Value::String(message) => !message.trim().is_empty(),
         _ => true,
     })
 }
@@ -66,15 +84,24 @@ mod tests {
         assert!(explicit_business_error(r#"{"ok":false}"#));
         assert!(explicit_business_error(r#"{"error_code":"denied"}"#));
         assert!(explicit_business_error(r#"{"error_code":403}"#));
+        assert!(explicit_business_error(r#"{"error":"denied"}"#));
     }
 
     #[test]
-    fn explicit_business_error_allows_success_and_unstructured_bodies() {
-        assert!(!explicit_business_error(""));
-        assert!(!explicit_business_error("OK"));
+    fn explicit_business_error_allows_explicit_success_and_zero_error_codes() {
         assert!(!explicit_business_error(r#"{"success":true}"#));
         assert!(!explicit_business_error(r#"{"id":"submission-1"}"#));
         assert!(!explicit_business_error(r#"{"error_code":""}"#));
+        assert!(!explicit_business_error(r#"{"error_code":"0"}"#));
+        assert!(!explicit_business_error(r#"{"error_code":0}"#));
         assert!(!explicit_business_error(r#"{"error_code":null}"#));
+    }
+
+    #[test]
+    fn login_redirect_paths_are_detected_case_insensitively() {
+        for url in ["https://tenant/sso", "https://tenant/auth/Login?next=x"] {
+            assert!(super::response_url_is_login(&url.parse().unwrap()));
+        }
+        assert!(!super::response_url_is_login(&"https://tenant/api/exams".parse().unwrap()));
     }
 }

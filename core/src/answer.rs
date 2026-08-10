@@ -142,6 +142,7 @@ pub async fn shared_answers(
     cfg: &LlmConfig,
     cb: llm::EventCb,
     activity_token: &str,
+    account_id: &str,
     course_id: &str,
     base_url: &str,
     subjects: &[Value],
@@ -180,7 +181,7 @@ pub async fn shared_answers(
                                 json!({ "role": "user", "content": CORRECTION_PROMPT }),
                             ]
                         };
-                        let reply = llm::answer_question(client, cfg, &messages, cb, activity_token, &plan.subject_id, tool_ctx.as_ref()).await.unwrap_or_default();
+                        let reply = llm::answer_question(client, cfg, &messages, cb, activity_token, account_id, &plan.subject_id, tool_ctx.as_ref()).await.unwrap_or_default();
                         if !reply.is_empty() {
                             if let Some(a) = parse_answer(subject, &plan.qtype, &reply) {
                                 answers.insert(plan.subject_id.clone(), a);
@@ -438,6 +439,9 @@ pub async fn submit_exam(
         "submit exam",
     )
     .await?;
+    if http::explicit_business_error_value(&v) {
+        return Err("submit exam: server rejected the request".to_string());
+    }
     // submission_id comes back as an INTEGER (e.g. 681504) — reading it as_str gave "" and disabled the
     // resubmit-for-correct pass; accept int OR string, with the v1 `id` fallback (confirmed live 2026-07).
     let sid = json_id_string(v.get("submission_id").or_else(|| v.get("id")));
@@ -489,11 +493,15 @@ pub async fn resubmit_correct(
         return Ok(());
     }
     let body = exam_body(&paper.instance_id, &entries);
-    http::send_checked(
+    let response = http::mutation_checked(
         client.post(ep.exam_submissions(activity_id)).json(&body),
         "resubmit corrected exam",
     )
     .await?;
+    let sid = json_id_string(response.get("submission_id").or_else(|| response.get("id")));
+    if sid.is_empty() {
+        return Err("resubmit corrected exam: response missing submission_id".to_string());
+    }
     Ok(())
 }
 
