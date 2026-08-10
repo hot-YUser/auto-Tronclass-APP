@@ -8,7 +8,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 腳本集中於 tools/；$root 維持 = repo root。
+$tools = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $tools
 Set-Location $root
 
 if ($Mode -ne "portable" -and -not $DevelopmentOnly) {
@@ -35,7 +37,7 @@ $tfm = "net11.0-windows10.0.19041.0"
 
 function Publish-Portable {
     # release.ps1 會執行 cargo、原生 marker、self-contained publish、真實資料隔離 smoke、資產檢查。
-    Invoke-ScriptChecked -Path (Join-Path $root "release.ps1") -Arguments @(
+    Invoke-ScriptChecked -Path (Join-Path $tools "release.ps1") -Arguments @(
         "-Tag", "dev-local", "-SkipAndroid", "-SkipInstaller"
     )
     Write-Host "portable -> dist/AutoTronclass-dev-local-windows-x64-portable.zip" -ForegroundColor Green
@@ -43,7 +45,7 @@ function Publish-Portable {
 
 function Publish-MsixDevelopment {
     Write-Warning "MSIX 僅供開發測試，使用自簽憑證；不代表可發布的正式安裝檔。"
-    Invoke-ScriptChecked -Path (Join-Path $root "build-core.ps1") -Arguments @("-Head", "windows")
+    Invoke-ScriptChecked -Path (Join-Path $tools "build-core.ps1") -Arguments @("-Head", "windows")
 
     foreach ($path in @(
         (Join-Path $root "ui\bin\Release\$tfm"),

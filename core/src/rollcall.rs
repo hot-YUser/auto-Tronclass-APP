@@ -1,4 +1,4 @@
-//! The four rollcall types (docs 30). `classify` is pure and unit-tested; the per-type answer +
+//! The four rollcall types (rollcall.rs). `classify` is pure and unit-tested; the per-type answer +
 //! `on_call_fine` recheck are async over a single account's session. Each account signs for itself
 //! with its own device id; shared computation (number code, radar solve) is done once by the caller.
 
@@ -28,7 +28,7 @@ impl RollcallKind {
     }
 }
 
-/// Classify a rollcall by its status flags — each rollcall is exactly one type (docs 30 table).
+/// Classify a rollcall by its status flags — each rollcall is exactly one type (rollcall.rs table).
 pub fn classify(rc: &Value) -> RollcallKind {
     let flag = |k: &str| rc.get(k).and_then(Value::as_bool) == Some(true);
     if flag("is_number") {
@@ -51,7 +51,7 @@ pub struct SignOutcome {
     pub discovered_code: Option<String>,
 }
 
-// --- `student_rollcalls` object roster helpers (docs 30 real contract) ---
+// --- `student_rollcalls` object roster helpers (rollcall.rs real contract) ---
 
 /// A roster entry's status (any of the three real field names) is the present state `on_call_fine`.
 fn entry_fine(e: &Value) -> bool {
@@ -91,7 +91,7 @@ fn my_present(v: &Value, user_no: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whole-class attendance rate (percent) for the 15% gate — computed from the roster (docs 30).
+/// Whole-class attendance rate (percent) for the 15% gate — computed from the roster (rollcall.rs).
 pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Option<f64> {
     let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
     let (present, total) = roster_stats(&v);
@@ -154,7 +154,7 @@ pub async fn recheck_on_call_fine(client: &Client, ep: &Endpoints, id: &str, use
     my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v)
 }
 
-/// Brute-force tuning (docs 30). Concurrency starts high and halves toward `min_concurrency` on
+/// Brute-force tuning (rollcall.rs). Concurrency starts high and halves toward `min_concurrency` on
 /// throttling; `cooldown_ms` is the backoff sleep; give up after `max_cooldowns` transient rounds.
 #[derive(Clone, Copy)]
 pub struct NumberCfg {
@@ -174,7 +174,7 @@ pub enum CodeResult {
     Fatal,
 }
 
-/// Classify a number-answer by HTTP status first, then the body for a 2xx (docs 30).
+/// Classify a number-answer by HTTP status first, then the body for a 2xx (rollcall.rs).
 pub fn classify_response(status: u16, body: &str) -> CodeResult {
     if status == 401 || status == 403 || (300..400).contains(&status) {
         return CodeResult::Fatal; // auth lost / redirect to login → aborting is the only safe move
@@ -292,7 +292,7 @@ pub fn is_auth_lost(err: &str) -> bool {
 }
 
 /// number: submit the shared code once (classified), or brute-force it. Success is the response
-/// success flag — not just a recheck (docs 30 §3). Returns the winning code so it can be shared.
+/// success flag — not just a recheck (rollcall.rs §3). Returns the winning code so it can be shared.
 pub async fn sign_number(
     client: &Client,
     ep: &Endpoints,
@@ -389,7 +389,7 @@ async fn brute_force_number(client: &Client, url: &str, device_id: &str, cfg: Nu
     Err("number code not found in 0000–9999".into())
 }
 
-/// radar: walk the configured strategy chain in order, rechecking `on_call_fine` after each (docs 30).
+/// radar: walk the configured strategy chain in order, rechecking `on_call_fine` after each (rollcall.rs).
 /// `empty_answer` = PUT `{}` (main path); `global_wgs84` = probe distances and multilaterate on the
 /// WGS84 ellipsoid, then resubmit the solved point. Default chain is `[empty_answer, global_wgs84]`.
 pub async fn sign_radar(
@@ -404,7 +404,7 @@ pub async fn sign_radar(
     for strat in strategies {
         match strat.as_str() {
             "empty_answer" => {
-                // Empty main path (docs 30 / docs/70 §1): plain `{}`, no api_version, no beacon.
+                // Empty main path (rollcall.rs / radar.rs §1): plain `{}`, no api_version, no beacon.
                 let resp = client
                     .put(ep.answer_radar(id))
                     .json(&json!({}))
@@ -430,7 +430,7 @@ pub async fn sign_radar(
     Err(last_err)
 }
 
-/// `global_wgs84` = the docs/70 §11 driver (steps 1-5): `lite` (no coords) → probe the 12 earth-scale
+/// `global_wgs84` = the radar.rs §11 driver (steps 1-5): `lite` (no coords) → probe the 12 earth-scale
 /// anchors → `solve_global_radar` → standard sampling rings → refined estimate. Any submit that lands
 /// in scope (HTTP 2xx, no error_code) is a hit → recheck → sign. ponytail: steps 6-7 (supplement
 /// rings / unbounded chessboard grid / rate-limit cooldown) + concurrent anchor probing are R2.5.
@@ -477,7 +477,7 @@ async fn radar_confirm(client: &Client, ep: &Endpoints, id: &str, user_no: &str)
     }
 }
 
-/// `lite` (docs/70 §1): carries NO target coordinate — only `use_beacon` + `beacon_nonce`.
+/// `lite` (radar.rs §1): carries NO target coordinate — only `use_beacon` + `beacon_nonce`.
 async fn radar_lite(client: &Client, ep: &Endpoints, id: &str) -> (bool, String) {
     let v: Value = match client.get(ep.lite(id)).send().await {
         Ok(r) => r.json().await.unwrap_or(Value::Null),
@@ -495,7 +495,7 @@ enum ProbeOutcome {
     NoInfo,
 }
 
-/// Submit one coordinate answer (docs/70 §1 body) and classify the response.
+/// Submit one coordinate answer (radar.rs §1 body) and classify the response.
 async fn radar_probe(client: &Client, ep: &Endpoints, id: &str, point: GeoPoint, device_id: &str, beacon: Option<(&str, &str)>) -> ProbeOutcome {
     let mut body = json!({
         "deviceId": device_id, "latitude": point.lat, "longitude": point.lon,
@@ -513,7 +513,7 @@ async fn radar_probe(client: &Client, ep: &Endpoints, id: &str, point: GeoPoint,
     parse_scope(status, &text)
 }
 
-/// docs/70 §1 distance extraction — **error_code first, regardless of status** (a real server returns
+/// radar.rs §1 distance extraction — **error_code first, regardless of status** (a real server returns
 /// out-of-scope as `200 + error_code`; a status-first check would misread every off-target anchor as
 /// in-range → no distances → the solver never runs → radar fully dead; exact status is a §12 unknown).
 fn parse_scope(status: u16, body: &str) -> ProbeOutcome {
@@ -530,7 +530,7 @@ fn parse_scope(status: u16, body: &str) -> ProbeOutcome {
     ProbeOutcome::NoInfo
 }
 
-/// Nested walk (docs/70 §1): body; if dict, descend keys `data,result,error,errors,scope,rollcall`;
+/// Nested walk (radar.rs §1): body; if dict, descend keys `data,result,error,errors,scope,rollcall`;
 /// if list, first 3 elements. Collect the dicts to inspect (bounded depth).
 fn walk_dicts<'a>(v: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>>, depth: u32) {
     if depth > 6 {
@@ -567,7 +567,7 @@ fn extract_distance(v: &Value) -> Option<f64> {
     None
 }
 
-/// beacon signature (docs/70 §1): `md5(nonce+deviceId+userId+ts) + "," + ts`. ts = unix seconds.
+/// beacon signature (radar.rs §1): `md5(nonce+deviceId+userId+ts) + "," + ts`. ts = unix seconds.
 fn radar_signature(nonce: &str, device_id: &str, user_no: &str, ts: u64) -> String {
     use md5::{Digest, Md5};
     let mut h = Md5::new();

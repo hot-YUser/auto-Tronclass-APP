@@ -39,16 +39,16 @@ jobs:
         run: dotnet workload install maui-windows --version 11.0.100-preview.6.26364.2
       - name: Build Windows native core
         shell: pwsh
-        run: ./build-core.ps1 -Head windows
+        run: ./tools/build-core.ps1 -Head windows
       - name: Build Windows UI
         shell: pwsh
         run: dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0 -c Release -p:TargetFrameworks=net11.0-windows10.0.19041.0
       - name: Run protocol contract check
         shell: pwsh
-        run: dotnet run --project checks/ProtocolContract.Check/ProtocolContract.Check.csproj -c Release
+        run: dotnet run --project tools/checks/ProtocolContract.Check/ProtocolContract.Check.csproj -c Release
       - name: Run device-key check
         shell: pwsh
-        run: dotnet run --project checks/DeviceKey.Check/DeviceKey.Check.csproj -c Release
+        run: dotnet run --project tools/checks/DeviceKey.Check/DeviceKey.Check.csproj -c Release
 
   android:
     name: Android UI and native ABI build
@@ -73,7 +73,7 @@ jobs:
           if ($version -notmatch 'cargo-ndk 4\.1\.2') { throw "Unexpected cargo-ndk version: $version" }
       - name: Build Android native core
         shell: pwsh
-        run: ./build-core.ps1 -Head android
+        run: ./tools/build-core.ps1 -Head android
       - name: Install Android platform dependencies
         shell: pwsh
         run: dotnet build ui/Ui.csproj -f net11.0-android -t:InstallAndroidDependencies -p:AcceptAndroidSDKLicenses=True

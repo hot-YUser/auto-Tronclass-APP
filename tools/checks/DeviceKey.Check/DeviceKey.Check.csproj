@@ -7,7 +7,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\ui\Interop\DeviceKeyProvider.cs" Link="DeviceKeyProvider.cs" />
-    <Compile Include="..\..\ui\Platforms\Windows\DeviceKeyProtector.cs" Link="DeviceKeyProtector.cs" />
+    <Compile Include="..\..\..\ui\Interop\DeviceKeyProvider.cs" Link="DeviceKeyProvider.cs" />
+    <Compile Include="..\..\..\ui\Platforms\Windows\DeviceKeyProtector.cs" Link="DeviceKeyProtector.cs" />
   </ItemGroup>
 </Project>

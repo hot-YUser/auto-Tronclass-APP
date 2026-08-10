@@ -43,7 +43,7 @@
 		<ApplicationVersion>11</ApplicationVersion>
 
 		<!-- Windows distribution mode: 'portable' (unpackaged exe, default) or 'msix' (signed installer).
-		     package-windows.ps1 sets -p:PackageMode=msix -p:CertThumbprint=... for the MSIX build. -->
+		     tools/package-windows.ps1 sets -p:PackageMode=msix -p:CertThumbprint=... for the MSIX build. -->
 		<PackageMode Condition="'$(PackageMode)' == ''">portable</PackageMode>
 		<WindowsPackageType Condition="'$(PackageMode)' != 'msix'">None</WindowsPackageType>
 
@@ -70,7 +70,7 @@
 		<!-- Raw Assets (also remove the "Resources\Raw" prefix) -->
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
 		<!-- Rust 與 C# Mock 共用的跨語言 golden contract。 -->
-		<MauiAsset Include="..\protocol\fixtures\quiz_prepared_v1.json" LogicalName="contract/quiz_prepared_v1.json" />
+		<MauiAsset Include="..\core\src\assets\quiz_prepared_v1.json" LogicalName="contract/quiz_prepared_v1.json" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -78,7 +78,7 @@
 		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.0" />
 	</ItemGroup>
 
-	<!-- Native core, built by build-core.ps1 into the sibling core/ crate's output.
+	<!-- Native core, built by tools/build-core.ps1 into the sibling core/ crate's output.
 	     DllImport("tronclass_core") resolves to tronclass_core.dll / libtronclass_core.so. -->
 	<ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
 		<None Include="..\core\target\release\tronclass_core.dll" Link="tronclass_core.dll">

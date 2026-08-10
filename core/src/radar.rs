@@ -1,5 +1,5 @@
-//! Radar-rollcall global position solver — a faithful 1:1 port of `docs/70-radar-solver.md`
-//! (owner-authored, server-verified numerical algorithm; sanctioned transcription). Send earth-scale
+//! Radar-rollcall global position solver — a faithful 1:1 port of the owner-authored, server-verified
+//! numerical algorithm (this file IS the executable realization; no external spec doc is maintained).
 //! anchor coordinates → collect each "distance to target" → **3D linear closed-form initial estimate**
 //! (global, no tangent plane) → **geodesic pattern search** → **LM local refine** → uncertainty.
 //! Pure, zero external math deps (docs 90 §8). The old ENU tangent-plane solver was wrong at earth

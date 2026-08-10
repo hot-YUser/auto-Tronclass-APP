@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn shared_quiz_prepared_fixture_uses_typed_answers() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../protocol/fixtures/quiz_prepared_v1.json"
+            "assets/quiz_prepared_v1.json"
         ))
         .unwrap();
         assert_eq!(fixture["event"], "QuizPrepared");

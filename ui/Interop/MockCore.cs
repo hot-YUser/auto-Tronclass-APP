@@ -9,7 +9,8 @@ namespace TronClass.Interop;
 /// hero-moment popup, the core-owned countdown, the LLM reasoning stream, the multi-account merge —
 /// can be built and previewed WITHOUT the native library. **Every command below produces a visible
 /// response**, so you can wire and preview any button. Flip <c>MauiProgram</c> to <see cref="NativeCore"/>
-/// for the real core; the UI does not change. Field names/shapes are verbatim from <c>docs/20-contract.md</c>.
+/// for the real core; the UI does not change. Field names/shapes are verbatim from the wire
+/// contract implemented by <c>QuizPreparedContract.cs</c> and <c>core/src/protocol.rs</c>.
 /// </summary>
 public sealed class MockCore : ICore
 {
