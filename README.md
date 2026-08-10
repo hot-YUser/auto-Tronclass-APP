@@ -28,7 +28,7 @@ v1 行為基準保留在 [auto-rollcall-thu-tronclass](https://github.com/hot-YU
 
 ### setup / MSIX
 
-setup/MSIX 是目前的發行或開發路徑，請以 Releases 的說明為準。未受信任的自簽憑證不代表官方發布；安裝前應檢查檔案來源、版本與簽章。開發者可執行 `package-windows.ps1 -Mode msix -DevelopmentOnly` 產生開發用套件，但這不是可直接對外發布的商業簽章。
+setup/MSIX 是目前的發行或開發路徑，請以 Releases 的說明為準。未受信任的自簽憑證不代表官方發布；安裝前應檢查檔案來源、版本與簽章。開發者可執行 `tools/package-windows.ps1 -Mode msix -DevelopmentOnly` 產生開發用套件，但這不是可直接對外發布的商業簽章。
 
 ### Windows 資料與秘密
 
@@ -64,7 +64,7 @@ Rust core（登入、持久化、監控、點名、測驗、LLM、redaction）
         └─ Android: libtronclass_core.so（arm64-v8a / x86_64）
 ```
 
-`protocol/fixtures/quiz_prepared_v1.json` 是 Rust 與 C# 共用的 golden fixture。跨邊界變更必須同時更新核心、UI、Mock/檢查器與測試，不應只修改其中一端。
+`core/src/assets/quiz_prepared_v1.json` 是 Rust 與 C# 共用的 golden fixture。跨邊界變更必須同時更新核心、UI、Mock/檢查器與測試，不應只修改其中一端。
 
 ## 從原始碼建置與測試
 
@@ -76,8 +76,8 @@ cargo test --manifest-path core/Cargo.toml --locked --all-targets --all-features
 cargo clippy --manifest-path core/Cargo.toml --locked --all-targets --all-features -- -D warnings
 
 # 產生目前平台的 native core
-./build-core.ps1 -Head windows
-./build-core.ps1 -Head android
+./tools/build-core.ps1 -Head windows
+./tools/build-core.ps1 -Head android
 
 # Windows 開發建置（實際 TFM 以目前 SDK 與 Ui.csproj 為準）
 dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0 -c Debug
@@ -86,14 +86,14 @@ dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0 -c Debug
 dotnet build ui/Ui.csproj -f net11.0-android -c Debug
 
 # 發行流程：測試、雙 head、產物 hash/簽章/smoke gate
-./release.ps1 -Tag v2.0.0-alpha.XX
+./tools/release.ps1 -Tag v2.0.0-alpha.XX
 ```
 
-`release.ps1` 需要 Android 簽章資訊與私有 keystore 才能做完整 APK 發行；私鑰不在 Repository。若只做 Windows 開發驗證，可依腳本參數跳過 Android，但跳過的 head 不得被當成完整雙平台發行證據。`checks/DeviceKey.Check` 是無第三方依賴的 Windows 裝置金鑰/遷移 runnable check；CI 也應執行它與協定 contract check。
+`tools/release.ps1` 需要 Android 簽章資訊與私有 keystore 才能做完整 APK 發行；私鑰不在 Repository。若只做 Windows 開發驗證，可依腳本參數跳過 Android，但跳過的 head 不得被當成完整雙平台發行證據。`tools/checks/DeviceKey.Check` 是無第三方依賴的 Windows 裝置金鑰/遷移 runnable check；CI 也應執行它與協定 contract check。
 
 ## 發行驗證與簽章
 
-正式產物必須由 `release.ps1` 產生並通過：Rust test/clippy、native marker（hash/mtime）、Windows publish native hash、隔離資料 smoke test、APK `apksigner verify`、APK 內兩個 ABI 的 native hash 比對，以及完整資產存在性檢查。未通過任何一項都不應發布。
+正式產物必須由 `tools/release.ps1` 產生並通過：Rust test/clippy、native marker（hash/mtime）、Windows publish native hash、隔離資料 smoke test、APK `apksigner verify`、APK 內兩個 ABI 的 native hash 比對，以及完整資產存在性檢查。未通過任何一項都不應發布。
 
 目前公開 Android 憑證指紋固定為：
 
@@ -102,7 +102,7 @@ SHA-256: 50F019154AFDFA4CB464339CF7F6D62DD603FAA68136E97FF01E8D7C09FD2CF7
 Subject: CN=Auto TronClass, OU=Dev, O=hot-YUser, C=TW
 ```
 
-指紋只驗證公開憑證，不包含私鑰。若要輪替簽章金鑰，必須在獨立變更中更新 `release/android-signing.json`、發布說明與升級策略；不能以環境變數靜默改成另一把未審查的金鑰。
+指紋只驗證公開憑證，不包含私鑰。若要輪替簽章金鑰，必須在獨立變更中更新 `tools/android-signing.json`、發布說明與升級策略；不能以環境變數靜默改成另一把未審查的金鑰。
 
 ## 審查與目前限制
 

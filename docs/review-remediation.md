@@ -1,5 +1,7 @@
 ## 第二輪審查追蹤（2026-08-10）
 
+> 建置／發版腳本與資產自 2026-08-10 起集中於 `tools/`（`tools/release.ps1`、`tools/build-core.ps1`、`tools/checks/`、`tools/android-signing.json`）；本矩陣描述性路徑已同步更新。
+
 第二輪確認的四項 P1 已在目前工作樹封閉並通過本機正式路徑測試：
 
 - Vote／Courseware／Homework 允許存在但為空的 `instance_id`；Exam／Classroom／Questionnaire 仍要求非空，未知 source fail-closed。共享 fixture 與 production emitter 同時覆蓋 source matrix。
@@ -23,7 +25,7 @@
 | P1-6 Start×2 / Start→Stop orphan monitor | confirmed | fixed / verified | `a04262c` 以世代狀態機收斂 core；目前 UI 另有 boot-ready 與 transition guard。需把 Start/Stop 競態測試納入完整 all-features gate。 |
 | P1-7 損毀資料被當首次啟動並覆寫 | confirmed | fixed / verified | `3cacbd8`、`f1a2a30` 保留毀損檔並原子保存；`checks/DeviceKey.Check` 已實跑首次啟動、重載、遷移、毀損 envelope/legacy preservation。仍需在 CI 穩定執行。 |
 | P1-8 Android dataSync 時限與逾時崩潰 | confirmed | fixed / build verified / device pending | `836b0f3` 改為 NotSticky、OnTimeout、停止時關閉服務；本輪讓 timeout/OnDestroy 共用冪等 best-effort core stop，且通知例外不再阻止 `StopForeground`/`StopSelf`。2026-08-10 Android Release build 0 warning / 0 error；API 35+ 真機的 6 小時/24 小時 timeout 與 process-death 行為仍待實測。 |
-| P1-9 舊 native core、smoke 污染真實資料 | confirmed | fixed / Windows release verified | `build-core.ps1`/`release.ps1` 已加入精確輸出清理、marker hash/mtime、publish hash、隔離 smoke、apksigner 與 APK ABI hash。2026-08-10 `dev-local-check4` Windows-only dry-run 通過：117 tests、clippy、兩個 runnable checks、fresh native marker、self-contained publish、5.6 秒實跑、隔離資料 fingerprint、111 MB portable ZIP；signed Android gate 尚未重跑。 |
+| P1-9 舊 native core、smoke 污染真實資料 | confirmed | fixed / Windows release verified | `tools/build-core.ps1`/`tools/release.ps1` 已加入精確輸出清理、marker hash/mtime、publish hash、隔離 smoke、apksigner 與 APK ABI hash。2026-08-10 `dev-local-check4` Windows-only dry-run 通過：117 tests、clippy、兩個 runnable checks、fresh native marker、self-contained publish、5.6 秒實跑、隔離資料 fingerprint、111 MB portable ZIP；signed Android gate 尚未重跑。 |
 
 ## 其他高風險項目
 
@@ -38,7 +40,7 @@
 | ISO-8601 parser 不完整 | fixed / verified | parser 現在驗證年月日、閏年、時間範圍、Z/±HH:MM/±HHMM 與 ±14:00 邊界；Rust monitor tests 目前 11 項通過。 |
 | LLM body 綁死 NVIDIA/MiniMax 方言 | fixed / verified | `LlmProvider` 只在精確 NVIDIA host 傳 vendor fields；generic OpenAI-compatible request 共用 builder，3 個 provider tests 通過。 |
 | README 是 v1 CLI 文件 | fixed | 本文件與 README 已改為 v2 Rust + MAUI GUI 說明；使用者操作、平台限制與證據仍以實際 release gate 為準。 |
-| 測試與 CI 斷層 | fixed / verified | `.github/workflows/ci.yml` 已含 Rust test/clippy、Windows production contract/device-key check 與雙平台 build，官方 actions 以 SHA 固定；cargo-ndk 固定為 4.1.2，.NET 11 preview.6 與 MAUI workload set 亦精確固定。2026-08-10 [CI run 31325769517](https://github.com/hot-YUser/auto-Tronclass-APP/actions/runs/31325769517) 三個 jobs 全綠；完整 release artifact identity gate 仍由本機 `release.ps1` dry-run 提供。 |
+| 測試與 CI 斷層 | fixed / verified | `.github/workflows/ci.yml` 已含 Rust test/clippy、Windows production contract/device-key check 與雙平台 build，官方 actions 以 SHA 固定；cargo-ndk 固定為 4.1.2，.NET 11 preview.6 與 MAUI workload set 亦精確固定。2026-08-10 [CI run 31325769517](https://github.com/hot-YUser/auto-Tronclass-APP/actions/runs/31325769517) 三個 jobs 全綠；完整 release artifact identity gate 仍由本機 `tools/release.ps1` dry-run 提供。 |
 | 裝置金鑰/秘密記憶體生命週期 | fixed in code / verification pending | Windows DPAPI、Android Keystore、外部 key 注入、毀損隔離及 DeviceKey runnable check 已具備；`AccountSecret`/LLM 字串的完整 zeroization 與跨程序失敗路徑仍需最後審閱。 |
 
 ## 多模型證據界線
@@ -53,5 +55,5 @@
 1. `cargo test --all-targets --all-features` 與 `cargo clippy --all-targets --all-features -- -D warnings`。
 2. Windows/Android UI build（包含最新 NativeCore、SettingsPage、服務與 fixture 變更）。
 3. DeviceKey runnable check、跨邊界 protocol contract check、Start/Stop/partial-submit 回歸測試。
-4. `release.ps1` 完整或明確記錄的受限 dry-run：native marker、publish hash、隔離 smoke、APK `apksigner`、固定憑證指紋與兩個 ABI hash。
+4. `tools/release.ps1` 完整或明確記錄的受限 dry-run：native marker、publish hash、隔離 smoke、APK `apksigner`、固定憑證指紋與兩個 ABI hash。
 5. 逐項將本表的 `verification pending` 轉成有命令、日期、commit 與輸出的 `verified`；沒有輸出就保持 pending。

@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # 建置 Rust 原生核心，並確認輸出確實由本次建置產生。
-#   ./build-core.ps1                 -> Windows: core/target/release/tronclass_core.dll
-#   ./build-core.ps1 -Head android   -> Android: core/jniLibs/{arm64-v8a,x86_64}/libtronclass_core.so
+#   ./tools/build-core.ps1                 -> Windows: core/target/release/tronclass_core.dll
+#   ./tools/build-core.ps1 -Head android   -> Android: core/jniLibs/{arm64-v8a,x86_64}/libtronclass_core.so
 
 param(
     [ValidateSet("windows", "android")]
@@ -11,7 +11,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 腳本集中於 tools/；$root 維持 = repo root，讓 marker/產物路徑不變。
+$tools = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $tools
 $core = Join-Path $root "core"
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 if (Test-Path -LiteralPath $cargoBin -PathType Container) { $env:PATH = "$cargoBin;$env:PATH" }
@@ -95,6 +97,24 @@ function Write-BuildMarker {
     return $marker
 }
 
+function Resolve-AndroidNdk {
+    # Point cargo-ndk at an explicitly configured or newest installed NDK.
+    if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME)) {
+        $sdkCandidates = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT)
+        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $sdkCandidates += (Join-Path $env:LOCALAPPDATA "Android\sdk") }
+        $sdk = $sdkCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath ([string]$_) -PathType Container) } | Select-Object -First 1
+        if ($sdk) {
+            $ndkBase = Join-Path ([string]$sdk) "ndk"
+            $ndk = Get-ChildItem -LiteralPath $ndkBase -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | Select-Object -First 1
+            if ($ndk) { $env:ANDROID_NDK_HOME = $ndk.FullName }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME) -or -not (Test-Path -LiteralPath $env:ANDROID_NDK_HOME -PathType Container)) {
+        throw "找不到 Android NDK；請設定 ANDROID_NDK_HOME 或安裝 SDK 內的 NDK。"
+    }
+}
+
 $buildStartedUtc = [DateTime]::UtcNow
 $artifacts = @()
 
@@ -110,21 +130,7 @@ if ($Head -eq "windows") {
 else {
     Push-Location $core
     try {
-        # Point cargo-ndk at an explicitly configured or newest installed NDK.
-        if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME)) {
-            $sdkCandidates = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT)
-            if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $sdkCandidates += (Join-Path $env:LOCALAPPDATA "Android\sdk") }
-            $sdk = $sdkCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath ([string]$_) -PathType Container) } | Select-Object -First 1
-            if ($sdk) {
-                $ndkBase = Join-Path ([string]$sdk) "ndk"
-                $ndk = Get-ChildItem -LiteralPath $ndkBase -Directory -ErrorAction SilentlyContinue |
-                    Sort-Object Name -Descending | Select-Object -First 1
-                if ($ndk) { $env:ANDROID_NDK_HOME = $ndk.FullName }
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME) -or -not (Test-Path -LiteralPath $env:ANDROID_NDK_HOME -PathType Container)) {
-            throw "找不到 Android NDK；請設定 ANDROID_NDK_HOME 或安裝 SDK 內的 NDK。"
-        }
+        Resolve-AndroidNdk
         $outputs = @(
             (Join-Path $core "jniLibs\arm64-v8a\libtronclass_core.so"),
             (Join-Path $core "jniLibs\x86_64\libtronclass_core.so")

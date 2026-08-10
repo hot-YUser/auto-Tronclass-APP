@@ -2,11 +2,11 @@
 # 一鍵發版建置器：測試 → 雙 head 原生核心 → Windows/Android 發行產物 → 驗證與打包。
 # 本腳本只建置與驗證，不發布；缺少 APK 固定 fingerprint 或簽章工具時必定失敗。
 #
-#   ./release.ps1 -Tag v2.0.0-alpha.4
-#   ./release.ps1 -Tag v2.0.0-alpha.4 -SkipAndroid
+#   ./tools/release.ps1 -Tag v2.0.0-alpha.4
+#   ./tools/release.ps1 -Tag v2.0.0-alpha.4 -SkipAndroid
 #
 # Android 私鑰仍由 keystore.properties 提供；公開 SHA-256 憑證指紋固定在
-# release/android-signing.json，不能以環境變數靜默換掉。
+# tools/android-signing.json，不能以環境變數靜默換掉。
 
 param(
     [Parameter(Mandatory)] [string]$Tag,
@@ -17,7 +17,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 腳本集中於 tools/；$root 維持 = repo root，讓 core/ui/dist/keystore 路徑不變。
+$tools = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $tools
 Set-Location $root
 
 if ($Tag -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' -or $Tag -in '.', '..') {
@@ -222,18 +224,10 @@ if (-not $SkipAndroid) {
     if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) { $sdkCandidates += (Join-Path ${env:ProgramFiles(x86)} "Android\android-sdk") }
     $env:ANDROID_HOME = Resolve-ExistingDirectory -Label "Android SDK" -Candidates $sdkCandidates
     $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
-
-    $ndkCandidates = @()
-    if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME)) { $ndkCandidates += $env:ANDROID_NDK_HOME }
-    $ndkRoot = Join-Path $env:ANDROID_HOME "ndk"
-    if (Test-Path -LiteralPath $ndkRoot -PathType Container) {
-        $ndkCandidates += Get-ChildItem -LiteralPath $ndkRoot -Directory | Sort-Object Name -Descending | ForEach-Object FullName
-    }
-    $env:ANDROID_NDK_HOME = Resolve-ExistingDirectory -Label "Android NDK" -Candidates $ndkCandidates
 }
 
 $core = Join-Path $root "core"
-$buildCore = Join-Path $root "build-core.ps1"
+$buildCore = Join-Path $tools "build-core.ps1"
 $winTfm = "net11.0-windows10.0.19041.0"
 $winName = "AutoTronclass-$Tag-windows-x64-portable"
 $setupName = "AutoTronclass-$Tag-windows-x64-setup"
@@ -256,8 +250,8 @@ Invoke-Native -FilePath "cargo" -Arguments @("clippy", "--manifest-path", "$core
 if (-not $SkipWindows) {
     # 兩個檢查直接連結 production source，防止 OS key 與 Rust↔C# wire contract 在發版前漂移。
     foreach ($check in @(
-        @{ Name = "DeviceKey"; Path = (Join-Path $root "checks\DeviceKey.Check\DeviceKey.Check.csproj") },
-        @{ Name = "ProtocolContract"; Path = (Join-Path $root "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") }
+        @{ Name = "DeviceKey"; Path = (Join-Path $tools "checks\DeviceKey.Check\DeviceKey.Check.csproj") },
+        @{ Name = "ProtocolContract"; Path = (Join-Path $tools "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") }
     )) {
         if (-not (Test-Path -LiteralPath $check.Path -PathType Leaf)) {
             throw "缺少 $($check.Name) 可執行檢查：$($check.Path)"
@@ -292,7 +286,7 @@ if (-not $SkipWindows) {
     Step "publish Windows portable (self-contained)"
     Clear-HeadBuildOutput -TargetFramework $winTfm
     Invoke-Native -FilePath $dotnet -Arguments @(
-        "publish", "ui/Ui.csproj", "-f", $winTfm, "-c", "Release", "-r", "win-x64", "--self-contained",
+        "publish", (Join-Path $root "ui/Ui.csproj"), "-f", $winTfm, "-c", "Release", "-r", "win-x64", "--self-contained",
         "-p:PackageMode=portable", "-p:WindowsAppSDKSelfContained=true"
     ) -FailureMessage "Windows publish 失敗"
     $pub = Join-Path $root "ui\bin\Release\$winTfm\win-x64\publish"
@@ -374,7 +368,7 @@ if (-not $SkipWindows) {
         $pubAbs = (Resolve-Path -LiteralPath $pub).Path
         Invoke-Native -FilePath $iscc -Arguments @(
             "/Qp", "/DMyAppVersion=$Tag", "/DPubDir=$pubAbs", "/DOutDir=$dist",
-            (Join-Path $root "installer\AutoTronclass.iss")
+            (Join-Path $tools "installer\AutoTronclass.iss")
         ) -FailureMessage "Inno 安裝檔建置失敗"
         $setup = Join-Path $dist "$setupName.exe"
         if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "沒產出 setup.exe" }
@@ -386,7 +380,7 @@ if (-not $SkipWindows) {
 if (-not $SkipAndroid) {
     Step "publish signed Android APK"
     Clear-HeadBuildOutput -TargetFramework "net11.0-android"
-    $signingConfigPath = Join-Path $root "release\android-signing.json"
+    $signingConfigPath = Join-Path $tools "android-signing.json"
     if (-not (Test-Path -LiteralPath $signingConfigPath -PathType Leaf)) { throw "缺少固定 Android 簽章設定：$signingConfigPath" }
     try { $signingConfig = Get-Content -Raw -LiteralPath $signingConfigPath | ConvertFrom-Json }
     catch { throw "Android 簽章設定不是有效 JSON：$signingConfigPath" }
@@ -407,7 +401,7 @@ if (-not $SkipAndroid) {
     $providedFingerprints = @($ExpectedApkFingerprint, $kp["expectedFingerprint"]) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
     foreach ($provided in $providedFingerprints) {
         if ((Normalize-Fingerprint ([string]$provided)) -ne $pinnedFingerprint) {
-            throw "keystore.properties／環境變數指定的 APK fingerprint 與 release/android-signing.json 不符"
+            throw "keystore.properties／環境變數指定的 APK fingerprint 與 tools/android-signing.json 不符"
         }
     }
     $expectedFingerprintNormalized = $pinnedFingerprint
@@ -416,7 +410,7 @@ if (-not $SkipAndroid) {
     $ksAbs = (Resolve-Path -LiteralPath $ksPath).Path
     $androidPublish = Join-Path $root "ui\bin\Release\net11.0-android\publish"
     Invoke-Native -FilePath $dotnet -Arguments @(
-        "publish", "ui/Ui.csproj", "-f", "net11.0-android", "-c", "Release",
+        "publish", (Join-Path $root "ui/Ui.csproj"), "-f", "net11.0-android", "-c", "Release",
         "-p:AndroidKeyStore=true", "-p:AndroidSigningKeyStore=$ksAbs",
         "-p:AndroidSigningStorePass=$($kp.storePassword)", "-p:AndroidSigningKeyAlias=$($kp.keyAlias)",
         "-p:AndroidSigningKeyPass=$($kp.keyPassword)"
