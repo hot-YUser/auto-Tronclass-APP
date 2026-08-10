@@ -14,6 +14,7 @@ use crate::protocol::AnswerWire;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
 use crate::rollcall::{self, RollcallKind, SignOutcome};
+use crate::teacher_qr::{self, FailureKind};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap as Map;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 pub type EventCb = extern "C" fn(*const u8, usize);
@@ -277,7 +278,10 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
     let (tune_tx, tune_rx) = watch::channel(cfg.tuning());
 
     let mut tasks = Vec::new();
-    for acc in map.values() {
+    // A teacher account is only a QR data source (dispatch_signs uses it via the actor's `map`), never a
+    // monitored student — so it gets no poller. Polling it as a student would waste a request loop and
+    // could enrol it as a spurious rollcall participant.
+    for acc in map.values().filter(|acc| !acc.is_teacher) {
         tasks.push(tokio::spawn(poller(acc.clone(), tx.clone(), cb, tune_rx.clone())));
     }
     tasks.push(tokio::spawn(actor(cb, map, rx, tx.clone(), cfg, tune_tx)));
@@ -988,14 +992,25 @@ fn dispatch_signs(
     };
 
     if kind == RollcallKind::Qr {
-        // QR: needs a teacher account for this base_url; teacher sources data, students sign their own id.
-        let teacher = accounts.values().find(|acc| acc.base_url == base_url && acc.is_teacher).cloned();
+        // QR: needs a teacher account to source the rotating data; students then sign their own id on
+        // their OWN endpoint. The token is portable across courses/tenants (confirmed: a THU teacher's
+        // data signs a Longhua rollcall), so prefer a same-site teacher but fall back to ANY teacher
+        // rather than giving up. `id` breaks ties deterministically.
+        let teacher = accounts
+            .values()
+            .filter(|acc| acc.is_teacher)
+            .min_by_key(|acc| (acc.base_url != base_url, acc.id.clone()))
+            .cloned();
         match teacher {
             // course_id may be empty — the task falls back to the teacher's first my-course.
             Some(t) => {
                 let students: Vec<Arc<Account>> =
                     participants.iter().filter_map(|id| accounts.get(id).cloned()).filter(|acc| !acc.is_teacher).collect();
-                spawn_qr_teacher_assist(t, students, tx.clone(), key.clone());
+                // No student to sign → don't open a teacher source for nobody (it would create + stop a
+                // rollcall on the teacher's real course to no purpose).
+                if !students.is_empty() {
+                    spawn_qr_teacher_assist(t, students, tx.clone(), key.clone());
+                }
             }
             None => emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
                                      "code": "qr_needs_teacher",
@@ -1128,52 +1143,66 @@ fn spawn_sign(acc: Arc<Account>, kind: RollcallKind, code: Option<String>, rollc
     });
 }
 
-/// Teacher sources `data` from its own qr rollcall, then each student signs THEIR own rollcall_id
-/// with that data (docs 32). Because the QR token is valid only ~1–4 s, this **re-sources and
-/// re-sends** every ~1.5 s for up to ~12 s until each student confirms (one snapshot is not enough).
+/// Teacher opens its OWN qr rollcall as the rotating-`data` source; each student then signs THEIR own
+/// rollcall id on THEIR own endpoint with that data (docs 32). Because the token is valid only ~1–4 s,
+/// this re-sources and re-sends every ~1.5 s for up to ~12 s until each student confirms. A session lost
+/// mid-flight is recovered once (teacher and per-student). When monitoring stops, `tx` closes (the actor
+/// dropped its receiver): the loop bails out and still runs the best-effort teacher-source cleanup, so a
+/// StopMonitoring never leaves an open rollcall on the teacher's real course. (On a full `core_free` the
+/// runtime is torn down and the final cleanup may not complete — same terminal-shutdown caveat as the
+/// pollers/actor, which are aborted too.)
 fn spawn_qr_teacher_assist(teacher: Arc<Account>, students: Vec<Arc<Account>>, tx: UnboundedSender<MonitorMsg>, key: ActivityKey) {
     let student_rollcall_id = key.2.clone();
     tokio::spawn(async move {
         let ep = Endpoints::derive(&teacher.base_url);
-        // course_id: the teacher's, else fall back to its first my-course (don't just give up).
-        let course_id = match teacher.course_id.clone() {
-            Some(c) if !c.is_empty() => c,
-            _ => first_course(&teacher.client, &ep).await.unwrap_or_default(),
-        };
-
-        // Teacher starts its OWN qr rollcall purely to source the rotating data (full create body).
-        // ponytail: placeholder numeric/bool values; exact required fields need a real tenant to verify.
-        let create_body = json!({
-            "type": "qr_rollcall", "title": "auto", "status": "in_progress",
-            "is_radar": false, "is_number": false, "number_code": null,
-            "latitude": 0.0, "longitude": 0.0, "altitude": 0.0,
-            "use_beacon": false, "duration": 3600, "student_rollcalls": []
-        });
-        let teacher_rollcall_id = match teacher.client.post(ep.teacher_create_rollcall(&course_id)).json(&create_body).send().await {
-            Ok(r) => {
-                let v = r.json::<Value>().await.unwrap_or(Value::Null);
-                v.get("rollcall_id").or_else(|| v.get("id")).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+        let mut teacher_recovered = false;
+        let source = match prepare_teacher_source(&teacher, &ep, &mut teacher_recovered).await {
+            Ok(source) => source,
+            Err(_) => {
+                for s in &students {
+                    tx.send(MonitorMsg::SignResult { key: key.clone(), account_id: s.id.clone(),
+                        result: Err("qr: teacher could not open a data source".into()) }).ok();
+                }
+                return;
             }
-            Err(_) => String::new(),
         };
-        let _ = teacher.client.post(ep.teacher_start_rollcall(&teacher_rollcall_id)).send().await;
 
         let mut confirmed: HashSet<String> = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while confirmed.len() < students.len() && Instant::now() < deadline {
-            if let Some(data) = rollcall::teacher_source_qr_data(&teacher.client, &ep, &course_id, &teacher_rollcall_id).await {
-                for s in &students {
-                    if confirmed.contains(&s.id) {
-                        continue;
-                    }
-                    if let Ok(outcome) = rollcall::sign_qr_with_teacher_data(&s.client, &ep, &student_rollcall_id, &s.device_id, &data, &s.user_no).await {
-                        confirmed.insert(s.id.clone());
-                        tx.send(MonitorMsg::SignResult { key: key.clone(), account_id: s.id.clone(), result: Ok(outcome) }).ok();
+        let deadline = Instant::now() + teacher_qr::CONFIRM_WINDOW;
+        while confirmed.len() < students.len() && Instant::now() < deadline && !tx.is_closed() {
+            match teacher_qr::fetch_data(&teacher.client, &ep, &source).await {
+                Ok(data) => {
+                    let pending: Vec<Arc<Account>> =
+                        students.iter().filter(|s| !confirmed.contains(&s.id)).cloned().collect();
+                    // Bounded concurrent fan-out: many co-located students sign the same fresh token in
+                    // parallel (the window is only ~1–4 s), capped so a big roster can't burst one tenant.
+                    for chunk in pending.chunks(teacher_qr::FANOUT_LIMIT) {
+                        let mut fanout = JoinSet::new();
+                        for s in chunk {
+                            let (s, data, rid) = (s.clone(), data.clone(), student_rollcall_id.clone());
+                            fanout.spawn(async move { (s.id.clone(), sign_qr_student(s, &rid, &data).await) });
+                        }
+                        while let Some(joined) = fanout.join_next().await {
+                            if let Ok((account_id, Ok(outcome))) = joined {
+                                if confirmed.insert(account_id.clone()) {
+                                    tx.send(MonitorMsg::SignResult { key: key.clone(), account_id, result: Ok(outcome) }).ok();
+                                }
+                            }
+                        }
+                        if tx.is_closed() {
+                            break;
+                        }
                     }
                 }
+                // Teacher session died mid-window → re-login once, then re-fetch next iteration.
+                Err(e) if e.kind == FailureKind::AuthLost && !teacher_recovered && relogin(&teacher).await => {
+                    teacher_recovered = true;
+                }
+                // Transient/fatal token fetch (incl. a second auth-loss): cool down and retry within the window.
+                Err(_) => {}
             }
-            if confirmed.len() < students.len() {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+            if confirmed.len() < students.len() && !tx.is_closed() {
+                tokio::time::sleep(teacher_qr::POLL_INTERVAL).await;
             }
         }
         for s in &students {
@@ -1182,14 +1211,71 @@ fn spawn_qr_teacher_assist(teacher: Arc<Account>, students: Vec<Arc<Account>>, t
                     result: Err("qr: could not confirm within the token window".into()) }).ok();
             }
         }
-        let _ = teacher.client.put(ep.teacher_stop_qr(&teacher_rollcall_id)).send().await; // close teacher end
+        cleanup_teacher_source(&teacher, &ep, &source).await;
     });
 }
 
-/// The teacher's first course id (my-courses) — the QR create fallback when no course_id is set.
-async fn first_course(client: &Client, ep: &Endpoints) -> Option<String> {
-    let v = get_json(client, &ep.my_courses()).await.ok()?;
-    extract_array(&v, "courses").iter().find_map(id_of)
+/// Resolve the teacher's course, then create + start its own QR rollcall as the data source. A session
+/// lost during setup is recovered once; a start that fails after recovery drops the half-open source
+/// before re-creating, so we never leak a created-but-unstarted rollcall.
+async fn prepare_teacher_source(
+    teacher: &Account,
+    ep: &Endpoints,
+    recovered: &mut bool,
+) -> Result<teacher_qr::Source, teacher_qr::QrError> {
+    loop {
+        let course_id = match teacher_qr::resolve_course_id(&teacher.client, ep, teacher.course_id.as_deref()).await {
+            Ok(course_id) => course_id,
+            Err(e) if e.kind == FailureKind::AuthLost && !*recovered && relogin(teacher).await => {
+                *recovered = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let source = match teacher_qr::create(&teacher.client, ep, &course_id).await {
+            Ok(source) => source,
+            Err(e) if e.kind == FailureKind::AuthLost && !*recovered && relogin(teacher).await => {
+                *recovered = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match teacher_qr::start(&teacher.client, ep, &source).await {
+            Ok(()) => return Ok(source),
+            Err(e) if e.kind == FailureKind::AuthLost && !*recovered && relogin(teacher).await => {
+                *recovered = true;
+                let _ = tokio::time::timeout(Duration::from_secs(2), teacher_qr::stop(&teacher.client, ep, &source)).await;
+            }
+            Err(e) => {
+                let _ = tokio::time::timeout(Duration::from_secs(2), teacher_qr::stop(&teacher.client, ep, &source)).await;
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Best-effort close of the teacher's data source (bounded; one auth-lost recovery).
+async fn cleanup_teacher_source(teacher: &Account, ep: &Endpoints, source: &teacher_qr::Source) {
+    let first = tokio::time::timeout(Duration::from_secs(2), teacher_qr::stop(&teacher.client, ep, source)).await;
+    if matches!(first, Ok(Err(ref e)) if e.kind == FailureKind::AuthLost) && relogin(teacher).await {
+        let _ = tokio::time::timeout(Duration::from_secs(2), teacher_qr::stop(&teacher.client, ep, source)).await;
+    }
+}
+
+/// Sign one student on ITS OWN endpoint (never the teacher's), recovering a lost session once.
+async fn sign_qr_student(student: Arc<Account>, rollcall_id: &str, data: &str) -> Result<SignOutcome, String> {
+    let ep = Endpoints::derive(&student.base_url);
+    let first = rollcall::sign_qr_with_teacher_data(
+        &student.client, &ep, rollcall_id, &student.device_id, data, &student.user_no,
+    )
+    .await;
+    if matches!(first.as_ref(), Err(e) if rollcall::is_auth_lost(e)) && relogin(&student).await {
+        return rollcall::sign_qr_with_teacher_data(
+            &student.client, &ep, rollcall_id, &student.device_id, data, &student.user_no,
+        )
+        .await;
+    }
+    first
 }
 
 // --- small helpers ---

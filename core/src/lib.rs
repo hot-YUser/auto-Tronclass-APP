@@ -21,6 +21,7 @@ mod radar;
 mod redaction;
 mod rollcall;
 mod secrets;
+mod teacher_qr;
 
 #[cfg(any(test, feature = "fakeserver"))]
 pub mod fake;
@@ -39,6 +40,9 @@ mod slice3_test;
 
 #[cfg(test)]
 mod slice4_test;
+
+#[cfg(test)]
+mod teacher_qr_test;
 
 #[cfg(test)]
 mod r1_test;
