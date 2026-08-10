@@ -106,7 +106,7 @@ Subject: CN=Auto TronClass, OU=Dev, O=hot-YUser, C=TW
 
 ## 審查與目前限制
 
-第一輪審查的逐項證據矩陣見 [`docs/review-remediation.md`](docs/review-remediation.md)。原始審查檔 [`第一輪審查.md`](第一輪審查.md) 是歷史紀錄，不會被本 README 重新改寫；矩陣只記錄目前可由提交、測試或程式碼重查證的狀態。沒有證據的 DeepSeek/Kimi 反駁、以及報告中未交付的 A–E 命題，都保持 `unverified`，不會被寫成共識。
+第一輪審查的逐項證據矩陣見 [`docs/review-remediation.md`](docs/review-remediation.md)。原始審查檔未納入本 repo；矩陣只記錄目前可由提交、測試或程式碼重查證的狀態。沒有證據的 DeepSeek/Kimi 反駁、以及報告中未交付的 A–E 命題，都保持 `unverified`，不會被寫成共識。
 
 ## 授權
 

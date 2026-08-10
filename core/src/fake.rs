@@ -664,7 +664,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         };
     }
     if let Some(id) = rollcall_route(request_line, "GET", "lite") {
-        // Real lite carries NO target coordinate (docs/70 §1) — only beacon metadata.
+        // Real lite carries NO target coordinate (radar.rs §1) — only beacon metadata.
         let st = state.lock().unwrap();
         return match st.rollcalls.iter().find(|r| r.id == id) {
             Some(r) => json(200, &format!(
@@ -745,7 +745,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
         };
     }
 
-    // radar: the solver must reverse-locate from distances; lite carries no target (docs/70 §1).
+    // radar: the solver must reverse-locate from distances; lite carries no target (radar.rs §1).
     if kind == "radar" {
         let has_coords = v.get("latitude").is_some();
         if !has_coords {
@@ -766,7 +766,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
                 r.signed.insert(user.to_string());
                 return json(200, r#"{"success":true}"#);
             }
-            // Out of scope → HTTP 200 + nested error envelope (docs/70 §1: 200-with-error_code).
+            // Out of scope → HTTP 200 + nested error envelope (radar.rs §1: 200-with-error_code).
             return json(200, &format!(
                 r#"{{"error_code":"radar_out_of_rollcall_scope","data":{{"distance":{dist}}}}}"#
             ));

@@ -194,7 +194,7 @@ impl Endpoints {
     pub fn answer_radar(&self, id: &str) -> String {
         format!("{}/api/rollcall/{id}/answer", self.base)
     }
-    /// Radar coordinate answer (docs/70 §1) — carries `?api_version=1.76`; the empty `{}` path does not.
+    /// Radar coordinate answer (radar.rs §1) — carries `?api_version=1.76`; the empty `{}` path does not.
     pub fn answer_radar_coord(&self, id: &str) -> String {
         format!("{}/api/rollcall/{id}/answer?api_version=1.76", self.base)
     }
