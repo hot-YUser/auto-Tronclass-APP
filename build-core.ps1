@@ -47,9 +47,16 @@ function Get-ArtifactRecord {
         throw "原生核心建置成功但缺少輸出：$Path"
     }
     $item = Get-Item -LiteralPath $Path
-    # 建置前已刪除精確輸出；mtime 再次確認不是殘留檔案。
-    if ($item.LastWriteTimeUtc -lt $BuildStartedUtc) {
-        throw "原生核心輸出時間早於本次建置：$Path"
+    # 建置前已刪除精確輸出。cargo 的 top-level artifact 是 deps 產物的一組 hardlink，零變更重發時
+    # 不會重寫 mtime；因此「輸出不得舊於 core 目前原始檔」比「不得舊於本次 build 開始」更正確，
+    # 同時仍能抓出 source 已改、輸出卻未更新的真實 stale 風險。
+    $sources = @(Get-ChildItem -LiteralPath (Join-Path $core "src") -Recurse -File -ErrorAction SilentlyContinue)
+    $sources += Get-Item -LiteralPath (Join-Path $core "Cargo.toml") -ErrorAction SilentlyContinue
+    $buildRs = Join-Path $core "build.rs"
+    if (Test-Path -LiteralPath $buildRs -PathType Leaf) { $sources += Get-Item -LiteralPath $buildRs }
+    $newestSource = ($sources | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+    if ($null -ne $newestSource -and $item.LastWriteTimeUtc -lt $newestSource) {
+        throw "原生核心輸出早於最新原始檔：$Path"
     }
     $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     return [ordered]@{
