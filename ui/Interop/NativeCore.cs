@@ -13,13 +13,16 @@ namespace TronClass.Interop;
 /// callback routes to the single live instance (<see cref="_self"/>). Commands correlate by id;
 /// unsolicited events (id == null) are raised on <see cref="EventReceived"/>.
 /// </summary>
-public sealed class NativeCore : ICore
+public sealed class NativeCore : ICore, IDisposable
 {
     private static NativeCore? _self; // the instance the native callback routes events to
     private static unsafe void* _handle;
     private static long _nextId;
     private static readonly object BootGate = new();
     private static Task? _bootTask;
+    private static int _initialized;  // 1 = Init 已成功;同一 handle 不再重送 Init
+    private static int _disposed;     // 1 = 已釋放:不再接受 core_send/事件
+    private static readonly object SendGate = new(); // 序列化 core_send;與 core_free 互斥
     private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<JsonElement>> Pending = new();
     private static readonly ConcurrentQueue<JsonElement> EventQueue = new();
     private static int _eventDrainScheduled;
@@ -39,10 +42,48 @@ public sealed class NativeCore : ICore
             throw new InvalidOperationException("NativeCore 每個程序只能建立一個實例。");
     }
 
-    /// <summary>Start the core and load state from <paramref name="dataDir"/> — exactly once.</summary>
+    /// <summary>
+    /// Thread-safe, exactly-once teardown. Windows 關窗時由 App 呼叫(WINDOWS-only);Android 的
+    /// FGS 可能保住 process,core 必須存活,所以 Android 一律不 core_free。Dispose 後:
+    /// 新 send 直接失敗、pending 命令以失敗回覆收尾、核心事件不再投遞;core_free 只在沒有
+    /// 任何進行中的 core_send 時執行(SendGate 互斥),且絕不在 native callback 內發生。
+    /// </summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return; // 恰一次
+        // 完成所有 pending:等待中的 SendAsync 立刻以失敗收尾,不會懸住 caller。
+        foreach (var (id, tcs) in Pending)
+            if (Pending.TryRemove(id, out var t))
+                t.TrySetResult(DisposedReply(id));
+        lock (SendGate)
+        {
+            unsafe
+            {
+#if WINDOWS
+                var handle = _handle;
+                _handle = null;
+                if (handle != null) NativeMethods.core_free(handle);
+#else
+                _handle = null; // Android:不 free(見 class doc);設 null 使任何殘留 send 失敗而非誤用
+#endif
+            }
+        }
+        _self = null; // 之後 native 不再路由事件給任何實例
+    }
+
+    /// <summary>
+    /// Start the core and load state from <paramref name="dataDir"/> — exactly once per handle.
+    /// Single-flight:並發呼叫共享同一個 task;失敗後下次呼叫自動重試。已成功 Init 過的 handle
+    /// 直接回已完成 task,絕不重送 Init(重送會把執行中的 monitor 等狀態整個重設)。
+    /// </summary>
     public Task BootAsync(string dataDir)
     {
-        lock (BootGate) return _bootTask ??= BootCoreAsync(dataDir);
+        if (Volatile.Read(ref _initialized) == 1) return Task.CompletedTask;
+        lock (BootGate)
+        {
+            if (Volatile.Read(ref _initialized) == 1) return Task.CompletedTask;
+            return _bootTask ??= BootCoreAsync(dataDir);
+        }
     }
 
     private async Task BootCoreAsync(string dataDir)
@@ -62,6 +103,7 @@ public sealed class NativeCore : ICore
                 var error = reply.TryGetProperty("error", out var value) ? value.GetString() : null;
                 throw new InvalidOperationException(error ?? "核心初始化失敗。");
             }
+            Volatile.Write(ref _initialized, 1);
         }
         catch
         {
@@ -79,6 +121,7 @@ public sealed class NativeCore : ICore
     private unsafe void Start()
     {
         if (_handle != null) return;
+        if (Volatile.Read(ref _disposed) == 1) throw new ObjectDisposedException(nameof(NativeCore));
         _handle = NativeMethods.core_init(&OnEvent);
     }
 
@@ -91,6 +134,7 @@ public sealed class NativeCore : ICore
     public async Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
     {
         var id = (ulong)Interlocked.Increment(ref _nextId);
+        if (Volatile.Read(ref _disposed) == 1) return DisposedReply(id);
         if (!HasNativeHandle()) return CoreUnavailableReply(id, cmd);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = tcs;
@@ -132,29 +176,45 @@ public sealed class NativeCore : ICore
         error = $"核心尚未完成啟動，無法執行 {cmd}。",
     });
 
+    private static JsonElement DisposedReply(ulong id) => JsonSerializer.SerializeToElement(new
+    {
+        id,
+        @event = "Reply",
+        ok = false,
+        error = "核心已釋放，無法執行命令。",
+    });
+
     private static unsafe bool HasNativeHandle() => _handle != null;
 
     private unsafe void Send(string json)
     {
-        var bytes = Encoding.UTF8.GetBytes(json);
-        try
+        // SendGate 序列化所有 core_send,並與 Dispose 的 core_free 互斥:
+        // free 一定等進行中的 send 結束才執行,不會有用到已釋放 handle 的 send。
+        // (Rust 會在 core_send 內同步回呼 OnEvent,但回呼只碰 managed 狀態、不碰 SendGate,故無死鎖。)
+        lock (SendGate)
         {
-            fixed (byte* p = bytes)
+            if (Volatile.Read(ref _disposed) == 1) throw new ObjectDisposedException(nameof(NativeCore));
+            var bytes = Encoding.UTF8.GetBytes(json);
+            try
             {
-                NativeMethods.core_send(_handle, p, (nuint)bytes.Length);
+                fixed (byte* p = bytes)
+                {
+                    NativeMethods.core_send(_handle, p, (nuint)bytes.Length);
+                }
             }
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(bytes);
+            finally
+            {
+                CryptographicOperations.ZeroMemory(bytes);
+            }
         }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static unsafe void OnEvent(byte* ptr, nuint len)
     {
-        // No managed exception may cross an UnmanagedCallersOnly ABI boundary. With the Rust core's
-        // panic=abort profile that would be a process-level failure, not a recoverable UI error.
+        // No managed exception may cross an UnmanagedCallersOnly ABI boundary. The Rust core's FFI
+        // entry points catch_unwind (release panic=unwind), but the managed side must still isolate
+        // its own failures here — a throw across the ABI would be UB, not a recoverable UI error.
         try
         {
             ProcessEvent(new ReadOnlySpan<byte>(ptr, checked((int)len)));

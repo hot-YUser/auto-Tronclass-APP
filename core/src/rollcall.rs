@@ -84,8 +84,13 @@ fn my_present(v: &Value, user_no: &str) -> bool {
         .and_then(Value::as_array)
         .map(|a| {
             a.iter().any(|e| {
-                let uid = e.get("user_no").or_else(|| e.get("user_id")).and_then(Value::as_str);
-                uid.map(|u| u.eq_ignore_ascii_case(user_no)).unwrap_or(false) && entry_fine(e)
+                let uid = e
+                    .get("user_no")
+                    .or_else(|| e.get("user_id"))
+                    .and_then(Value::as_str);
+                uid.map(|u| u.eq_ignore_ascii_case(user_no))
+                    .unwrap_or(false)
+                    && entry_fine(e)
             })
         })
         .unwrap_or(false)
@@ -93,14 +98,28 @@ fn my_present(v: &Value, user_no: &str) -> bool {
 
 /// Whole-class attendance rate (percent) for the 15% gate — computed from the roster (rollcall.rs).
 pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Option<f64> {
-    let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
+    let v: Value = client
+        .get(ep.student_rollcalls(id))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let (present, total) = roster_stats(&v);
     (total > 0).then(|| present as f64 / total as f64 * 100.0)
 }
 
 /// Read the shared number code once from the roster. None → caller brute-forces.
 pub async fn read_number_code(client: &Client, ep: &Endpoints, id: &str) -> Option<String> {
-    let v: Value = client.get(ep.student_rollcalls(id)).send().await.ok()?.json().await.ok()?;
+    let v: Value = client
+        .get(ep.student_rollcalls(id))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     number_code_from_payload(&v)
 }
 
@@ -124,16 +143,28 @@ fn coerce_number_code(v: &Value) -> Option<String> {
 /// Robust to the observed shapes: top-level `{number_code}`, `{data:{number_code}}`, a
 /// `student_rollcalls`/`data` array of student items, or a bare list of them.
 fn number_code_from_payload(payload: &Value) -> Option<String> {
-    let in_item = |item: &Value| item.as_object()?.get("number_code").and_then(coerce_number_code);
+    let in_item = |item: &Value| {
+        item.as_object()?
+            .get("number_code")
+            .and_then(coerce_number_code)
+    };
     if let Some(obj) = payload.as_object() {
         if let Some(c) = obj.get("number_code").and_then(coerce_number_code) {
             return Some(c);
         }
-        if let Some(c) = obj.get("data").and_then(|d| d.get("number_code")).and_then(coerce_number_code) {
+        if let Some(c) = obj
+            .get("data")
+            .and_then(|d| d.get("number_code"))
+            .and_then(coerce_number_code)
+        {
             return Some(c);
         }
         for key in ["student_rollcalls", "data"] {
-            if let Some(c) = obj.get(key).and_then(Value::as_array).and_then(|a| a.iter().find_map(in_item)) {
+            if let Some(c) = obj
+                .get(key)
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().find_map(in_item))
+            {
                 return Some(c);
             }
         }
@@ -147,9 +178,20 @@ fn number_code_from_payload(payload: &Value) -> Option<String> {
 /// **my_present** (the caller's own `user_no` entry is present), **or** the whole class is present
 /// (present==total), **or** the top-level status is present. NEVER "any entry" — that would mask the
 /// caller's own sign failure whenever a classmate is present. Empty `user_no` skips my_present.
-pub async fn recheck_on_call_fine(client: &Client, ep: &Endpoints, id: &str, user_no: &str) -> bool {
-    let Ok(resp) = client.get(ep.student_rollcalls(id)).send().await else { return false };
-    let Ok(v) = resp.json::<Value>().await else { return false };
+pub async fn recheck_on_call_fine(
+    client: &Client,
+    ep: &Endpoints,
+    id: &str,
+    user_no: &str,
+) -> bool {
+    let Ok(resp) = client.get(ep.student_rollcalls(id)).send().await else {
+        return false;
+    };
+    let Ok(v) =
+        crate::http::read_bounded_json(resp, crate::http::MAX_API_JSON, "rollcall roster").await
+    else {
+        return false;
+    };
     let (present, total) = roster_stats(&v);
     my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v)
 }
@@ -192,13 +234,22 @@ pub fn classify_response(status: u16, body: &str) -> CodeResult {
 }
 
 // Number-answer body markers (v1 `number_rollcall`), matched case-insensitively against body+message.
-const UNAUTHORIZED_MARKERS: &[&str] =
-    &["unauthorized", "forbidden", "login", "sign in", "session expired", "未登入", "請登入", "登入逾時", "權限"];
+const UNAUTHORIZED_MARKERS: &[&str] = &[
+    "unauthorized",
+    "forbidden",
+    "login",
+    "sign in",
+    "session expired",
+    "未登入",
+    "請登入",
+    "登入逾時",
+    "權限",
+];
 
-/// Classify a 2xx number-answer body — faithful port of v1 `classify_number_response`'s 2xx branch.
-/// Confirmed live (2026-07): a real accept is `{"id":…,"status":"on_call"}` with NO success bool, so a
-/// 2xx **defaults to Success** (the old v2 default of Wrong silently rejected every real sign). Empty →
-/// Success; auth markers → Fatal; explicit `success` bool wins; wrong markers / `success:false` → Wrong.
+/// Classify a 2xx number-answer body. Confirmed live (2026-07): a real accept is
+/// `{"id":…,"status":"on_call"}` with no success bool, so a non-empty JSON object defaults to Success.
+/// Empty/non-JSON bodies remain fail-closed; auth markers → Fatal; explicit `success` bool wins;
+/// wrong markers / `success:false` → Wrong.
 fn classify_number_2xx(body: &str) -> CodeResult {
     let text = body.trim();
     if text.is_empty() {
@@ -225,7 +276,10 @@ fn classify_number_2xx(body: &str) -> CodeResult {
         return CodeResult::Success;
     }
     let status = object.get("status").and_then(Value::as_str).unwrap_or("");
-    if matches!(status, "on_call" | "on_call_fine" | "accepted" | "completed") {
+    if matches!(
+        status,
+        "on_call" | "on_call_fine" | "accepted" | "completed"
+    ) {
         return CodeResult::Success;
     }
     CodeResult::Wrong
@@ -233,14 +287,21 @@ fn classify_number_2xx(body: &str) -> CodeResult {
 
 /// The human message a payload carries (v1 `_payload_message`) — the first non-empty of these keys.
 fn payload_message(p: &Value) -> String {
-    ["message", "msg", "error", "error_description", "detail", "status"]
-        .iter()
-        .find_map(|k| match p.get(*k) {
-            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            Some(Value::Number(n)) => Some(n.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default()
+    [
+        "message",
+        "msg",
+        "error",
+        "error_description",
+        "detail",
+        "status",
+    ]
+    .iter()
+    .find_map(|k| match p.get(*k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
+    .unwrap_or_default()
 }
 
 fn payload_bool(p: &Value, keys: &[&str]) -> Option<bool> {
@@ -254,10 +315,12 @@ fn has_marker(text_lower: &str, markers: &[&str]) -> bool {
 /// The token every sign type's auth-lost `Err` carries, so `is_auth_lost` recognises it (R4.1 #2).
 pub const SESSION_INVALID: &str = "session invalid";
 
-/// The URL half of the auth-lost decision: a final URL that landed on a login page (whole URL, lowercased
-/// — v1 `"login" in str(resp.url).lower()`). Shared by every sign type and the poll canary (single truth).
+/// The URL half of the auth-lost decision: a final URL that landed on a login page. ONE shared
+/// conservative classifier (`http::response_url_is_login`): path segments `login`/`sso` or server
+/// pages like `Login.aspx`/`login.jsp` — never a whole-URL substring scan, so an arbitrary
+/// `?next=/login` query parameter can't false-positive a healthy API response as a dead session.
 pub fn response_url_is_login(url: &reqwest::Url) -> bool {
-    url.as_str().to_lowercase().contains("login")
+    crate::http::response_url_is_login(url)
 }
 
 /// Is this response a dead session? The status+body half (`classify_response == Fatal`) OR the url half.
@@ -305,7 +368,10 @@ pub async fn sign_number(
     let url = ep.answer_number(id);
     let outcome = if let Some(code) = code {
         match submit_number_code(client, &url, device_id, code).await {
-            CodeResult::Success => Ok(SignOutcome { method: "number".into(), discovered_code: Some(code.to_string()) }),
+            CodeResult::Success => Ok(SignOutcome {
+                method: "number".into(),
+                discovered_code: Some(code.to_string()),
+            }),
             CodeResult::Fatal => Err(format!("number: fatal response ({SESSION_INVALID})")),
             CodeResult::Transient => Err("number: transient error submitting shared code".into()),
             CodeResult::Wrong => Err("number: shared code rejected".into()),
@@ -320,15 +386,30 @@ pub async fn sign_number(
 }
 
 async fn submit_number_code(client: &Client, url: &str, device_id: &str, code: &str) -> CodeResult {
-    match client.put(url).json(&json!({ "deviceId": device_id, "numberCode": code })).send().await {
+    match client
+        .put(url)
+        .json(&json!({ "deviceId": device_id, "numberCode": code }))
+        .send()
+        .await
+    {
         Err(_) => CodeResult::Transient, // transport error → treat as transient, cool down
         Ok(resp) => {
             let status = resp.status().as_u16();
             let rurl = resp.url().clone();
-            let body = resp.text().await.unwrap_or_default();
+            let Ok(body) =
+                crate::http::read_bounded(resp, crate::http::MAX_MUTATION_BODY, "number sign")
+                    .await
+            else {
+                return CodeResult::Transient;
+            };
+            let body = String::from_utf8_lossy(&body);
             let r = classify_response(status, &body);
             // OR-in the url half so a redirect-to-login (2xx body) is Fatal too (shared auth-lost truth).
-            if r == CodeResult::Fatal || response_url_is_login(&rurl) { CodeResult::Fatal } else { r }
+            if r == CodeResult::Fatal || response_url_is_login(&rurl) {
+                CodeResult::Fatal
+            } else {
+                r
+            }
         }
     }
 }
@@ -337,7 +418,12 @@ async fn submit_number_code(client: &Client, url: &str, device_id: &str, code: &
 // the whole round immediately; any Success wins; a throttled batch halves `width` toward the min and
 // retries after a cooldown, giving up after `max_cooldowns`. Widen/tune via Settings if a real tenant
 // needs it.
-async fn brute_force_number(client: &Client, url: &str, device_id: &str, cfg: NumberCfg) -> Result<SignOutcome, String> {
+async fn brute_force_number(
+    client: &Client,
+    url: &str,
+    device_id: &str,
+    cfg: NumberCfg,
+) -> Result<SignOutcome, String> {
     let floor = cfg.cooldown_ms.max(1);
     let min_w = cfg.min_concurrency.clamp(1, 256);
     let mut width = cfg.concurrency.clamp(min_w, 256);
@@ -370,10 +456,15 @@ async fn brute_force_number(client: &Client, url: &str, device_id: &str, cfg: Nu
             }
         }
         if fatal {
-            return Err(format!("number: fatal response ({SESSION_INVALID} / login page) — aborting the round"));
+            return Err(format!(
+                "number: fatal response ({SESSION_INVALID} / login page) — aborting the round"
+            ));
         }
         if let Some(code) = success {
-            return Ok(SignOutcome { method: "number(brute)".into(), discovered_code: Some(code) });
+            return Ok(SignOutcome {
+                method: "number(brute)".into(),
+                discovered_code: Some(code),
+            });
         }
         if transient {
             cooldowns += 1;
@@ -411,19 +502,28 @@ pub async fn sign_radar(
                     .send()
                     .await
                     .map_err(|e| format!("radar: {e}"))?;
-                // Session lost mid-sign → abort with the shared marker so the monitor re-logins + re-signs.
                 let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
-                let body = resp.text().await.unwrap_or_default();
-                validate_sign_response("radar", status, &rurl, &body)?;
+                let body =
+                    crate::http::read_bounded(resp, crate::http::MAX_MUTATION_BODY, "radar sign")
+                        .await?;
+                validate_sign_response("radar", status, &rurl, &String::from_utf8_lossy(&body))?;
                 if recheck_on_call_fine(client, ep, id, user_no).await {
-                    return Ok(SignOutcome { method: "radar(empty)".into(), ..Default::default() });
+                    return Ok(SignOutcome {
+                        method: "radar(empty)".into(),
+                        ..Default::default()
+                    });
                 }
                 last_err = "radar empty answer did not mark present".into();
             }
-            "global_wgs84" => match radar_solve_and_sign(client, ep, id, user_no, device_id).await {
-                Ok(outcome) => return Ok(outcome),
-                Err(e) => last_err = e,
-            },
+            "global_wgs84" => {
+                match radar_solve_and_sign(client, ep, id, user_no, device_id).await {
+                    Ok(outcome) => return Ok(outcome),
+                    // A dead session must abort the whole chain instead of falling through to the next
+                    // strategy: the shared SESSION_INVALID marker routes the monitor to re-login + re-sign.
+                    Err(e) if is_auth_lost(&e) => return Err(e),
+                    Err(e) => last_err = e,
+                }
+            }
             other => last_err = format!("radar: unknown strategy '{other}' skipped"),
         }
     }
@@ -434,14 +534,27 @@ pub async fn sign_radar(
 /// anchors → `solve_global_radar` → standard sampling rings → refined estimate. Any submit that lands
 /// in scope (HTTP 2xx, no error_code) is a hit → recheck → sign. ponytail: steps 6-7 (supplement
 /// rings / unbounded chessboard grid / rate-limit cooldown) + concurrent anchor probing are R2.5.
-async fn radar_solve_and_sign(client: &Client, ep: &Endpoints, id: &str, user_no: &str, device_id: &str) -> Result<SignOutcome, String> {
+async fn radar_solve_and_sign(
+    client: &Client,
+    ep: &Endpoints,
+    id: &str,
+    user_no: &str,
+    device_id: &str,
+) -> Result<SignOutcome, String> {
     let (use_beacon, beacon_nonce) = radar_lite(client, ep, id).await;
-    let beacon = if use_beacon { Some((beacon_nonce.as_str(), user_no)) } else { None };
+    let beacon = if use_beacon {
+        Some((beacon_nonce.as_str(), user_no))
+    } else {
+        None
+    };
 
     let mut obs: Vec<Observation> = Vec::new();
-    // (1) probe the 12 global anchors; a direct in-scope hit signs immediately.
+    // (1) probe the 12 global anchors; a direct in-scope hit signs immediately. A dead session aborts
+    // the WHOLE chain right here — running every anchor first would turn an auth loss into a generic
+    // "not within scope" failure and skip the shared re-login + re-sign path.
     for point in radar::global_anchor_points(12) {
         match radar_probe(client, ep, id, point, device_id, beacon).await {
+            ProbeOutcome::AuthLost => return Err(format!("radar probe: {SESSION_INVALID}")),
             ProbeOutcome::InRange => return radar_confirm(client, ep, id, user_no).await,
             ProbeOutcome::Distance(d) => obs.push(Observation { point, distance: d }),
             ProbeOutcome::NoInfo => {}
@@ -449,29 +562,46 @@ async fn radar_solve_and_sign(client: &Client, ep: &Endpoints, id: &str, user_no
     }
     // (2) need ≥3 distances to solve.
     if obs.len() < 3 {
-        return Err(format!("radar: only {} anchor distances (need ≥3)", obs.len()));
+        return Err(format!(
+            "radar: only {} anchor distances (need ≥3)",
+            obs.len()
+        ));
     }
     // (3) coarse global solve.
-    let est = radar::solve_global_radar(&obs, None).ok_or("radar: solver failed")?.point;
+    let est = radar::solve_global_radar(&obs, None)
+        .ok_or("radar: solver failed")?
+        .point;
     // (4) standard sampling rings around the estimate.
     for point in radar::standard_sample_points(est) {
         match radar_probe(client, ep, id, point, device_id, beacon).await {
+            ProbeOutcome::AuthLost => return Err(format!("radar probe: {SESSION_INVALID}")),
             ProbeOutcome::InRange => return radar_confirm(client, ep, id, user_no).await,
             ProbeOutcome::Distance(d) => obs.push(Observation { point, distance: d }),
             ProbeOutcome::NoInfo => {}
         }
     }
     // (5) refine with the fuller observation set and submit the estimate itself.
-    let est2 = radar::solve_global_radar(&obs, Some(est)).ok_or("radar: refine failed")?.point;
+    let est2 = radar::solve_global_radar(&obs, Some(est))
+        .ok_or("radar: refine failed")?
+        .point;
     match radar_probe(client, ep, id, est2, device_id, beacon).await {
+        ProbeOutcome::AuthLost => Err(format!("radar probe: {SESSION_INVALID}")),
         ProbeOutcome::InRange => radar_confirm(client, ep, id, user_no).await,
         _ => Err("radar: estimate not within scope (supplement/grid deferred to R2.5)".into()),
     }
 }
 
-async fn radar_confirm(client: &Client, ep: &Endpoints, id: &str, user_no: &str) -> Result<SignOutcome, String> {
+async fn radar_confirm(
+    client: &Client,
+    ep: &Endpoints,
+    id: &str,
+    user_no: &str,
+) -> Result<SignOutcome, String> {
     if recheck_on_call_fine(client, ep, id, user_no).await {
-        Ok(SignOutcome { method: "radar(solved)".into(), ..Default::default() })
+        Ok(SignOutcome {
+            method: "radar(solved)".into(),
+            ..Default::default()
+        })
     } else {
         Err("radar: hit but on_call_fine not set".into())
     }
@@ -480,23 +610,39 @@ async fn radar_confirm(client: &Client, ep: &Endpoints, id: &str, user_no: &str)
 /// `lite` (radar.rs §1): carries NO target coordinate — only `use_beacon` + `beacon_nonce`.
 async fn radar_lite(client: &Client, ep: &Endpoints, id: &str) -> (bool, String) {
     let v: Value = match client.get(ep.lite(id)).send().await {
-        Ok(r) => r.json().await.unwrap_or(Value::Null),
+        Ok(r) => crate::http::read_bounded_json(r, crate::http::MAX_API_JSON, "radar lite")
+            .await
+            .unwrap_or(Value::Null),
         Err(_) => Value::Null,
     };
     (
-        v.get("use_beacon").and_then(Value::as_bool).unwrap_or(false),
-        v.get("beacon_nonce").and_then(Value::as_str).unwrap_or("").to_string(),
+        v.get("use_beacon")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        v.get("beacon_nonce")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     )
 }
 
 enum ProbeOutcome {
+    /// The probe response proves the session is dead (401/403/redirect-to-login/200 login page).
+    AuthLost,
     InRange,
     Distance(f64),
     NoInfo,
 }
 
 /// Submit one coordinate answer (radar.rs §1 body) and classify the response.
-async fn radar_probe(client: &Client, ep: &Endpoints, id: &str, point: GeoPoint, device_id: &str, beacon: Option<(&str, &str)>) -> ProbeOutcome {
+async fn radar_probe(
+    client: &Client,
+    ep: &Endpoints,
+    id: &str,
+    point: GeoPoint,
+    device_id: &str,
+    beacon: Option<(&str, &str)>,
+) -> ProbeOutcome {
     let mut body = json!({
         "deviceId": device_id, "latitude": point.lat, "longitude": point.lon,
         "accuracy": 60, "speed": null, "heading": null, "altitude": 0, "altitudeAccuracy": null
@@ -504,12 +650,29 @@ async fn radar_probe(client: &Client, ep: &Endpoints, id: &str, point: GeoPoint,
     if let Some((nonce, uid)) = beacon {
         body["radarSignal"] = Value::String(radar_signature(nonce, device_id, uid, now_unix()));
     }
-    let resp = match client.put(ep.answer_radar_coord(id)).json(&body).send().await {
+    let resp = match client
+        .put(ep.answer_radar_coord(id))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return ProbeOutcome::NoInfo,
     };
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    let rurl = resp.url().clone();
+    let Ok(text) =
+        crate::http::read_bounded(resp, crate::http::MAX_MUTATION_BODY, "radar probe").await
+    else {
+        return ProbeOutcome::NoInfo;
+    };
+    let text = String::from_utf8_lossy(&text);
+    // A dead session (401/403/redirect-to-login/200 login HTML) is the shared auth marker, NOT an
+    // out-of-scope miss: classify it FIRST so the radar chain aborts early with SESSION_INVALID and
+    // the monitor's re-login + re-sign path runs instead of a generic failure after all anchors.
+    if response_auth_lost(status, &rurl, &text) {
+        return ProbeOutcome::AuthLost;
+    }
     parse_scope(status, &text)
 }
 
@@ -545,20 +708,30 @@ fn walk_dicts<'a>(v: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>
                 }
             }
         }
-        Value::Array(a) => a.iter().take(3).for_each(|item| walk_dicts(item, out, depth + 1)),
+        Value::Array(a) => a
+            .iter()
+            .take(3)
+            .for_each(|item| walk_dicts(item, out, depth + 1)),
         _ => {}
     }
 }
 fn has_scope_error(v: &Value) -> bool {
     let mut dicts = Vec::new();
     walk_dicts(v, &mut dicts, 0);
-    dicts.iter().any(|m| m.get("error_code").and_then(Value::as_str) == Some("radar_out_of_rollcall_scope"))
+    dicts
+        .iter()
+        .any(|m| m.get("error_code").and_then(Value::as_str) == Some("radar_out_of_rollcall_scope"))
 }
 fn extract_distance(v: &Value) -> Option<f64> {
     let mut dicts = Vec::new();
     walk_dicts(v, &mut dicts, 0);
     for m in dicts {
-        for key in ["distance", "scope_distance", "distance_meters", "distanceMeters"] {
+        for key in [
+            "distance",
+            "scope_distance",
+            "distance_meters",
+            "distanceMeters",
+        ] {
             if let Some(d) = m.get(key).and_then(Value::as_f64) {
                 return Some(d);
             }
@@ -577,11 +750,19 @@ fn radar_signature(nonce: &str, device_id: &str, user_no: &str, ts: u64) -> Stri
 }
 
 fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// self_registration: empty body, the simplest type.
-pub async fn sign_self_registration(client: &Client, ep: &Endpoints, id: &str, user_no: &str) -> Result<SignOutcome, String> {
+pub async fn sign_self_registration(
+    client: &Client,
+    ep: &Endpoints,
+    id: &str,
+    user_no: &str,
+) -> Result<SignOutcome, String> {
     let resp = client
         .put(ep.answer_self_registration(id))
         .json(&json!({}))
@@ -589,10 +770,23 @@ pub async fn sign_self_registration(client: &Client, ep: &Endpoints, id: &str, u
         .await
         .map_err(|e| format!("self_registration: {e}"))?;
     let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
-    let body = resp.text().await.unwrap_or_default();
-    validate_sign_response("self_registration", status, &rurl, &body)?;
+    let body = crate::http::read_bounded(
+        resp,
+        crate::http::MAX_MUTATION_BODY,
+        "self-registration sign",
+    )
+    .await?;
+    validate_sign_response(
+        "self_registration",
+        status,
+        &rurl,
+        &String::from_utf8_lossy(&body),
+    )?;
     if recheck_on_call_fine(client, ep, id, user_no).await {
-        Ok(SignOutcome { method: "self_registration".into(), ..Default::default() })
+        Ok(SignOutcome {
+            method: "self_registration".into(),
+            ..Default::default()
+        })
     } else {
         Err("self_registration submitted but on_call_fine not set".into())
     }
@@ -616,10 +810,13 @@ pub async fn sign_qr_with_teacher_data(
         .await
         .map_err(|e| format!("qr: {e}"))?;
     let (status, rurl) = (resp.status().as_u16(), resp.url().clone());
-    let body = resp.text().await.unwrap_or_default();
-    validate_sign_response("qr", status, &rurl, &body)?;
+    let body = crate::http::read_bounded(resp, crate::http::MAX_MUTATION_BODY, "QR sign").await?;
+    validate_sign_response("qr", status, &rurl, &String::from_utf8_lossy(&body))?;
     if recheck_on_call_fine(student, ep, student_rollcall_id, user_no).await {
-        Ok(SignOutcome { method: "qr(teacher-assist)".into(), ..Default::default() })
+        Ok(SignOutcome {
+            method: "qr(teacher-assist)".into(),
+            ..Default::default()
+        })
     } else {
         Err("qr submitted but on_call_fine not set".into())
     }
@@ -634,15 +831,21 @@ mod tests {
         let answer = reqwest::Url::parse("https://tenant.example/api/rollcalls/1/answer").unwrap();
         let login = reqwest::Url::parse("https://tenant.example/login").unwrap();
         assert!(validate_sign_response("radar", 204, &answer, "").is_ok());
-        assert!(validate_sign_response("radar", 200, &answer, r#"{"success":false}"#)
-            .unwrap_err()
-            .contains("server rejected"));
-        assert!(validate_sign_response("qr", 200, &answer, r#"{"error_code":"qr_invalid"}"#)
-            .unwrap_err()
-            .contains("server rejected"));
-        assert!(validate_sign_response("radar", 400, &answer, r#"{"ok":false}"#)
-            .unwrap_err()
-            .contains("HTTP 400"));
+        assert!(
+            validate_sign_response("radar", 200, &answer, r#"{"success":false}"#)
+                .unwrap_err()
+                .contains("server rejected")
+        );
+        assert!(
+            validate_sign_response("qr", 200, &answer, r#"{"error_code":"qr_invalid"}"#)
+                .unwrap_err()
+                .contains("server rejected")
+        );
+        assert!(
+            validate_sign_response("radar", 400, &answer, r#"{"ok":false}"#)
+                .unwrap_err()
+                .contains("HTTP 400")
+        );
         assert!(validate_sign_response("qr", 500, &answer, "server error")
             .unwrap_err()
             .contains("HTTP 500"));
@@ -660,16 +863,32 @@ mod tests {
         assert_eq!(number_code_from_payload(&live).as_deref(), Some("1234"));
 
         // int number_code → zero-padded 4-digit (a common contract variant).
-        assert_eq!(number_code_from_payload(&json!({"number_code": 123})).as_deref(), Some("0123"));
+        assert_eq!(
+            number_code_from_payload(&json!({"number_code": 123})).as_deref(),
+            Some("0123")
+        );
         // data-wrapped, array container, and a bare list of student items.
-        assert_eq!(number_code_from_payload(&json!({"data": {"number_code": "0007"}})).as_deref(), Some("0007"));
-        assert_eq!(number_code_from_payload(&json!({"student_rollcalls": [{"number_code": "4321"}]})).as_deref(), Some("4321"));
-        assert_eq!(number_code_from_payload(&json!([{"number_code": 42}])).as_deref(), Some("0042"));
+        assert_eq!(
+            number_code_from_payload(&json!({"data": {"number_code": "0007"}})).as_deref(),
+            Some("0007")
+        );
+        assert_eq!(
+            number_code_from_payload(&json!({"student_rollcalls": [{"number_code": "4321"}]}))
+                .as_deref(),
+            Some("4321")
+        );
+        assert_eq!(
+            number_code_from_payload(&json!([{"number_code": 42}])).as_deref(),
+            Some("0042")
+        );
     }
 
     #[test]
     fn number_code_rejects_non_codes() {
-        assert_eq!(number_code_from_payload(&json!({"status": "in_progress"})), None); // no code field
+        assert_eq!(
+            number_code_from_payload(&json!({"status": "in_progress"})),
+            None
+        ); // no code field
         assert_eq!(coerce_number_code(&json!("not-a-code")), None);
         assert_eq!(coerce_number_code(&json!(true)), None); // bool is not a code
         assert_eq!(coerce_number_code(&json!("12")), None); // must be 4 digits
@@ -678,8 +897,14 @@ mod tests {
 
     #[test]
     fn classify_number_2xx_requires_structured_success() {
-        assert_eq!(classify_response(200, r#"{"id":1,"status":"on_call"}"#), CodeResult::Success);
-        assert_eq!(classify_response(200, r#"{"success":true}"#), CodeResult::Success);
+        assert_eq!(
+            classify_response(200, r#"{"id":1,"status":"on_call"}"#),
+            CodeResult::Success
+        );
+        assert_eq!(
+            classify_response(200, r#"{"success":true}"#),
+            CodeResult::Success
+        );
         for rejected in [
             "",
             "unsuccessful",
@@ -688,11 +913,39 @@ mod tests {
             r#"{"error_code":"denied"}"#,
             r#"{"error":"wrong"}"#,
         ] {
-            assert_eq!(classify_response(200, rejected), CodeResult::Wrong, "{rejected}");
+            assert_eq!(
+                classify_response(200, rejected),
+                CodeResult::Wrong,
+                "{rejected}"
+            );
         }
-        assert_eq!(classify_response(200, "<html>login</html>"), CodeResult::Fatal);
+        assert_eq!(
+            classify_response(200, "<html>login</html>"),
+            CodeResult::Fatal
+        );
         assert_eq!(classify_response(400, "wrong code"), CodeResult::Wrong);
         assert_eq!(classify_response(403, ""), CodeResult::Fatal);
         assert_eq!(classify_response(429, ""), CodeResult::Transient);
+    }
+
+    #[test]
+    fn response_auth_lost_recognizes_every_session_death_shape() {
+        let api = reqwest::Url::parse("https://tenant.example/api/rollcalls/1/answer").unwrap();
+        let login = reqwest::Url::parse("https://tenant.example/login").unwrap();
+        // 401 / 403 → fatal by status (radar probe aborts the chain, monitor re-logins + re-signs).
+        assert!(response_auth_lost(401, &api, ""));
+        assert!(response_auth_lost(403, &api, ""));
+        // Redirected to a login URL — any status, incl. a 2xx after the redirect was followed.
+        assert!(response_auth_lost(200, &login, ""));
+        assert!(response_auth_lost(302, &login, ""));
+        // A 200 login page served as HTML (the body carries the marker even without a login URL).
+        assert!(response_auth_lost(
+            200,
+            &api,
+            "<html><title>login</title></html>"
+        ));
+        // Genuine responses are NOT session loss.
+        assert!(!response_auth_lost(200, &api, r#"{"status":"on_call"}"#));
+        assert!(!response_auth_lost(400, &api, r#"{"error":"wrong"}"#));
     }
 }

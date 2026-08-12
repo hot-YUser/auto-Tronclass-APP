@@ -1,25 +1,37 @@
+using System.Collections.Specialized;
+using System.ComponentModel;
 using Microsoft.Maui.Controls.Shapes;
 
 namespace Ui;
 
-/// <summary>帳號分頁:多帳號列表(切換/登入/刪除/cookie 後備)、新增入口、設定入口、鎖定保險庫。</summary>
+/// <summary>
+/// 帳號分頁:多帳號列表(切換/登入/刪除/cookie 後備)、新增入口、設定入口、鎖定保險庫。
+/// 監控啟動/執行/停止期間停用新增/登入/刪除/cookie 匯入入口(核心仍是安全底線);
+/// 切換帳號不受影響。狀態變更即時更新 enabled。
+/// </summary>
 public sealed class AccountsPage : ContentPage
 {
+    readonly AppState _state;
+    readonly Button _addButton;
+    readonly Label _empty;
+    bool _attached;
+
     public AccountsPage(AppState state)
     {
+        _state = state;
         Title = "帳號";
 
         var host = new VerticalStackLayout { Spacing = 10 };
         BindableLayout.SetItemsSource(host, state.Accounts);
         BindableLayout.SetItemTemplate(host, new DataTemplate(() => new AccountCard(state, this)));
 
-        var empty = Theme.Dim("尚未新增帳號。", 13);
-        void SyncEmpty() => empty.IsVisible = state.Accounts.Count == 0;
-        state.Accounts.CollectionChanged += (_, _) => SyncEmpty();
-        SyncEmpty();
+        _empty = Theme.Dim("尚未新增帳號。", 13);
 
         var settingsRow = NavRow("設定", "倒數秒數、防假點名門檻、LLM 金鑰",
             () => Navigation.PushAsync(new SettingsPage(state)));
+
+        _addButton = Theme.Primary("＋ 新增帳號", () => Navigation.PushAsync(new AddAccountPage(state)));
+        SyncAddEnabled();
 
         Content = new ScrollView
         {
@@ -30,9 +42,9 @@ public sealed class AccountsPage : ContentPage
                 Children =
                 {
                     new StatusBanner(state),
-                    empty,
+                    _empty,
                     host,
-                    Theme.Primary("＋ 新增帳號", () => Navigation.PushAsync(new AddAccountPage(state))),
+                    _addButton,
                     Theme.Section("其他"),
                     Theme.Card(new VerticalStackLayout
                     {
@@ -43,6 +55,42 @@ public sealed class AccountsPage : ContentPage
             },
         };
     }
+
+    /// <summary>監控啟動/執行/停止期間,新增/登入/刪除/cookie 匯入都停用;切換帳號仍可。</summary>
+    internal static bool MonitorBusy(AppState state) =>
+        state.MonitorState is "starting" or "monitoring" or "stopping";
+
+    void SyncAddEnabled() => _addButton.IsEnabled = !MonitorBusy(_state);
+
+    // singleton 訂閱綁頁面生命週期:離開畫面即退訂(長命 AppState 不握住本頁)。
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        if (_attached) return;
+        _attached = true;
+        _state.PropertyChanged += OnStateChanged;
+        _state.Accounts.CollectionChanged += OnAccountsChanged;
+        SyncAddEnabled();
+        SyncEmpty();
+    }
+
+    protected override void OnDisappearing()
+    {
+        base.OnDisappearing();
+        if (!_attached) return;
+        _attached = false;
+        _state.PropertyChanged -= OnStateChanged;
+        _state.Accounts.CollectionChanged -= OnAccountsChanged;
+    }
+
+    void OnStateChanged(object? _, PropertyChangedEventArgs a)
+    {
+        if (a.PropertyName == nameof(AppState.MonitorState)) SyncAddEnabled();
+    }
+
+    void OnAccountsChanged(object? _, NotifyCollectionChangedEventArgs __) => SyncEmpty();
+
+    void SyncEmpty() => _empty.IsVisible = _state.Accounts.Count == 0;
 
     static View NavRow(string title, string sub, Func<Task> onTap)
     {
@@ -68,7 +116,8 @@ sealed class AccountCard : Border
     readonly AppState _state;
     readonly Page _page;
     AccountVm? _hookedVm;
-    System.ComponentModel.PropertyChangedEventHandler? _handler;
+    PropertyChangedEventHandler? _vmHandler;
+    PropertyChangedEventHandler? _stateHandler;
 
     public AccountCard(AppState state, Page page)
     {
@@ -83,8 +132,9 @@ sealed class AccountCard : Border
 
     void Unhook()
     {
-        if (_hookedVm is not null && _handler is not null) _hookedVm.PropertyChanged -= _handler;
-        _hookedVm = null; _handler = null;
+        if (_hookedVm is not null && _vmHandler is not null) _hookedVm.PropertyChanged -= _vmHandler;
+        if (_stateHandler is not null) _state.PropertyChanged -= _stateHandler;
+        _hookedVm = null; _vmHandler = null; _stateHandler = null;
     }
 
     protected override void OnBindingContextChanged()
@@ -92,8 +142,11 @@ sealed class AccountCard : Border
         base.OnBindingContextChanged();
         Unhook();
         if (BindingContext is not AccountVm vm) return;
-        _handler = (_, a) => { if (a.PropertyName is nameof(AccountVm.State) or nameof(AccountVm.IsActive) or nameof(AccountVm.IsTeacher)) Render(vm); };
-        vm.PropertyChanged += _handler;
+        _vmHandler = (_, a) => { if (a.PropertyName is nameof(AccountVm.State) or nameof(AccountVm.IsActive) or nameof(AccountVm.IsTeacher)) Render(vm); };
+        vm.PropertyChanged += _vmHandler;
+        // 監控狀態變更 → 即時重算按鈕 enabled
+        _stateHandler = (_, a) => { if (a.PropertyName == nameof(AppState.MonitorState)) Render(vm); };
+        _state.PropertyChanged += _stateHandler;
         _hookedVm = vm;
         Render(vm);
     }
@@ -127,15 +180,24 @@ sealed class AccountCard : Border
         var buttons = new FlexLayout { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap };
         void AddBtn(Button b) { b.Margin = new Thickness(0, 0, 8, 0); buttons.Children.Add(b); }
 
+        var locked = AccountsPage.MonitorBusy(_state); // 監控中停用登入/刪除/cookie;切換仍可用
         if (!vm.IsActive) AddBtn(Theme.Ghost("切換", () => _state.SwitchAccount(vm.Id)));
-        AddBtn(Theme.Ghost("登入", () => _state.Login(vm.Id)));
+        var login = Theme.Ghost("登入", () => _state.Login(vm.Id));
+        login.IsEnabled = !locked;
+        AddBtn(login);
         if (vm.LoginFailed)
-            AddBtn(Theme.Ghost("Cookie 登入", () => _page.Navigation.PushAsync(new CookieImportPage(_state, vm))));
-        AddBtn(Theme.Danger("刪除", async () =>
+        {
+            var cookie = Theme.Ghost("Cookie 登入", () => _page.Navigation.PushAsync(new CookieImportPage(_state, vm)));
+            cookie.IsEnabled = !locked;
+            AddBtn(cookie);
+        }
+        var del = Theme.Danger("刪除", async () =>
         {
             if (await _page.DisplayAlertAsync("刪除帳號", $"確定刪除「{vm.Label}」?此動作無法復原。", "刪除", "取消"))
                 await _state.DeleteAccount(vm.Id);
-        }));
+        });
+        del.IsEnabled = !locked;
+        AddBtn(del);
 
         var stack = new VerticalStackLayout { Spacing = 8, Children = { header, Theme.Dim(vm.Username, 12.5) } };
         if (!string.IsNullOrEmpty(school)) stack.Children.Add(Theme.Dim(school, 12.5));

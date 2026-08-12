@@ -73,7 +73,9 @@ function Write-BuildMarker {
     param(
         [Parameter(Mandatory)] [string]$HeadName,
         [Parameter(Mandatory)] [DateTime]$BuildStartedUtc,
-        [Parameter(Mandatory)] [object[]]$Artifacts
+        [Parameter(Mandatory)] [object[]]$Artifacts,
+        # Android head 專用：完整 NDK 版本（如 27.2.12479018）；release 端會重驗 major 27。
+        [string]$NdkVersion
     )
 
     $marker = if ($BuildMarkerPath) {
@@ -92,6 +94,7 @@ function Write-BuildMarker {
         completedUtc = [DateTime]::UtcNow.ToString("o")
         artifacts    = @($Artifacts)
     }
+    if (-not [string]::IsNullOrWhiteSpace($NdkVersion)) { $payload["ndkVersion"] = $NdkVersion }
     $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $marker -Encoding UTF8
     Write-Host ("  ✓ native build marker {0} ({1})" -f $marker, $payload.buildId) -ForegroundColor Green
     return $marker
@@ -113,10 +116,26 @@ function Resolve-AndroidNdk {
     if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME) -or -not (Test-Path -LiteralPath $env:ANDROID_NDK_HOME -PathType Container)) {
         throw "找不到 Android NDK；請設定 ANDROID_NDK_HOME 或安裝 SDK 內的 NDK。"
     }
+    # 只接受 NDK major 27（現機與 CI runner 皆為 27.x）；完整版本寫入 marker 供 release 重驗。
+    $propsPath = Join-Path $env:ANDROID_NDK_HOME "source.properties"
+    if (-not (Test-Path -LiteralPath $propsPath -PathType Leaf)) {
+        throw "NDK 缺少 source.properties：$propsPath（$env:ANDROID_NDK_HOME 不是標準 NDK 安裝）"
+    }
+    $revLine = Get-Content -LiteralPath $propsPath | Where-Object { $_ -match '^\s*Pkg\.Revision\s*=' } | Select-Object -First 1
+    if (-not $revLine -or $revLine -notmatch '=\s*(\d+(?:\.\d+)*)') {
+        throw "NDK source.properties 缺少 Pkg.Revision：$propsPath"
+    }
+    $ndkVersion = $Matches[1]
+    $ndkMajor = [int](($ndkVersion -split '\.')[0])
+    if ($ndkMajor -ne 27) {
+        throw "只支援 NDK major 27（目前安裝：$ndkVersion）；請安裝 27.x 或調整 ANDROID_NDK_HOME。"
+    }
+    return $ndkVersion
 }
 
 $buildStartedUtc = [DateTime]::UtcNow
 $artifacts = @()
+$ndkVersion = ""
 
 if ($Head -eq "windows") {
     $output = Join-Path $core "target\release\tronclass_core.dll"
@@ -130,7 +149,7 @@ if ($Head -eq "windows") {
 else {
     Push-Location $core
     try {
-        Resolve-AndroidNdk
+        $ndkVersion = Resolve-AndroidNdk
         $outputs = @(
             (Join-Path $core "jniLibs\arm64-v8a\libtronclass_core.so"),
             (Join-Path $core "jniLibs\x86_64\libtronclass_core.so")
@@ -155,5 +174,5 @@ else {
     }
 }
 
-$markerPath = Write-BuildMarker -HeadName $Head -BuildStartedUtc $buildStartedUtc -Artifacts $artifacts
+$markerPath = Write-BuildMarker -HeadName $Head -BuildStartedUtc $buildStartedUtc -Artifacts $artifacts -NdkVersion $ndkVersion
 Write-Host ("{0}: 原生核心輸出已確認（{1}）" -f $Head, (($artifacts | ForEach-Object { $_.path }) -join ", "))

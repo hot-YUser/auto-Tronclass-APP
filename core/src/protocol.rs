@@ -29,7 +29,8 @@ impl AnswerWire {
             }
             Self::Text { value } if !value.trim().is_empty() => Ok(Answer::Text(value)),
             Self::Vote { letters }
-                if !letters.is_empty() && letters.iter().all(|letter| !letter.trim().is_empty()) =>
+                if !letters.is_empty()
+                    && letters.iter().all(|letter| !letter.trim().is_empty()) =>
             {
                 Ok(Answer::Vote(letters))
             }
@@ -80,8 +81,12 @@ pub enum Command {
         device_key_b64: Option<String>,
     },
     /// Idempotent no-ops: the vault auto-unlocks at Init (no master password). Kept for wire back-compat.
-    CreateVault { id: u64 },
-    Unlock { id: u64 },
+    CreateVault {
+        id: u64,
+    },
+    Unlock {
+        id: u64,
+    },
     /// Add an account; its password goes straight into the vault, never the config.
     AddAccount {
         id: u64,
@@ -94,30 +99,66 @@ pub enum Command {
         #[serde(default)]
         course_id: Option<String>,
     },
-    SwitchAccount { id: u64, account_id: String },
-    DeleteAccount { id: u64, account_id: String },
+    SwitchAccount {
+        id: u64,
+        account_id: String,
+    },
+    DeleteAccount {
+        id: u64,
+        account_id: String,
+    },
     /// Real login for the given account (resolves school → endpoints, reads secret from vault).
-    Login { id: u64, account_id: String },
+    Login {
+        id: u64,
+        account_id: String,
+    },
 
     /// Import a browser-exported cookie set for an account → vault → verify (no capture UI here).
-    ImportCookies { id: u64, account_id: String, cookies_json: String },
+    ImportCookies {
+        id: u64,
+        account_id: String,
+        cookies_json: String,
+    },
 
     /// Answer a captcha challenge for an in-flight login (paired with the `CaptchaChallenge` event).
-    SubmitCaptcha { id: u64, account_id: String, text: String },
+    SubmitCaptcha {
+        id: u64,
+        account_id: String,
+        text: String,
+    },
 
     /// Begin/stop concurrent per-account rollcall monitoring.
-    StartMonitoring { id: u64 },
-    StopMonitoring { id: u64 },
+    StartMonitoring {
+        id: u64,
+    },
+    StopMonitoring {
+        id: u64,
+    },
 
     /// User decisions on an in-flight rollcall (per-activity: all participating accounts).
-    SignNow { id: u64, activity_token: String },
-    DeferSignIn { id: u64, activity_token: String },
+    SignNow {
+        id: u64,
+        activity_token: String,
+    },
+    DeferSignIn {
+        id: u64,
+        activity_token: String,
+    },
 
     /// User decisions on an in-flight quiz (docs 20 flow A). Submit/hold/discard are per merged
     /// activity; SetAnswer resolves one account's one subject (conflicts are per-account).
-    SubmitNow { id: u64, activity_token: String },
-    HoldAnswer { id: u64, activity_token: String },
-    DiscardAnswer { id: u64, activity_token: String },
+    SubmitNow {
+        id: u64,
+        activity_token: String,
+    },
+    HoldAnswer {
+        id: u64,
+        activity_token: String,
+    },
+    DiscardAnswer {
+        id: u64,
+        activity_token: String,
+    },
     SetAnswer {
         id: u64,
         activity_token: String,
@@ -127,12 +168,20 @@ pub enum Command {
     },
 
     /// Store the LLM API key in the vault (never in config/logs).
-    SetLlmKey { id: u64, key: String },
+    SetLlmKey {
+        id: u64,
+        key: String,
+    },
 
     /// Patch typed settings (e.g. countdown_secs). `patch` is a JSON object merged into Settings.
-    UpdateConfig { id: u64, patch: serde_json::Value },
+    UpdateConfig {
+        id: u64,
+        patch: serde_json::Value,
+    },
 
-    Shutdown { id: u64 },
+    Shutdown {
+        id: u64,
+    },
 }
 
 impl Command {
@@ -194,11 +243,9 @@ mod tests {
 
     #[test]
     fn empty_answer_wire_is_rejected() {
-        assert!(AnswerWire::Text {
-            value: "  ".into()
-        }
-        .into_answer()
-        .is_err());
+        assert!(AnswerWire::Text { value: "  ".into() }
+            .into_answer()
+            .is_err());
         assert!(AnswerWire::Options { option_ids: vec![] }
             .into_answer()
             .is_err());
@@ -221,10 +268,8 @@ mod tests {
 
     #[test]
     fn shared_quiz_prepared_fixture_uses_typed_answers() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "assets/quiz_prepared_v1.json"
-        ))
-        .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("assets/quiz_prepared_v1.json")).unwrap();
         assert_eq!(fixture["event"], "QuizPrepared");
         assert_eq!(fixture["schema_version"], 1);
         assert!(fixture["activity_token"]

@@ -5,7 +5,12 @@ namespace Ui;
 
 /// <summary>設定(帳號分頁入口):監控參數、LLM 連線/答題偏好、LLM 金鑰、核心能力、日誌。
 /// 所有欄位以核心推來的 <see cref="AppState.CurrentSettings"/> 現值填入(非只有預設),
-/// 並訂閱 <see cref="AppState.SettingsChanged"/> 隨儲存後回填。金鑰本身不過縫,只顯示「已/未設定」。</summary>
+/// 並訂閱 <see cref="AppState.SettingsChanged"/> 隨儲存後回填。金鑰本身不過縫,只顯示「已/未設定」。
+///
+/// 未儲存編輯保護:每張卡的 dirty 以「欄位現值 vs 核心現值」的比較為準(<see cref="SettingsSync"/>),
+/// 程式化回填天生不會誤標 dirty(programmatic-populate guard)。儲存金鑰或另一張卡的
+/// Settings 事件觸發的回填,一律整卡跳過 dirty 卡 → 未儲存編輯不會被覆寫。
+/// 該卡成功儲存後以「剛送出的值」回填正規格式(核心隨後的 Settings 事件再校正),dirty 隨之清除。</summary>
 public sealed class SettingsPage : ContentPage
 {
     readonly AppState _state;
@@ -29,11 +34,21 @@ public sealed class SettingsPage : ContentPage
     readonly PropertyChangedEventHandler _onCaps;
     readonly NotifyCollectionChangedEventHandler _onLogs;
     bool _subscribed;
+    readonly SettingsCardSync _monitorSync = new();
+    readonly SettingsCardSync _llmSync = new();
 
     public SettingsPage(AppState state)
     {
         _state = state;
         Title = "設定";
+        _countdown.TextChanged += (_, _) => _monitorSync.MarkEdited();
+        _threshold.TextChanged += (_, _) => _monitorSync.MarkEdited();
+        _thresholdOn.Toggled += (_, _) => _monitorSync.MarkEdited();
+        _endpoint.TextChanged += (_, _) => _llmSync.MarkEdited();
+        _model.TextChanged += (_, _) => _llmSync.MarkEdited();
+        _maxTokens.TextChanged += (_, _) => _llmSync.MarkEdited();
+        _resubmit.Toggled += (_, _) => _llmSync.MarkEdited();
+        _tools.Toggled += (_, _) => _llmSync.MarkEdited();
 
         // --- 監控參數 ---
         var monitorCard = Theme.Card(new VerticalStackLayout
@@ -55,7 +70,13 @@ public sealed class SettingsPage : ContentPage
                         return;
                     }
                     if (await state.SaveConfig(secs, pct, _thresholdOn.IsToggled))
+                    {
+                        // 回填剛儲存的正規值(門檻停用時 core 存 0 → 畫面顯示預設 15),dirty 隨之清除
+                        _countdown.Text = secs.ToString();
+                        _threshold.Text = SettingsSync.CanonicalGateText(_thresholdOn.IsToggled ? pct : 0);
+                        _monitorSync.Saved();
                         state.Notify("info", "監控設定已儲存");
+                    }
                 }),
             },
         });
@@ -75,6 +96,7 @@ public sealed class SettingsPage : ContentPage
                     if (key.Length == 0) { state.Notify("error", "請輸入金鑰"); return; }
                     if (await state.SetLlmKey(key))
                     {
+                        // 金鑰欄位是暫存輸入,回填永不碰它;HasLlmKey 由隨後的 Settings 事件更新
                         _llmKey.Text = "";
                         state.Notify("info", "金鑰已儲存");
                     }
@@ -104,7 +126,14 @@ public sealed class SettingsPage : ContentPage
                     if (endpoint.Length == 0 || model.Length == 0) { state.Notify("error", "端點與模型不可空白"); return; }
                     if (!int.TryParse(_maxTokens.Text, out var mt) || mt < 0) { state.Notify("error", "最大 tokens 格式不正確"); return; }
                     if (await state.SaveLlmSettings(endpoint, model, mt, _resubmit.IsToggled, _tools.IsToggled))
+                    {
+                        // 回填剛儲存的正規值(trimmed),dirty 隨之清除
+                        _endpoint.Text = endpoint;
+                        _model.Text = model;
+                        _maxTokens.Text = mt.ToString();
+                        _llmSync.Saved();
                         state.Notify("info", "LLM 設定已儲存");
+                    }
                 }),
             },
         });
@@ -163,25 +192,36 @@ public sealed class SettingsPage : ContentPage
         _state.Logs.CollectionChanged += _onLogs;
         _subscribed = true;
 
-        // 每次重新顯示都以核心現值同步畫面，避免頁面暫離期間遺漏更新。
+        // 每次重新顯示都以核心現值同步畫面,避免頁面暫離期間遺漏更新(dirty 卡整卡保留)。
         Populate();
         BuildCaps();
         SyncLogEmpty();
     }
 
-    /// <summary>以核心現值填入所有欄位(修正舊版「開啟設定頁只顯示預設、不反映已存值」)。</summary>
+    /// <summary>
+    /// 以核心現值填入欄位。第一次事件一定初始化空控制項；之後 dirty 卡整卡跳過，
+    /// 因此儲存金鑰或另一張卡造成的 Settings 事件不會覆寫未儲存編輯。
+    /// </summary>
     void Populate()
     {
         var s = _state.CurrentSettings;
         if (s is null) return;
-        _countdown.Text = s.CountdownSecs.ToString();
-        _thresholdOn.IsToggled = s.AttendanceGatePercent > 0;
-        _threshold.Text = (s.AttendanceGatePercent > 0 ? s.AttendanceGatePercent : 15).ToString("0.#");
-        _endpoint.Text = s.LlmEndpoint;
-        _model.Text = s.LlmModel;
-        _maxTokens.Text = s.LlmMaxTokens.ToString();
-        _resubmit.IsToggled = s.ResubmitForCorrect;
-        _tools.IsToggled = s.EnableLlmTools;
+        if (_monitorSync.ShouldPopulate)
+        {
+            _countdown.Text = s.CountdownSecs.ToString();
+            _thresholdOn.IsToggled = s.AttendanceGatePercent > 0;
+            _threshold.Text = SettingsSync.CanonicalGateText(s.AttendanceGatePercent);
+            _monitorSync.Populated();
+        }
+        if (_llmSync.ShouldPopulate)
+        {
+            _endpoint.Text = s.LlmEndpoint;
+            _model.Text = s.LlmModel;
+            _maxTokens.Text = s.LlmMaxTokens.ToString();
+            _resubmit.IsToggled = s.ResubmitForCorrect;
+            _tools.IsToggled = s.EnableLlmTools;
+            _llmSync.Populated();
+        }
         _keyStatus.Text = s.HasLlmKey ? "金鑰狀態:已設定" : "金鑰狀態:尚未設定";
     }
 

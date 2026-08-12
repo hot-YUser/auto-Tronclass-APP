@@ -89,6 +89,56 @@ foreach (var requiredField in new[] { "quiz_id", "activity", "expected_accounts"
     Assert(!QuizPreparedContract.TryParse(malformed.RootElement, out _, out _), $"missing {requiredField} must fail closed");
 }
 
+// ---- Quiz 完成述詞(terminal set):只有 Submitted 或 AttemptState ∈ {failed, gone} 是終端 ----
+Assert(QuizCompletion.IsTerminal(null, submitted: true), "submitted must be terminal");
+Assert(QuizCompletion.IsTerminal("failed", submitted: false), "failed must be terminal");
+Assert(QuizCompletion.IsTerminal("gone", submitted: false), "gone must be terminal");
+foreach (var state in new[] { "waiting", "preparing", "ready", "submitting" })
+    Assert(!QuizCompletion.IsTerminal(state, submitted: false), $"{state} must block completion");
+
+// 帳號層:AttemptState/Submitted 經由同一述詞
+var terminalAcc = new QuizAccountVm { AccountId = "a" };
+terminalAcc.AttemptState = "failed";
+Assert(terminalAcc.IsTerminal, "failed account is terminal");
+terminalAcc.AttemptState = "ready";
+Assert(!terminalAcc.IsTerminal, "ready account blocks");
+terminalAcc.SubmitResult = "ok";
+Assert(terminalAcc.IsTerminal, "submitted account is terminal");
+
+static QuizVm Quiz(params (string Id, string State, bool Submitted)[] accounts)
+{
+    var vm = new QuizVm { ActivityToken = "check", Id = "q" };
+    foreach (var (id, state, submitted) in accounts)
+    {
+        vm.ExpectedAccountIds.Add(id);
+        var acc = new QuizAccountVm { AccountId = id };
+        acc.AttemptState = state;
+        if (submitted) acc.SubmitResult = "ok";
+        vm.PerAccount.Add(acc);
+    }
+    return vm;
+}
+
+// all-failed(failed + gone)→ 完成;狀態文字不得宣稱成功送出
+var allFailed = Quiz(("a", "failed", false), ("b", "gone", false));
+Assert(allFailed.IsComplete, "all-failed must complete");
+allFailed.Status = "done";
+Assert(allFailed.StatusTag == "已結束", "all-failed tag must not claim 已送出");
+Assert(allFailed.StatusText == "活動已結束 · 未送出作答", "all-failed text must not claim submission");
+
+// ready + failed:ready 仍在路上,不得完成
+Assert(!Quiz(("a", "ready", false), ("b", "failed", false)).IsComplete, "ready+failed must not complete");
+
+// preparing 不得完成(即使另一帳號已送出)
+Assert(!Quiz(("a", "preparing", false), ("b", "ready", true)).IsComplete, "preparing must not complete");
+
+// waiting / submitting 同樣阻擋
+Assert(!Quiz(("a", "waiting", false), ("b", "gone", false)).IsComplete, "waiting must not complete");
+Assert(!Quiz(("a", "submitting", false), ("b", "gone", false)).IsComplete, "submitting must not complete");
+
+// 全帳號送出 → 完成
+Assert(Quiz(("a", "ready", true), ("b", "ready", true)).IsComplete, "all submitted must complete");
+
 Console.WriteLine("ProtocolContract.Check：全部通過");
 
 static void Assert(bool condition, string message)

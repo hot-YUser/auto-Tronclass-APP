@@ -1,10 +1,14 @@
 #!/usr/bin/env pwsh
+#requires -Version 7.4
 # 一鍵發版建置器：測試 → 雙 head 原生核心 → Windows/Android 發行產物 → 驗證與打包。
 # 本腳本只建置與驗證，不發布；缺少 APK 固定 fingerprint 或簽章工具時必定失敗。
 #
 #   ./tools/release.ps1 -Tag v2.0.0-alpha.4
 #   ./tools/release.ps1 -Tag v2.0.0-alpha.4 -SkipAndroid
+#   ./tools/release.ps1 -Tag v2.0.0-alpha.4 -ValidateOnly   # 純版本驗算，不建置
 #
+# Tag 必須是嚴格 SemVer（v?M.m.p[-alpha|beta|rc.N]）；DisplayVersion／Android
+# versionCode／Windows 數值版本一律由 Tag 依共享公式計算，不依賴 Ui.csproj 的手動欄位。
 # Android 私鑰仍由 keystore.properties 提供；公開 SHA-256 憑證指紋固定在
 # tools/android-signing.json，不能以環境變數靜默換掉。
 
@@ -13,6 +17,10 @@ param(
     [switch]$SkipAndroid,
     [switch]$SkipWindows,
     [switch]$SkipInstaller,
+    # 要求 git tag 已存在且指向 HEAD；預設允許 tag 尚未建立的發行前置建置。
+    [switch]$RequireTaggedHead,
+    # 純版本解析自測：驗算 Tag → DisplayVersion/versionCode/Windows 版本後直接結束，不改工作區。
+    [switch]$ValidateOnly,
     [string]$ExpectedApkFingerprint = $env:ANDROID_APK_FINGERPRINT
 )
 
@@ -22,11 +30,73 @@ $tools = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $tools
 Set-Location $root
 
-if ($Tag -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' -or $Tag -in '.', '..') {
-    throw "Tag 只能由 1–64 個英數、點、底線或連字號組成，且不得是路徑片段：$Tag"
-}
 if ($SkipWindows -and $SkipAndroid) {
     throw "不能同時跳過 Windows 與 Android；至少必須驗證一個正式發行 head。"
+}
+
+function ConvertTo-ReleaseVersion {
+    param([Parameter(Mandatory)] [string]$Tag)
+
+    # 嚴格 SemVer：v?M.m.p[-alpha|beta|rc.N]（無前導零）。stage 排序 alpha=1、beta=2、rc=3、stable=9。
+    $m = [regex]::Match($Tag, '^v?(0|[1-9]\d{0,1})\.(0|[1-9]\d{0,1})\.(0|[1-9]\d{0,1})(?:-(alpha|beta|rc)\.(0|[1-9]\d{0,2}))?$')
+    if (-not $m.Success) {
+        throw "Tag 必須是嚴格 SemVer（v?M.m.p[-alpha|beta|rc.N]，M<=20、m/p<=99、N<=999）：$Tag"
+    }
+    $major = [int]$m.Groups[1].Value
+    $minor = [int]$m.Groups[2].Value
+    $patch = [int]$m.Groups[3].Value
+    $stage = if ($m.Groups[4].Success) { $m.Groups[4].Value } else { "stable" }
+    $ordinal = if ($m.Groups[5].Success) { [int]$m.Groups[5].Value } else { 0 }
+    if ($major -gt 20) { throw "Tag major 不得大於 20：$Tag" }
+    if ($minor -gt 99 -or $patch -gt 99) { throw "Tag minor/patch 不得大於 99：$Tag" }
+    if ($ordinal -gt 999) { throw "Tag prerelease ordinal 不得大於 999：$Tag" }
+    $rank = switch ($stage) { "alpha" { 1 } "beta" { 2 } "rc" { 3 } "stable" { 9 } }
+    # 共享公式：major*100_000_000 + minor*1_000_000 + patch*10_000 + rank*1_000 + ordinal；
+    # Windows 數值版本以同一組數字為第四段（rank*1000+ordinal <= 9999，恆在 16-bit 範圍）。
+    $versionCode = ($major * 100000000) + ($minor * 1000000) + ($patch * 10000) + ($rank * 1000) + $ordinal
+    if ($versionCode -gt 2147483647) { throw "versionCode 超過 Android int32 上限：$versionCode" }
+    return [pscustomobject]@{
+        Tag            = $Tag
+        Major          = $major
+        Minor          = $minor
+        Patch          = $patch
+        Stage          = $stage
+        Ordinal        = $ordinal
+        Rank           = $rank
+        DisplayVersion = $Tag -replace '^v', ''
+        VersionCode    = $versionCode
+        WindowsVersion = "$major.$minor.$patch.$($rank * 1000 + $ordinal)"
+    }
+}
+
+$version = ConvertTo-ReleaseVersion -Tag $Tag
+
+if ($ValidateOnly) {
+    [ordered]@{
+        tag            = $version.Tag
+        displayVersion = $version.DisplayVersion
+        versionCode    = $version.VersionCode
+        windowsVersion = $version.WindowsVersion
+        stage          = $version.Stage
+        ordinal        = $version.Ordinal
+    } | ConvertTo-Json | Write-Output
+    exit 0
+}
+
+# ── 來源閘：工作樹必須乾淨（尊重 .gitignore），並記下 HEAD 供產物稽核。 ──
+$gitStatus = @(& git status --porcelain 2>$null)
+if ($LASTEXITCODE -ne 0) { throw "無法執行 git status；請確認在 git 工作樹內執行。" }
+if ($gitStatus.Count -gt 0) {
+    throw "git 工作樹不乾淨（$($gitStatus.Count) 筆變更）；發行前請先提交或清除變更。"
+}
+$headSha = [string](& git rev-parse HEAD 2>$null)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($headSha)) { throw "無法取得 HEAD commit。" }
+if ($RequireTaggedHead) {
+    $tagCommit = [string](& git rev-parse --verify --quiet "$Tag^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "找不到 git tag $Tag（-RequireTaggedHead 要求 tag 已存在）。" }
+    if ($tagCommit.Trim() -ne $headSha.Trim()) {
+        throw "git tag $Tag 指向 $($tagCommit.Trim())，不是 HEAD $($headSha.Trim())（-RequireTaggedHead）。"
+    }
 }
 
 function Step([string]$Message) {
@@ -50,6 +120,12 @@ function Invoke-Native {
     if ($exitCode -ne 0) {
         throw "$FailureMessage（退出碼 $exitCode）"
     }
+}
+
+function Get-ToolVersion {
+    param([Parameter(Mandatory)] [string]$Name)
+    try { return ((& $Name --version 2>$null) | Select-Object -First 1) }
+    catch { return "unknown" }
 }
 
 function Read-NativeMarker {
@@ -99,6 +175,18 @@ function Find-ApkSigner {
     return Get-ChildItem -LiteralPath $buildTools -Directory |
         Sort-Object Name -Descending |
         ForEach-Object { Join-Path $_.FullName "apksigner.bat" } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+}
+
+function Find-Aapt {
+    $sdk = if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_HOME)) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+    if ([string]::IsNullOrWhiteSpace($sdk)) { return $null }
+    $buildTools = Join-Path $sdk "build-tools"
+    if (-not (Test-Path -LiteralPath $buildTools -PathType Container)) { return $null }
+    return Get-ChildItem -LiteralPath $buildTools -Directory |
+        Sort-Object Name -Descending |
+        ForEach-Object { Join-Path $_.FullName "aapt.exe" } |
         Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
         Select-Object -First 1
 }
@@ -203,6 +291,15 @@ $dotnetDir = Split-Path $dotnet -Parent
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$dotnetDir;$env:PATH"
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
 
+# ── .NET SDK 閘：發行必須使用與 CI 相同的 11.0.100 preview feature band。
+#    同 band 內的安全 roll-forward（11.0.100-preview.*）可接受；其他 SDK 一律拒絕，
+#    避免在錯誤 SDK 上產出無法與 CI 重現的發行物。
+$dotnetActual = Get-ToolVersion -Name $dotnet
+if ($dotnetActual -notmatch '^11\.0\.100-preview\.') {
+    throw "發行需要 .NET SDK 11.0.100-preview（與 CI 相同的 feature band）；目前：$dotnetActual。請安裝 11.0.100-preview.6.26359.118 或同 band 的 preview 後重試。"
+}
+Write-Host ("  ✓ .NET SDK $dotnetActual") -ForegroundColor Green
+
 if (-not $SkipAndroid) {
     $javaCandidates = @()
     if (-not [string]::IsNullOrWhiteSpace($env:JAVA_HOME)) { $javaCandidates += $env:JAVA_HOME }
@@ -248,10 +345,11 @@ Step "cargo clippy"
 Invoke-Native -FilePath "cargo" -Arguments @("clippy", "--manifest-path", "$core/Cargo.toml", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings") -FailureMessage "Rust cargo clippy 失敗"
 
 if (-not $SkipWindows) {
-    # 兩個檢查直接連結 production source，防止 OS key 與 Rust↔C# wire contract 在發版前漂移。
+    # 三個檢查直接連結 production source，防止 OS key、Rust↔C# wire contract 與設定頁保護邏輯在發版前漂移。
     foreach ($check in @(
         @{ Name = "DeviceKey"; Path = (Join-Path $tools "checks\DeviceKey.Check\DeviceKey.Check.csproj") },
-        @{ Name = "ProtocolContract"; Path = (Join-Path $tools "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") }
+        @{ Name = "ProtocolContract"; Path = (Join-Path $tools "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") },
+        @{ Name = "UiSettings"; Path = (Join-Path $tools "checks\UiSettings.Check\UiSettings.Check.csproj") }
     )) {
         if (-not (Test-Path -LiteralPath $check.Path -PathType Leaf)) {
             throw "缺少 $($check.Name) 可執行檢查：$($check.Path)"
@@ -279,6 +377,9 @@ if (-not $SkipAndroid) {
     & $buildCore -Head android -BuildMarkerPath $androidMarkerPath
     if ($LASTEXITCODE -ne 0) { throw "Android 原生核心腳本失敗（退出碼 $LASTEXITCODE）" }
     $androidMarker = Read-NativeMarker -Path $androidMarkerPath -ExpectedHead "android"
+    if ([string]::IsNullOrWhiteSpace([string]$androidMarker.ndkVersion) -or "$($androidMarker.ndkVersion)" -notmatch '^27\.') {
+        throw "Android marker 缺少完整 NDK 版本（需 major 27）：$androidMarkerPath"
+    }
 }
 
 # ── Windows portable + smoke ──
@@ -287,11 +388,24 @@ if (-not $SkipWindows) {
     Clear-HeadBuildOutput -TargetFramework $winTfm
     Invoke-Native -FilePath $dotnet -Arguments @(
         "publish", (Join-Path $root "ui/Ui.csproj"), "-f", $winTfm, "-c", "Release", "-r", "win-x64", "--self-contained",
-        "-p:PackageMode=portable", "-p:WindowsAppSDKSelfContained=true"
+        "-p:PackageMode=portable", "-p:WindowsAppSDKSelfContained=true",
+        "-p:Version=$($version.WindowsVersion)", "-p:FileVersion=$($version.WindowsVersion)",
+        "-p:InformationalVersion=$($version.DisplayVersion)", "-p:IncludeSourceRevisionInInformationalVersion=false"
     ) -FailureMessage "Windows publish 失敗"
     $pub = Join-Path $root "ui\bin\Release\$winTfm\win-x64\publish"
     if (-not (Test-Path -LiteralPath $pub -PathType Container)) { throw "Windows publish 目錄不存在：$pub" }
     Assert-PublishedNativeHash -Marker $winMarker -PublishedPath (Join-Path $pub "tronclass_core.dll")
+
+    # 產物內版本必須與 Tag 計算值一致；不符即 fail，release 不得依賴手改 Ui.csproj。
+    $uiExe = Join-Path $pub "Ui.exe"
+    $exeVersionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($uiExe)
+    if ($exeVersionInfo.FileVersion -ne $version.WindowsVersion) {
+        throw "Ui.exe FileVersion 不符：實際 $($exeVersionInfo.FileVersion)；預期 $($version.WindowsVersion)"
+    }
+    if ($exeVersionInfo.ProductVersion -ne $version.DisplayVersion) {
+        throw "Ui.exe ProductVersion 不符：實際 $($exeVersionInfo.ProductVersion)；預期 $($version.DisplayVersion)"
+    }
+    Write-Host ("  ✓ Ui.exe FileVersion=$($exeVersionInfo.FileVersion) ProductVersion=$($exeVersionInfo.ProductVersion)") -ForegroundColor Green
 
     $srisPath = Join-Path $pub "System.Runtime.InteropServices.dll"
     if (-not (Test-Path -LiteralPath $srisPath -PathType Leaf)) { throw "Windows publish 缺少 System.Runtime.InteropServices.dll" }
@@ -367,7 +481,8 @@ if (-not $SkipWindows) {
         Step "build Inno per-user installer"
         $pubAbs = (Resolve-Path -LiteralPath $pub).Path
         Invoke-Native -FilePath $iscc -Arguments @(
-            "/Qp", "/DMyAppVersion=$Tag", "/DPubDir=$pubAbs", "/DOutDir=$dist",
+            "/Qp", "/DMyAppVersion=$Tag", "/DMyVersionInfoVersion=$($version.WindowsVersion)",
+            "/DPubDir=$pubAbs", "/DOutDir=$dist",
             (Join-Path $tools "installer\AutoTronclass.iss")
         ) -FailureMessage "Inno 安裝檔建置失敗"
         $setup = Join-Path $dist "$setupName.exe"
@@ -413,7 +528,8 @@ if (-not $SkipAndroid) {
         "publish", (Join-Path $root "ui/Ui.csproj"), "-f", "net11.0-android", "-c", "Release",
         "-p:AndroidKeyStore=true", "-p:AndroidSigningKeyStore=$ksAbs",
         "-p:AndroidSigningStorePass=$($kp.storePassword)", "-p:AndroidSigningKeyAlias=$($kp.keyAlias)",
-        "-p:AndroidSigningKeyPass=$($kp.keyPassword)"
+        "-p:AndroidSigningKeyPass=$($kp.keyPassword)",
+        "-p:ApplicationVersion=$($version.VersionCode)", "-p:ApplicationDisplayVersion=$($version.DisplayVersion)"
     ) -FailureMessage "Android publish 失敗"
     $apk = Get-ChildItem -LiteralPath $androidPublish -Filter "*-Signed.apk" -File |
         Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
@@ -434,10 +550,25 @@ if (-not $SkipAndroid) {
     if ($actualFingerprint -ne $expectedFingerprintNormalized) {
         throw "APK fingerprint 不符固定設定（實際 $actualFingerprint；預期 $expectedFingerprintNormalized）"
     }
-    if ($verifyText -notmatch [regex]::Escape([string]$signingConfig.subject)) {
-        throw "APK 憑證 subject 不符固定設定（預期 $($signingConfig.subject)）"
-    }
     Assert-ApkNativeHashes -Marker $androidMarker -ApkPath $apkDest
+
+    # APK 內 versionName/versionCode 必須與 Tag 計算值一致；不符即 fail。
+    $aapt = Find-Aapt
+    if (-not $aapt) { throw "找不到 aapt（Android SDK build-tools 未安裝）" }
+    $badging = (& $aapt dump badging $apkDest 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "aapt dump badging 失敗（退出碼 $LASTEXITCODE）" }
+    $vcMatch = [regex]::Match($badging, "versionCode='(\d+)'")
+    $vnMatch = [regex]::Match($badging, "versionName='([^']*)'")
+    if (-not $vcMatch.Success -or -not $vnMatch.Success) {
+        throw "APK badging 缺少 versionCode/versionName"
+    }
+    if ($vcMatch.Groups[1].Value -ne [string]$version.VersionCode) {
+        throw "APK versionCode 不符：實際 $($vcMatch.Groups[1].Value)；預期 $($version.VersionCode)"
+    }
+    if ($vnMatch.Groups[1].Value -ne $version.DisplayVersion) {
+        throw "APK versionName 不符：實際 $($vnMatch.Groups[1].Value)；預期 $($version.DisplayVersion)"
+    }
+    Write-Host ("  ✓ APK versionCode=$($vcMatch.Groups[1].Value) versionName=$($vnMatch.Groups[1].Value)") -ForegroundColor Green
     Write-Host ("  ✓ dist\$apkName ({0:N0} MB)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB)) -ForegroundColor Green
 }
 
@@ -455,19 +586,57 @@ foreach ($asset in $expectedAssets) {
     Write-Host ("  {0}  {1:N0} MB" -f $item.Name, ($item.Length / 1MB))
 }
 $notesPath = Join-Path $dist "RELEASE_NOTES-$Tag.md"
-if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) {
-    $noteLines = @(
-        "# Auto-Tronclass $Tag",
-        "",
-        "此檔由 release.ps1 產生；腳本只建置與驗證，不會發布 GitHub Release。",
-        "",
-        "## 已驗證資產",
-        ""
-    )
-    $noteLines += ($expectedAssets | ForEach-Object { "- ``$([IO.Path]::GetFileName($_))``" })
-    Set-Content -LiteralPath $notesPath -Encoding UTF8 -Value ($noteLines -join "`n")
-}
+$noteLines = @(
+    "# Auto-Tronclass $Tag",
+    "",
+    "此檔由 release.ps1 產生；腳本只建置與驗證，不會發布 GitHub Release。",
+    "",
+    "## 版本（由 Tag 依共享公式計算）",
+    "",
+    "- DisplayVersion: $($version.DisplayVersion)",
+    "- versionCode: $($version.VersionCode)",
+    "- Windows 數值版本: $($version.WindowsVersion)",
+    "- Commit: $headSha",
+    "",
+    "## 已驗證資產",
+    ""
+)
+$noteLines += ($expectedAssets | ForEach-Object { "- ``$([IO.Path]::GetFileName($_))``" })
+Set-Content -LiteralPath $notesPath -Encoding UTF8 -Value ($noteLines -join "`n")
 if ((Get-Item -LiteralPath $notesPath).Length -le 0) { throw "release notes 為空：$notesPath" }
+
+# machine-readable 建置中繼資料；與所有產物一起列入 SHA256SUMS。
+$toolchains = [ordered]@{
+    rustc  = Get-ToolVersion -Name "rustc"
+    cargo  = Get-ToolVersion -Name "cargo"
+    dotnet = Get-ToolVersion -Name $dotnet
+}
+if (-not $SkipAndroid) { $toolchains["ndk"] = [string]$androidMarker.ndkVersion }
+$metadata = [ordered]@{
+    schema         = 1
+    tag            = $version.Tag
+    displayVersion = $version.DisplayVersion
+    versionCode    = $version.VersionCode
+    windowsVersion = $version.WindowsVersion
+    stage          = $version.Stage
+    ordinal        = $version.Ordinal
+    commit         = $headSha
+    builtAtUtc     = [DateTime]::UtcNow.ToString("o")
+    toolchains     = $toolchains
+}
+$metadataPath = Join-Path $dist "build-metadata.json"
+$metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding UTF8
+
+$sumLines = @()
+foreach ($file in @($expectedAssets + $notesPath + $metadataPath)) {
+    $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sumLines += "{0}  {1}" -f $hash, [IO.Path]::GetFileName($file)
+}
+$sumLines = @($sumLines | Sort-Object)
+$sumsPath = Join-Path $dist "SHA256SUMS.txt"
+Set-Content -LiteralPath $sumsPath -Encoding ASCII -Value ($sumLines -join "`n")
+Write-Host ("  ✓ build-metadata.json + SHA256SUMS.txt（{0} 個檔）" -f $sumLines.Count) -ForegroundColor Green
+
 $assets = ($expectedAssets | ForEach-Object { "dist/$([IO.Path]::GetFileName($_))" }) -join " "
 Write-Host "`n下一步（使用者決定後）：" -ForegroundColor Yellow
 Write-Host "  gh release create $Tag --repo hot-YUser/auto-Tronclass-APP --prerelease --target main ``"

@@ -6,6 +6,13 @@
 use crate::providers::Endpoints;
 use reqwest::Client;
 
+/// Bounded response bodies for login-page reads: a themed login HTML page can carry heavy JS/CSS
+/// (a few MiB is generous), but an unbounded `.text()` lets a broken tenant balloon memory.
+const MAX_LOGIN_HTML: usize = 8 * 1024 * 1024;
+const MAX_SESSION_JSON: usize = 4 * 1024 * 1024;
+const MAX_CAPTCHA_IMAGE: usize = 5 * 1024 * 1024;
+use zeroize::Zeroize;
+
 /// A parsed username/password `<form>`: action + field names + **every other named input verbatim**
 /// (CSRF/theme tokens must be echoed back on POST — not only `type=hidden`, some CAS/Keycloak themes
 /// render the token as a visible input). `captcha_field` is set when a form input matches the captcha
@@ -25,8 +32,20 @@ pub struct PasswordForm {
 /// image via AJAX JSON, not an `<img>`, so we can't auto-drive it — such tenants must use the
 /// browser-cookie login (Phase C). Don't imply support that isn't there (the QR "尚未發現" honesty rule).
 const CAPTCHA_FIELDS: &[&str] = &[
-    "captcha", "authcode", "auth_code", "verify_code", "verifycode",
-    "checkcode", "check_code", "vcode", "yzm", "imgcode", "seccode", "kaptcha", "validatecode", "validate_code",
+    "captcha",
+    "authcode",
+    "auth_code",
+    "verify_code",
+    "verifycode",
+    "checkcode",
+    "check_code",
+    "vcode",
+    "yzm",
+    "imgcode",
+    "seccode",
+    "kaptcha",
+    "validatecode",
+    "validate_code",
 ];
 
 fn is_captcha_field(name: &str) -> bool {
@@ -50,7 +69,11 @@ pub enum LoginKind {
     PublicCloudEmail(PublicCloudForm),
     /// A password form guarded by an image captcha: carries the form, the captcha image URL, and the
     /// captcha input field name so the flow can grab the image and resubmit with the typed answer.
-    Captcha { form: PasswordForm, image_url: String, captcha_field: String },
+    Captcha {
+        form: PasswordForm,
+        image_url: String,
+        captcha_field: String,
+    },
     SsoRedirect,
     EmailSpa,
     Unknown,
@@ -61,7 +84,10 @@ pub enum LoginKind {
 pub enum LoginOutcome {
     Ok,
     Failed(String),
-    NeedCaptcha { image_bytes: Vec<u8>, pending: CaptchaPending },
+    NeedCaptcha {
+        image_bytes: Vec<u8>,
+        pending: CaptchaPending,
+    },
 }
 
 /// Everything needed to finish a captcha login once the user supplies the text. Holds credentials
@@ -70,6 +96,18 @@ pub struct CaptchaPending {
     pub action_url: String,
     pub base_form: Vec<(String, String)>,
     pub captcha_field: String,
+}
+
+impl Drop for CaptchaPending {
+    fn drop(&mut self) {
+        // `base_form` carries the username/password (and CSRF tokens); wipe every value so an
+        // abandoned challenge (timeout, dropped sender) leaves no plaintext credentials behind.
+        for (_, value) in self.base_form.iter_mut() {
+            value.zeroize();
+        }
+        self.action_url.zeroize();
+        self.captcha_field.zeroize();
+    }
 }
 
 /// Classify a login page by its features. Branch names describe the *page*, not any school.
@@ -92,14 +130,22 @@ pub fn detect_login_kind(html: &str, page_url: &str) -> LoginKind {
     if let Some(f) = &form {
         if let Some(cf) = &f.captcha_field {
             if let Some(image_url) = find_captcha_image(html) {
-                return LoginKind::Captcha { form: f.clone(), image_url, captcha_field: cf.clone() };
+                return LoginKind::Captcha {
+                    form: f.clone(),
+                    image_url,
+                    captcha_field: cf.clone(),
+                };
             }
         }
     }
     // Enterprise SSO: NetIQ NAM (`nidp`), NEAI (Tamkang's NAM front-end — confirmed live on iclass.tku),
     // SAML, or a generic "single sign-on". Headless auto-login isn't supported → the caller offers the
     // browser-cookie fallback; classifying it as SSO (not Unknown) gives that honest message.
-    if lower.contains("nidp") || lower.contains("neai") || lower.contains("saml") || lower.contains("single sign-on") {
+    if lower.contains("nidp")
+        || lower.contains("neai")
+        || lower.contains("saml")
+        || lower.contains("single sign-on")
+    {
         return LoginKind::SsoRedirect;
     }
     if let Some(form) = form {
@@ -119,38 +165,72 @@ fn find_password_form(html: &str) -> Option<PasswordForm> {
     let parser = dom.parser();
 
     for form_handle in dom.query_selector("form")?.collect::<Vec<_>>() {
-        let Some(form_tag) = form_handle.get(parser).and_then(|n| n.as_tag()) else { continue };
+        let Some(form_tag) = form_handle.get(parser).and_then(|n| n.as_tag()) else {
+            continue;
+        };
 
         // Collect (name, type, value) for every named <input> in this form, then classify.
-        let mut inputs: Vec<(String, String, String)> = Vec::new();
-        for child in form_tag.children().all(parser) {
-            let Some(input) = child.as_tag() else { continue };
-            if input.name().as_utf8_str() != "input" {
-                continue;
+        // Inputs are scanned as DESCENDANTS, not direct children: real login themes wrap fields in
+        // <div>/<label> containers, and a children-only scan silently dropped those inputs (the
+        // form then had no password field and the whole login page was misclassified).
+        let mut input_nodes: Vec<&tl::Node> = Vec::new();
+        let mut stack: Vec<&tl::Node> = form_tag.children().all(parser).iter().rev().collect();
+        while let Some(node) = stack.pop() {
+            let Some(tag) = node.as_tag() else { continue };
+            if tag.name().as_utf8_str() == "input" {
+                input_nodes.push(node);
             }
+            stack.extend(tag.children().all(parser).iter().rev());
+        }
+        let mut inputs: Vec<(String, String, String)> = Vec::new();
+        for node in input_nodes {
+            let Some(input) = node.as_tag() else { continue };
             let attrs = input.attributes();
-            let Some(name) = attrs.get("name").flatten() else { continue };
+            let Some(name) = attrs.get("name").flatten() else {
+                continue;
+            };
             let name = name.as_utf8_str().to_string();
-            let ty = attrs.get("type").flatten().map(|b| b.as_utf8_str().to_lowercase()).unwrap_or_else(|| "text".to_string());
-            let val = attrs.get("value").flatten().map(|b| b.as_utf8_str().to_string()).unwrap_or_default();
+            let ty = attrs
+                .get("type")
+                .flatten()
+                .map(|b| b.as_utf8_str().to_lowercase())
+                .unwrap_or_else(|| "text".to_string());
+            let val = attrs
+                .get("value")
+                .flatten()
+                .map(|b| b.as_utf8_str().to_string())
+                .unwrap_or_default();
             inputs.push((name, ty, val));
         }
 
-        let Some(pass_field) = inputs.iter().find(|(_, ty, _)| ty == "password").map(|(n, ..)| n.clone()) else {
+        let Some(pass_field) = inputs
+            .iter()
+            .find(|(_, ty, _)| ty == "password")
+            .map(|(n, ..)| n.clone())
+        else {
             continue; // not a password form → try the next <form>
         };
-        let captcha_field = inputs.iter().find(|(n, ..)| is_captcha_field(n)).map(|(n, ..)| n.clone());
+        let captcha_field = inputs
+            .iter()
+            .find(|(n, ..)| is_captcha_field(n))
+            .map(|(n, ..)| n.clone());
         // Username = first text-like input that isn't the password or the captcha field.
         let user_field = inputs
             .iter()
-            .find(|(n, ty, _)| matches!(ty.as_str(), "text" | "email" | "tel" | "") && *n != pass_field && captcha_field.as_deref() != Some(n))
+            .find(|(n, ty, _)| {
+                matches!(ty.as_str(), "text" | "email" | "tel" | "")
+                    && *n != pass_field
+                    && captcha_field.as_deref() != Some(n)
+            })
             .map(|(n, ..)| n.clone())
             .unwrap_or_else(|| "username".to_string());
         // Echo EVERY other named input verbatim (hidden CSRF, visible theme tokens) — but not the three
         // fields we fill ourselves (user, pass, captcha). HTML-unescape values (a token may carry `&amp;`).
         let fields: Vec<(String, String)> = inputs
             .iter()
-            .filter(|(n, ..)| *n != pass_field && *n != user_field && captcha_field.as_deref() != Some(n))
+            .filter(|(n, ..)| {
+                *n != pass_field && *n != user_field && captcha_field.as_deref() != Some(n)
+            })
             .map(|(n, _, v)| (n.clone(), html_unescape(v)))
             .collect();
 
@@ -164,7 +244,13 @@ fn find_password_form(html: &str) -> Option<PasswordForm> {
             .flatten()
             .map(|b| html_unescape(&b.as_utf8_str()))
             .unwrap_or_default();
-        return Some(PasswordForm { action, user_field, pass_field, fields, captcha_field });
+        return Some(PasswordForm {
+            action,
+            user_field,
+            pass_field,
+            fields,
+            captcha_field,
+        });
     }
     None
 }
@@ -181,9 +267,18 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
             let parser = dom.parser();
             if let Some(q) = dom.query_selector("input") {
                 for h in q.collect::<Vec<_>>() {
-                    let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else { continue };
-                    let Some(name) = tag.attributes().get("name").flatten() else { continue };
-                    let val = tag.attributes().get("value").flatten().map(|b| b.as_utf8_str().to_string()).unwrap_or_default();
+                    let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else {
+                        continue;
+                    };
+                    let Some(name) = tag.attributes().get("name").flatten() else {
+                        continue;
+                    };
+                    let val = tag
+                        .attributes()
+                        .get("value")
+                        .flatten()
+                        .map(|b| b.as_utf8_str().to_string())
+                        .unwrap_or_default();
                     fields.push((name.as_utf8_str().to_string(), val));
                 }
             }
@@ -194,10 +289,20 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
     let form_json: serde_json::Value = attr_value(html, ":email-login-form")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
-    let json_str = |k: &str| form_json.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let json_str = |k: &str| {
+        form_json
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
 
     // next: the hidden input, else the JSON, else the page's `?next=`.
-    let mut next = fields.iter().find(|(n, _)| n == "next").map(|(_, v)| v.clone()).unwrap_or_default();
+    let mut next = fields
+        .iter()
+        .find(|(n, _)| n == "next")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
     if next.is_empty() {
         next = json_str("next");
     }
@@ -208,7 +313,11 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
     let mut org_id = json_str("org_id");
     if org_id.is_empty() {
         let a = attr_value(html, ":org-id").unwrap_or_default();
-        org_id = if a.trim() == "0" { String::new() } else { a.trim().to_string() };
+        org_id = if a.trim() == "0" {
+            String::new()
+        } else {
+            a.trim().to_string()
+        };
     }
 
     // setdefault (keep an existing hidden input; add ours only if absent) — matches v1.
@@ -219,13 +328,22 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
         fields.push(("org_id".into(), org_id));
     }
     fields.push(("submit".into(), "login".into()));
-    let remember = form_json.get("remember").and_then(|v| v.as_bool()).unwrap_or(false)
-        || form_json.get("remember_me").and_then(|v| v.as_bool()).unwrap_or(false);
+    let remember = form_json
+        .get("remember")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || form_json
+            .get("remember_me")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     if remember && !fields.iter().any(|(n, _)| n == "remember_me") {
         fields.push(("remember_me".into(), "true".into()));
     }
 
-    Some(PublicCloudForm { action: public_cloud_email_url(page_url, &next), fields })
+    Some(PublicCloudForm {
+        action: public_cloud_email_url(page_url, &next),
+        fields,
+    })
 }
 
 /// The public-cloud email login POST URL: `{origin}/login?login=email` (+ `next` when set). Built on
@@ -246,7 +364,11 @@ fn public_cloud_email_url(page_url: &str, next: &str) -> String {
 
 /// One `?key=` value from a URL. ponytail: a tiny scan — enough for the single `next` param.
 fn query_param(url: &str, key: &str) -> Option<String> {
-    reqwest::Url::parse(url).ok()?.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
+    reqwest::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
 }
 
 /// Read a (possibly `:`-prefixed) HTML attribute's value by name, HTML-unescaping entities.
@@ -257,9 +379,13 @@ fn attr_value(html: &str, name: &str) -> Option<String> {
         let idx = from + p;
         from = idx + name.len();
         let rest = html[from..].trim_start();
-        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
         let rest = rest.trim_start();
-        let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') else { continue };
+        let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') else {
+            continue;
+        };
         if let Some(end) = rest[1..].find(quote) {
             return Some(html_unescape(&rest[1..1 + end]));
         }
@@ -285,19 +411,48 @@ fn find_captcha_image(html: &str) -> Option<String> {
     let parser = dom.parser();
     let mut fallback: Option<String> = None;
     for h in dom.query_selector("img")?.collect::<Vec<_>>() {
-        let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else { continue };
-        let Some(src) = tag.attributes().get("src").flatten() else { continue };
+        let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) else {
+            continue;
+        };
+        let Some(src) = tag.attributes().get("src").flatten() else {
+            continue;
+        };
         let src = src.as_utf8_str().to_string();
         let low = src.to_lowercase();
         // strong-match toward v1's find_captcha_source regexes.
-        if ["captcha", "verif", "authimage", "getcode", "get_code", "kaptcha", "yzm", "valid"].iter().any(|w| low.contains(w)) {
+        if [
+            "captcha",
+            "verif",
+            "authimage",
+            "getcode",
+            "get_code",
+            "kaptcha",
+            "yzm",
+            "valid",
+        ]
+        .iter()
+        .any(|w| low.contains(w))
+        {
             return Some(src);
         }
         // fallback: the first <img> that isn't obviously page chrome.
         if fallback.is_none()
-            && !["logo", "banner", "icon", "favicon", "header", "download_file", "loading", "btn", "button", "sprite", "avatar", "qrcode"]
-                .iter()
-                .any(|w| low.contains(w))
+            && ![
+                "logo",
+                "banner",
+                "icon",
+                "favicon",
+                "header",
+                "download_file",
+                "loading",
+                "btn",
+                "button",
+                "sprite",
+                "avatar",
+                "qrcode",
+            ]
+            .iter()
+            .any(|w| low.contains(w))
         {
             fallback = Some(src);
         }
@@ -321,9 +476,9 @@ pub async fn login(
     let (final_url, html) = match client.get(endpoints.login_page()).send().await {
         Ok(page) => {
             let url = page.url().to_string();
-            match page.text().await {
-                Ok(h) => (url, h),
-                Err(e) => return LoginOutcome::Failed(e.to_string()),
+            match crate::http::read_bounded(page, MAX_LOGIN_HTML, "login page").await {
+                Ok(bytes) => (url, String::from_utf8_lossy(&bytes).into_owned()),
+                Err(e) => return LoginOutcome::Failed(e),
             }
         }
         Err(e) => return LoginOutcome::Failed(format!("connect: {e}")),
@@ -343,7 +498,9 @@ pub async fn login(
             if verify_session(client, endpoints).await {
                 LoginOutcome::Ok
             } else {
-                LoginOutcome::Failed("login failed: credentials rejected or session not established".into())
+                LoginOutcome::Failed(
+                    "login failed: credentials rejected or session not established".into(),
+                )
             }
         }
         LoginKind::PublicCloudEmail(form) => {
@@ -357,10 +514,16 @@ pub async fn login(
             if verify_session(client, endpoints).await {
                 LoginOutcome::Ok
             } else {
-                LoginOutcome::Failed("login failed: credentials rejected or session not established".into())
+                LoginOutcome::Failed(
+                    "login failed: credentials rejected or session not established".into(),
+                )
             }
         }
-        LoginKind::Captcha { form, image_url, captcha_field } => {
+        LoginKind::Captcha {
+            form,
+            image_url,
+            captcha_field,
+        } => {
             let action_url = resolve_action(&final_url, &form.action);
             let mut base_form: Vec<(String, String)> = form.fields;
             base_form.push((form.user_field, username.to_string()));
@@ -368,20 +531,32 @@ pub async fn login(
 
             let img_url = resolve_action(&final_url, &image_url);
             let image_bytes = match client.get(&img_url).send().await {
-                Ok(r) => match r.bytes().await {
-                    Ok(b) => b.to_vec(),
-                    Err(e) => return LoginOutcome::Failed(format!("captcha image: {e}")),
-                },
+                Ok(r) => {
+                    match crate::http::read_bounded(r, MAX_CAPTCHA_IMAGE, "captcha image").await {
+                        Ok(bytes) => bytes,
+                        Err(e) => return LoginOutcome::Failed(e),
+                    }
+                }
                 Err(e) => return LoginOutcome::Failed(format!("captcha image: {e}")),
             };
             LoginOutcome::NeedCaptcha {
                 image_bytes,
-                pending: CaptchaPending { action_url, base_form, captcha_field },
+                pending: CaptchaPending {
+                    action_url,
+                    base_form,
+                    captcha_field,
+                },
             }
         }
-        LoginKind::SsoRedirect => LoginOutcome::Failed("此校為企業 SSO 登入，請改用瀏覽器 cookie 匯入登入".into()),
-        LoginKind::EmailSpa => LoginOutcome::Failed("此校為公有雲 email 登入頁，請改用瀏覽器 cookie 匯入登入".into()),
-        LoginKind::Unknown => LoginOutcome::Failed("無法辨識的登入頁型態，請改用瀏覽器 cookie 匯入登入".into()),
+        LoginKind::SsoRedirect => {
+            LoginOutcome::Failed("此校為企業 SSO 登入，請改用瀏覽器 cookie 匯入登入".into())
+        }
+        LoginKind::EmailSpa => {
+            LoginOutcome::Failed("此校為公有雲 email 登入頁，請改用瀏覽器 cookie 匯入登入".into())
+        }
+        LoginKind::Unknown => {
+            LoginOutcome::Failed("無法辨識的登入頁型態，請改用瀏覽器 cookie 匯入登入".into())
+        }
     }
 }
 
@@ -389,17 +564,21 @@ pub async fn login(
 pub async fn complete_captcha(
     client: &Client,
     endpoints: &Endpoints,
-    pending: CaptchaPending,
+    mut pending: CaptchaPending,
     captcha_text: &str,
 ) -> Result<(), String> {
-    let mut form = pending.base_form;
-    form.push((pending.captcha_field, captcha_text.to_string()));
-    client
-        .post(&pending.action_url)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| format!("post: {e}"))?;
+    // `pending` now implements Drop (zeroizes credentials), so fields must be taken with
+    // `mem::take` rather than moved out; the taken form is wiped right after the POST.
+    let mut form = std::mem::take(&mut pending.base_form);
+    let captcha_field = std::mem::take(&mut pending.captcha_field);
+    let action_url = std::mem::take(&mut pending.action_url);
+    form.push((captcha_field, captcha_text.to_string()));
+    let posted = client.post(&action_url).form(&form).send().await;
+    // The form holds the password (and now the typed captcha) — wipe it before any further await.
+    for (_, value) in form.iter_mut() {
+        value.zeroize();
+    }
+    posted.map_err(|e| format!("post: {e}"))?;
     if verify_session(client, endpoints).await {
         Ok(())
     } else {
@@ -414,12 +593,24 @@ pub fn encode_base64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -446,7 +637,10 @@ pub async fn verify_session(client: &Client, endpoints: &Endpoints) -> bool {
     if resp.url().path().contains("login") {
         return false; // redirected back to a login page
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = match crate::http::read_bounded(resp, MAX_SESSION_JSON, "session check").await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => return false,
+    };
     serde_json::from_str::<serde_json::Value>(body.trim())
         .map(|v| v.is_object())
         .unwrap_or(false)
@@ -477,19 +671,51 @@ mod tests {
     #[test]
     fn public_cloud_email_detected_and_posts_plain() {
         let kind = detect_login_kind(LOGIN_VIEW, "https://www.tronclass.com.tw/login");
-        let LoginKind::PublicCloudEmail(form) = kind else { panic!("expected PublicCloudEmail, got {kind:?}") };
-        assert_eq!(form.action, "https://www.tronclass.com.tw/login?login=email");
+        let LoginKind::PublicCloudEmail(form) = kind else {
+            panic!("expected PublicCloudEmail, got {kind:?}")
+        };
+        assert_eq!(
+            form.action,
+            "https://www.tronclass.com.tw/login?login=email"
+        );
         // body carries the hidden `next`, an `org_id` (empty, "0" dropped), and submit=login.
         assert!(form.fields.contains(&("next".into(), "".into())));
         assert!(form.fields.contains(&("org_id".into(), "".into())));
         assert!(form.fields.contains(&("submit".into(), "login".into())));
-        assert!(!form.fields.iter().any(|(n, _)| n == "remember_me"), "remember=false → no remember_me");
+        assert!(
+            !form.fields.iter().any(|(n, _)| n == "remember_me"),
+            "remember=false → no remember_me"
+        );
     }
 
     #[test]
     fn login_view_less_email_spa_still_defers() {
         // No <login-view> → the old browser-fallback path is unchanged.
-        assert!(matches!(detect_login_kind(r#"<div id="app"></div>"#, "u"), LoginKind::EmailSpa));
+        assert!(matches!(
+            detect_login_kind(r#"<div id="app"></div>"#, "u"),
+            LoginKind::EmailSpa
+        ));
+    }
+
+    #[test]
+    fn password_form_collects_descendant_inputs() {
+        // Real login themes wrap fields in <div>/<label> containers — the inputs are DESCENDANTS
+        // of the form, not direct children; a children-only scan missed them and the page was
+        // misclassified as not-a-password-form.
+        let html = r#"<html><body><form action="/do-login" method="post">
+            <div class="field"><label>User<input name="username" type="text"></label></div>
+            <div class="field"><label>Pass<input name="password" type="password"></label></div>
+            <input name="csrf" type="hidden" value="tok&amp;1">
+        </form></body></html>"#;
+        let form =
+            find_password_form(html).expect("password form must be found through containers");
+        assert_eq!(form.user_field, "username");
+        assert_eq!(form.pass_field, "password");
+        assert!(
+            form.fields
+                .contains(&("csrf".to_string(), "tok&1".to_string())),
+            "hidden input echoed (unescaped)"
+        );
     }
 
     #[test]
@@ -503,9 +729,14 @@ mod tests {
         let form = find_password_form(html).expect("password form");
         assert_eq!(form.user_field, "username");
         assert_eq!(form.pass_field, "password");
-        assert!(!form.action.contains("&amp;"), "action must be HTML-unescaped, got {}", form.action);
         assert!(
-            form.action.contains("session_code=SC&execution=EX&client_id=tronclass&tab_id=TB"),
+            !form.action.contains("&amp;"),
+            "action must be HTML-unescaped, got {}",
+            form.action
+        );
+        assert!(
+            form.action
+                .contains("session_code=SC&execution=EX&client_id=tronclass&tab_id=TB"),
             "all query params intact, got {}",
             form.action
         );

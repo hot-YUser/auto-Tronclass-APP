@@ -25,7 +25,10 @@ fn operating_gate_open_and_closed() {
     .unwrap();
     assert!(sched.is_open(0, 0), "00:00 Thu is inside 00:00–01:00");
     assert!(sched.is_open(59 * 60, 0), "00:59 still inside");
-    assert!(sched.is_open(60 * 60, 0), "01:00 is the INCLUSIVE end → open (v1: start <= t <= end)");
+    assert!(
+        sched.is_open(60 * 60, 0),
+        "01:00 is the INCLUSIVE end → open (v1: start <= t <= end)"
+    );
     assert!(!sched.is_open(61 * 60, 0), "01:01 past the window → closed");
     assert!(!sched.is_open(2 * 3600, 0), "02:00 outside the window");
 
@@ -34,10 +37,16 @@ fn operating_gate_open_and_closed() {
         "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "00:00", "end": "00:00" }] }]
     }))
     .unwrap();
-    assert!(allday.is_open(0, 0) && allday.is_open(13 * 3600, 0), "00:00–00:00 = all day open");
+    assert!(
+        allday.is_open(0, 0) && allday.is_open(13 * 3600, 0),
+        "00:00–00:00 = all day open"
+    );
 
     // A different weekday (Friday = epoch + 1 day) is not listed → inherits always-on.
-    assert!(sched.is_open(86400 + 2 * 3600, 0), "Friday not listed → open");
+    assert!(
+        sched.is_open(86400 + 2 * 3600, 0),
+        "Friday not listed → open"
+    );
 
     // Listed but disabled → closed even inside a would-be window.
     let disabled: Operating = serde_json::from_value(json!({
@@ -51,8 +60,14 @@ fn operating_gate_open_and_closed() {
         "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "07:00", "end": "09:00" }] }]
     }))
     .unwrap();
-    assert!(morning.is_open(0, 480), "UTC 00:00 + 8h = 08:00 local, inside 07:00–09:00");
-    assert!(!morning.is_open(0, 0), "without the offset it is 00:00, outside");
+    assert!(
+        morning.is_open(0, 480),
+        "UTC 00:00 + 8h = 08:00 local, inside 07:00–09:00"
+    );
+    assert!(
+        !morning.is_open(0, 0),
+        "without the offset it is 00:00, outside"
+    );
 
     // v1 0=Sunday weekday import maps to internal 0=Monday..6=Sunday.
     use crate::config::simple_weekday_to_internal;
@@ -65,19 +80,33 @@ fn operating_gate_open_and_closed() {
         "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "22:00", "end": "02:00" }] }]
     }))
     .unwrap();
-    assert!(overnight.is_open(30 * 60, 0), "00:30 is inside a 22:00→02:00 wrap");
+    assert!(
+        overnight.is_open(30 * 60, 0),
+        "00:30 is inside a 22:00→02:00 wrap"
+    );
 }
 
 #[test]
 fn max_tokens_default_and_zero_resolve_to_16384() {
-    assert_eq!(Settings::default().llm_max_tokens, 16384, "fresh default is 16384");
+    assert_eq!(
+        Settings::default().llm_max_tokens,
+        16384,
+        "fresh default is 16384"
+    );
     assert_eq!(crate::llm::resolve_max_tokens(0), 16384, "0 → safe default");
-    assert_eq!(crate::llm::resolve_max_tokens(32000), 32000, "explicit value preserved");
+    assert_eq!(
+        crate::llm::resolve_max_tokens(32000),
+        32000,
+        "explicit value preserved"
+    );
 }
 
 #[test]
 fn radar_default_chain_is_empty_then_wgs84() {
-    assert_eq!(Settings::default().radar_strategy, vec!["empty_answer".to_string(), "global_wgs84".to_string()]);
+    assert_eq!(
+        Settings::default().radar_strategy,
+        vec!["empty_answer".to_string(), "global_wgs84".to_string()]
+    );
 }
 
 #[test]
@@ -94,8 +123,17 @@ fn redaction_hides_secrets_everywhere() {
     crate::redaction::redact(&mut v);
     let s = v.to_string();
 
-    for secret in ["hunter2", "session=abc", "sk-abc123", "root-pw", "Bearer xyz"] {
-        assert!(!s.contains(secret), "secret {secret} leaked through redaction: {s}");
+    for secret in [
+        "hunter2",
+        "session=abc",
+        "sk-abc123",
+        "root-pw",
+        "Bearer xyz",
+    ] {
+        assert!(
+            !s.contains(secret),
+            "secret {secret} leaked through redaction: {s}"
+        );
     }
     assert!(s.contains("[redacted]"), "redaction marker present");
     assert_eq!(v["account_id"], "keep-me", "non-secret ids are preserved");
@@ -109,7 +147,10 @@ fn rbuf() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn rcollect(ptr: *const u8, len: usize) {
     let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    rbuf().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+    rbuf()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(b).into_owned());
 }
 
 #[test]
@@ -120,11 +161,19 @@ fn leveled_logging_drops_debug_at_normal() {
     crate::redaction::set_level("normal");
     crate::redaction::log_line(rcollect, "debug", "should be dropped");
     crate::redaction::log_line(rcollect, "info", "always shown");
-    assert_eq!(rbuf().lock().unwrap().len(), 1, "debug dropped at normal, info kept");
+    assert_eq!(
+        rbuf().lock().unwrap().len(),
+        1,
+        "debug dropped at normal, info kept"
+    );
 
     crate::redaction::set_level("debug");
     crate::redaction::log_line(rcollect, "debug", "now shown");
-    assert_eq!(rbuf().lock().unwrap().len(), 2, "debug emitted at debug level");
+    assert_eq!(
+        rbuf().lock().unwrap().len(),
+        2,
+        "debug emitted at debug level"
+    );
     crate::redaction::set_level("normal"); // restore
 }
 
@@ -137,10 +186,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(b).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -171,7 +228,11 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
 fn account_id(label: &str) -> Option<String> {
     for ev in snapshot().iter().rev() {
         if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"].as_array()?.iter().find(|a| a["label"] == label) {
+            if let Some(a) = ev["accounts"]
+                .as_array()?
+                .iter()
+                .find(|a| a["label"] == label)
+            {
                 return a["id"].as_str().map(str::to_string);
             }
         }
@@ -181,7 +242,10 @@ fn account_id(label: &str) -> Option<String> {
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -209,7 +273,10 @@ struct Harness {
 impl Harness {
     fn new() -> Harness {
         events().lock().unwrap().clear();
-        Harness { h: crate::core_init(collect), id: 0 }
+        Harness {
+            h: crate::core_init(Some(collect)),
+            id: 0,
+        }
     }
     fn next(&mut self) -> u64 {
         self.id += 1;
@@ -222,7 +289,10 @@ impl Drop for Harness {
     }
 }
 fn data_dir(tag: &str) -> String {
-    std::env::temp_dir().join(format!("tron-slice4-{tag}-{}", new_id())).to_string_lossy().replace('\\', "/")
+    std::env::temp_dir()
+        .join(format!("tron-slice4-{tag}-{}", new_id()))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 #[test]
@@ -232,15 +302,22 @@ fn settings_persist_over_the_seam() {
     let dir = data_dir("settings");
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     assert!(wait_for(reply_ok(i), 10).is_some());
 
     let i = hz.next();
     let patch = r#"{"llm_max_tokens":32000,"radar_strategy":["empty_answer","global_wgs84"],
-        "number_concurrency":4,"number_cooldown_ms":500,"poll_idle_secs":9,"quiz_detect_secs":30,
-        "log_level":"debug","max_answer_reask":7,"tz_offset_minutes":540,
+        "number_concurrency":4,"number_min_concurrency":4,"number_cooldown_ms":500,
+        "poll_idle_secs":9,"quiz_detect_secs":30,"log_level":"debug","max_answer_reask":7,
+        "tz_offset_minutes":540,
         "operating":{"days":[{"weekday":2,"enabled":true,"windows":[{"start":"08:30","end":"17:00"}]}]}}"#;
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{patch}}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{patch}}}"#),
+    );
     assert!(wait_for(reply_ok(i), 5).unwrap()["ok"] == true);
 
     // Read the persisted config.json back and confirm every knob round-tripped.
@@ -248,6 +325,7 @@ fn settings_persist_over_the_seam() {
     let s = &cfg.settings;
     assert_eq!(s.llm_max_tokens, 32000);
     assert_eq!(s.number_concurrency, 4);
+    assert_eq!(s.number_min_concurrency, 4);
     assert_eq!(s.number_cooldown_ms, 500);
     assert_eq!(s.poll_idle_secs, 9);
     assert_eq!(s.quiz_detect_secs, 30);
@@ -267,37 +345,69 @@ fn captcha_login_challenge_and_submit() {
     let dir = data_dir("captcha");
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     assert!(wait_for(reply_ok(i), 10).is_some());
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
 
     // Turn on the fake's captcha login page.
-    post(&base, "/_test/captcha", r#"{"required":true,"expected":"A1B2"}"#);
+    post(
+        &base,
+        "/_test/captcha",
+        r#"{"required":true,"expected":"A1B2"}"#,
+    );
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let dave = account_id("dave").unwrap();
 
     let login_id = hz.next();
-    send(hz.h, &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{dave}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{dave}"}}"#),
+    );
 
     // The core grabs the captcha image and asks us to solve it.
-    let challenge = wait_for(|v| v["event"] == "CaptchaChallenge" && v["account_id"].as_str() == Some(&dave), 10)
-        .expect("CaptchaChallenge");
+    let challenge = wait_for(
+        |v| v["event"] == "CaptchaChallenge" && v["account_id"].as_str() == Some(&dave),
+        10,
+    )
+    .expect("CaptchaChallenge");
     let expected_b64 = crate::login::encode_base64(fake::CAPTCHA_IMAGE.as_bytes());
-    assert_eq!(challenge["image_b64"].as_str().unwrap(), expected_b64, "image bytes shipped as base64");
+    assert_eq!(
+        challenge["image_b64"].as_str().unwrap(),
+        expected_b64,
+        "image bytes shipped as base64"
+    );
 
     // No login result yet — it is blocked awaiting the answer.
-    assert!(none_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 2), "login waits for captcha");
+    assert!(
+        none_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 2),
+        "login waits for captcha"
+    );
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"SubmitCaptcha","account_id":"{dave}","text":"A1B2"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"SubmitCaptcha","account_id":"{dave}","text":"A1B2"}}"#),
+    );
     wait_for(reply_ok(i), 5);
 
-    let result = wait_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 10).expect("LoginResult");
+    let result =
+        wait_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 10).expect("LoginResult");
     assert_eq!(result["ok"], true, "captcha answered → login succeeds");
 }
 
@@ -309,23 +419,45 @@ fn captcha_wrong_answer_fails() {
     let dir = data_dir("captcha-bad");
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
-    post(&base, "/_test/captcha", r#"{"required":true,"expected":"A1B2"}"#);
+    post(
+        &base,
+        "/_test/captcha",
+        r#"{"required":true,"expected":"A1B2"}"#,
+    );
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"e","school":"{base}","username":"e","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"e","school":"{base}","username":"e","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let eid = account_id("e").unwrap();
     let login_id = hz.next();
-    send(hz.h, &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{eid}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{eid}"}}"#),
+    );
     wait_for(|v| v["event"] == "CaptchaChallenge", 10).expect("challenge");
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"SubmitCaptcha","account_id":"{eid}","text":"WRONG"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"SubmitCaptcha","account_id":"{eid}","text":"WRONG"}}"#),
+    );
     wait_for(reply_ok(i), 5);
-    let result = wait_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 10).expect("LoginResult");
+    let result =
+        wait_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 10).expect("LoginResult");
     assert_eq!(result["ok"], false, "wrong captcha → login fails");
 }
 
@@ -337,30 +469,57 @@ fn sso_login_routes_to_cookie_fallback() {
     let dir = data_dir("sso");
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     post(&base, "/_test/sso", r#"{"enabled":true}"#);
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"carol","school":"{base}","username":"carol","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"carol","school":"{base}","username":"carol","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let carol = account_id("carol").unwrap();
 
     let login_id = hz.next();
-    send(hz.h, &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{carol}"}}"#));
-    let result = wait_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 10).expect("LoginResult");
+    send(
+        hz.h,
+        &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{carol}"}}"#),
+    );
+    let result =
+        wait_for(|v| v["event"] == "LoginResult" && v["id"] == login_id, 10).expect("LoginResult");
     assert_eq!(result["ok"], false, "SSO page cannot password-login");
-    assert!(result["reason"].as_str().unwrap_or("").contains("cookie"), "routed to the cookie fallback");
+    assert!(
+        result["reason"].as_str().unwrap_or("").contains("cookie"),
+        "routed to the cookie fallback"
+    );
 
     // The ImportCookies fallback command is reachable and runs end-to-end (bogus cookies → login_failed).
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"ImportCookies","account_id":"{carol}","cookies_json":"[]"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"ImportCookies","account_id":"{carol}","cookies_json":"[]"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     assert!(
-        wait_for(|v| v["event"] == "AccountStatus" && v["account_id"].as_str() == Some(&carol), 5).is_some(),
+        wait_for(
+            |v| v["event"] == "AccountStatus" && v["account_id"].as_str() == Some(&carol),
+            5
+        )
+        .is_some(),
         "ImportCookies reports an AccountStatus"
     );
 }
@@ -373,30 +532,59 @@ fn schedule_closed_suppresses_monitoring() {
     let dir = data_dir("sched");
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
 
     // All seven weekdays enabled but with no windows → closed all the time, whatever today is.
-    let days: Vec<String> = (0..7).map(|w| format!(r#"{{"weekday":{w},"enabled":true,"windows":[]}}"#)).collect();
+    let days: Vec<String> = (0..7)
+        .map(|w| format!(r#"{{"weekday":{w},"enabled":true,"windows":[]}}"#))
+        .collect();
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"operating":{{"days":[{}]}}}}}}"#, days.join(",")));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"operating":{{"days":[{}]}}}}}}"#,
+            days.join(",")
+        ),
+    );
     wait_for(reply_ok(i), 5);
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"frank","school":"{base}","username":"frank","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"frank","school":"{base}","username":"frank","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     wait_for(reply_ok(i), 15);
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
 
     // Open a rollcall — but the poller is gated closed, so it must never be detected.
-    post(&base, "/_test/open_rollcall", r#"{"id":"SCHED1","kind":"self_registration","attendance_rate":100}"#);
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"SCHED1","kind":"self_registration","attendance_rate":100}"#,
+    );
     assert!(
-        none_for(|v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "SCHED1", 5),
+        none_for(
+            |v| v["event"] == "RollcallDetected" && v["rollcall_id"] == "SCHED1",
+            5
+        ),
         "closed schedule → no detection"
     );
 
@@ -413,7 +601,10 @@ fn vault_auto_unlocks_without_a_password() {
 
     // No CreateVault, no master password: Init auto-unlocks the vault with the persistent device key.
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     assert!(
         wait_for(|v| v["event"] == "VaultState" && v["unlocked"] == true, 3).is_some(),
@@ -422,8 +613,17 @@ fn vault_auto_unlocks_without_a_password() {
 
     // The vault is already open, so a secret can be stored straight away.
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"g","school":"http://x","username":"g","password":"secret"}}"#));
-    assert_eq!(wait_for(reply_ok(i), 5).unwrap()["ok"], true, "AddAccount works with no unlock step");
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"g","school":"http://x","username":"g","password":"secret"}}"#
+        ),
+    );
+    assert_eq!(
+        wait_for(reply_ok(i), 5).unwrap()["ok"],
+        true,
+        "AddAccount works with no unlock step"
+    );
 }
 
 /// Boot one account against a fresh fake and start monitoring with the anti-fake gate at `gate` %.
@@ -432,22 +632,34 @@ fn boot_monitoring(tag: &str, gate: f64) -> (Harness, String) {
     let mut hz = Harness::new();
     let dir = data_dir(tag);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(
-        r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":1,"attendance_gate_percent":{gate}}}}}"#
-    ));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":1,"attendance_gate_percent":{gate}}}}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(
-        r#"{{"id":{i},"cmd":"AddAccount","label":"eve","school":"{base}","username":"eve","password":"secret"}}"#
-    ));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"eve","school":"{base}","username":"eve","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     wait_for(reply_ok(i), 15);
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
     (hz, base)
 }
 
@@ -459,15 +671,32 @@ fn config_update_applies_to_a_running_monitor() {
     let _g = SEQ.lock().unwrap();
     let (mut hz, base) = boot_monitoring("livecfg", 100.0);
 
-    post(&base, "/_test/open_rollcall", r#"{"id":"RC50","kind":"self_registration","attendance_rate":50}"#);
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"RC50","kind":"self_registration","attendance_rate":50}"#,
+    );
     let signed = |v: &Value| v["event"] == "SignedIn" && v["rollcall_id"] == "RC50";
-    assert!(none_for(signed, 3), "a 50%-attendance rollcall is held by the 100% gate");
+    assert!(
+        none_for(signed, 3),
+        "a 50%-attendance rollcall is held by the 100% gate"
+    );
 
     // Lower the gate WHILE monitoring — no stop/start cycle.
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"attendance_gate_percent":10}}}}"#));
-    assert_eq!(wait_for(reply_ok(i), 5).unwrap()["ok"], true, "UpdateConfig accepted");
-    assert!(wait_for(signed, 15).is_some(), "the running monitor must adopt the new gate without a restart");
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"attendance_gate_percent":10}}}}"#),
+    );
+    assert_eq!(
+        wait_for(reply_ok(i), 5).unwrap()["ok"],
+        true,
+        "UpdateConfig accepted"
+    );
+    assert!(
+        wait_for(signed, 15).is_some(),
+        "the running monitor must adopt the new gate without a restart"
+    );
 }
 
 /// While a rollcall is held below the gate there is no countdown, so the UI needs the live class rate
@@ -478,18 +707,41 @@ fn below_gate_emits_live_attendance_for_the_ui() {
     let _g = SEQ.lock().unwrap();
     let (mut hz, base) = boot_monitoring("gateui", 80.0);
 
-    post(&base, "/_test/open_rollcall", r#"{"id":"RC40","kind":"self_registration","attendance_rate":40}"#);
-    let held = wait_for(|v| v["event"] == "RollcallGate" && v["rollcall_id"] == "RC40" && v["holding"] == true, 15)
-        .expect("a held rollcall emits RollcallGate{holding:true}");
-    let rate = held["rate"].as_f64().expect("carries the live class attendance rate");
-    assert!((30.0..50.0).contains(&rate), "rate ≈ the fake's 40% roster, got {rate}");
-    assert_eq!(held["gate_percent"].as_f64(), Some(80.0), "carries the configured threshold");
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"RC40","kind":"self_registration","attendance_rate":40}"#,
+    );
+    let held = wait_for(
+        |v| v["event"] == "RollcallGate" && v["rollcall_id"] == "RC40" && v["holding"] == true,
+        15,
+    )
+    .expect("a held rollcall emits RollcallGate{holding:true}");
+    let rate = held["rate"]
+        .as_f64()
+        .expect("carries the live class attendance rate");
+    assert!(
+        (30.0..50.0).contains(&rate),
+        "rate ≈ the fake's 40% roster, got {rate}"
+    );
+    assert_eq!(
+        held["gate_percent"].as_f64(),
+        Some(80.0),
+        "carries the configured threshold"
+    );
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"attendance_gate_percent":10}}}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"attendance_gate_percent":10}}}}"#),
+    );
     wait_for(reply_ok(i), 5);
     assert!(
-        wait_for(|v| v["event"] == "RollcallGate" && v["rollcall_id"] == "RC40" && v["holding"] == false, 15).is_some(),
+        wait_for(
+            |v| v["event"] == "RollcallGate" && v["rollcall_id"] == "RC40" && v["holding"] == false,
+            15
+        )
+        .is_some(),
         "clearing the gate emits holding:false so the UI restores the countdown"
     );
 }

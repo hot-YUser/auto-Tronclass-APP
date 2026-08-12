@@ -139,7 +139,11 @@ pub fn extract_teacher_qr_data(payload: &Value) -> Option<String> {
     None
 }
 
-pub fn classify_http_response(status: u16, url: &reqwest::Url, body: &str) -> Result<(), FailureKind> {
+pub fn classify_http_response(
+    status: u16,
+    url: &reqwest::Url,
+    body: &str,
+) -> Result<(), FailureKind> {
     if rollcall::response_auth_lost(status, url, body) {
         return Err(FailureKind::AuthLost);
     }
@@ -180,7 +184,10 @@ pub async fn resolve_course_id(
     ep: &Endpoints,
     configured: Option<&str>,
 ) -> Result<String, QrError> {
-    if let Some(course) = configured.map(str::trim).filter(|course| !course.is_empty()) {
+    if let Some(course) = configured
+        .map(str::trim)
+        .filter(|course| !course.is_empty())
+    {
         return Ok(course.to_string());
     }
     let payload = response_json(client.get(ep.my_courses()).send().await, "list-courses").await?;
@@ -210,14 +217,21 @@ pub async fn create(client: &Client, ep: &Endpoints, course_id: &str) -> Result<
 
 pub async fn start(client: &Client, ep: &Endpoints, source: &Source) -> Result<(), QrError> {
     response_body(
-        client.post(ep.teacher_start_rollcall(&source.rollcall_id)).send().await,
+        client
+            .post(ep.teacher_start_rollcall(&source.rollcall_id))
+            .send()
+            .await,
         "start",
     )
     .await
     .map(|_| ())
 }
 
-pub async fn fetch_data(client: &Client, ep: &Endpoints, source: &Source) -> Result<String, QrError> {
+pub async fn fetch_data(
+    client: &Client,
+    ep: &Endpoints,
+    source: &Source,
+) -> Result<String, QrError> {
     let payload = response_json(
         client
             .get(ep.teacher_qr_code(&source.course_id, &source.rollcall_id))
@@ -226,12 +240,16 @@ pub async fn fetch_data(client: &Client, ep: &Endpoints, source: &Source) -> Res
         "fetch-token",
     )
     .await?;
-    extract_teacher_qr_data(&payload).ok_or_else(|| QrError::new(FailureKind::Fatal, "fetch-token-data"))
+    extract_teacher_qr_data(&payload)
+        .ok_or_else(|| QrError::new(FailureKind::Fatal, "fetch-token-data"))
 }
 
 pub async fn stop(client: &Client, ep: &Endpoints, source: &Source) -> Result<(), QrError> {
     response_body(
-        client.put(ep.teacher_stop_qr(&source.rollcall_id)).send().await,
+        client
+            .put(ep.teacher_stop_qr(&source.rollcall_id))
+            .send()
+            .await,
         "stop",
     )
     .await
@@ -277,7 +295,10 @@ mod tests {
             extract_course_items(&json!({"data":{"items":[{"courseId":9}]}})).len(),
             1
         );
-        assert_eq!(extract_course_id(&json!({"course_id": 9})).as_deref(), Some("9"));
+        assert_eq!(
+            extract_course_id(&json!({"course_id": 9})).as_deref(),
+            Some("9")
+        );
         assert_eq!(
             extract_teacher_qr_data(&json!({"result":{"data":"opaque"}})).as_deref(),
             Some("opaque")

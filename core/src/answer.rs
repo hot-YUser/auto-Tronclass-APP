@@ -10,6 +10,7 @@ use crate::providers::Endpoints;
 use crate::quiz::{self, Answer, Decision};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// Which activity family; picks the fetch + submit contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +71,13 @@ fn json_id_string(v: Option<&Value>) -> String {
 /// questionnaire use their own `distribute` segment; courseware its subjects endpoint — all four run
 /// `quiz::flatten_paper`. vote synthesizes subjects from `vote_option_items`; homework synthesizes one
 /// `short_answer` from the stem. `stem` is the activity's raw description (from detection), if any.
-pub async fn fetch_paper(client: &Client, ep: &Endpoints, source: Source, activity_id: &str, stem: &str) -> Result<Paper, String> {
+pub async fn fetch_paper(
+    client: &Client,
+    ep: &Endpoints,
+    source: Source,
+    activity_id: &str,
+    stem: &str,
+) -> Result<Paper, String> {
     let url = match source {
         Source::Exam => {
             let _ = client.get(ep.exam_qualification(activity_id)).send().await; // best-effort gate
@@ -83,7 +90,11 @@ pub async fn fetch_paper(client: &Client, ep: &Endpoints, source: Source, activi
         Source::Homework => return Ok(homework_paper(client, ep, activity_id, stem).await),
     };
     let v = http::json_checked(client.get(url), "fetch distributed paper").await?;
-    let raw = v.get("subjects").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw = v
+        .get("subjects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     Ok(Paper {
         // Real distribute returns this as an integer (e.g. 635061) — reading it as_str gave "" and the
         // submit then dropped the instance id. Accept int OR string (confirmed live 2026-07).
@@ -94,21 +105,38 @@ pub async fn fetch_paper(client: &Client, ep: &Endpoints, source: Source, activi
 
 /// vote: `GET votes/{id}` → `interaction.data.vote_option_items` (letter→text) → one selection subject
 /// whose option ids ARE the letters (A=1st…); the submit then sends `{votes:[letters]}`.
-async fn fetch_vote_paper(client: &Client, ep: &Endpoints, activity_id: &str) -> Result<Paper, String> {
+async fn fetch_vote_paper(
+    client: &Client,
+    ep: &Endpoints,
+    activity_id: &str,
+) -> Result<Paper, String> {
     let v = http::json_checked(client.get(ep.votes_read(activity_id)), "fetch vote paper").await?;
     let mut opts = Vec::new();
     if let Some(Value::Object(m)) = v.pointer("/interaction/data/vote_option_items") {
         let mut keys: Vec<&String> = m.keys().collect();
         keys.sort();
         for k in keys {
-            opts.push(json!({ "id": k, "content": m.get(k).and_then(Value::as_str).unwrap_or("") }));
+            opts.push(
+                json!({ "id": k, "content": m.get(k).and_then(Value::as_str).unwrap_or("") }),
+            );
         }
     }
     // single-vs-multi: `vote_type` containing "multi" → multiple_selection, else single (caps to 1 letter).
-    let multi = v.pointer("/interaction/data/vote_type").and_then(Value::as_str).map(|t| t.contains("multi")).unwrap_or(false);
-    let vtype = if multi { "multiple_selection" } else { "single_selection" };
+    let multi = v
+        .pointer("/interaction/data/vote_type")
+        .and_then(Value::as_str)
+        .map(|t| t.contains("multi"))
+        .unwrap_or(false);
+    let vtype = if multi {
+        "multiple_selection"
+    } else {
+        "single_selection"
+    };
     let subject = json!({ "id": activity_id, "type": vtype, "answer_type": "vote", "content": "Vote", "options": opts });
-    Ok(Paper { instance_id: String::new(), subjects: vec![subject] })
+    Ok(Paper {
+        instance_id: String::new(),
+        subjects: vec![subject],
+    })
 }
 
 /// homework: no distribute. Prefer the raw `stem`, else a **guarded** activity-detail GET (teacher-only
@@ -117,8 +145,12 @@ async fn homework_paper(client: &Client, ep: &Endpoints, activity_id: &str, stem
     let mut prompt = stem.trim().to_string();
     if prompt.is_empty() {
         if let Ok(resp) = client.get(ep.activity_detail(activity_id)).send().await {
-            if let Ok(v) = resp.json::<Value>().await {
-                prompt = v.get("description").and_then(Value::as_str)
+            if let Ok(v) =
+                http::read_bounded_json(resp, http::MAX_API_JSON, "activity detail").await
+            {
+                prompt = v
+                    .get("description")
+                    .and_then(Value::as_str)
                     .or_else(|| v.pointer("/data/description").and_then(Value::as_str))
                     .or_else(|| v.get("title").and_then(Value::as_str))
                     .unwrap_or("")
@@ -130,15 +162,20 @@ async fn homework_paper(client: &Client, ep: &Endpoints, activity_id: &str, stem
         prompt = "Please write a short response for this assignment.".to_string();
     }
     let subject = json!({ "id": activity_id, "type": "short_answer", "answer_type": "short_answer", "content": prompt });
-    Paper { instance_id: String::new(), subjects: vec![subject] }
+    Paper {
+        instance_id: String::new(),
+        subjects: vec![subject],
+    }
 }
 
 /// Decide every subject; for pending ones ask the LLM (streaming reasoning). Shared answers, run once
 /// per activity. Blank/pending subjects re-asked up to `max_reask`; a persistent empty is dropped
-/// (never submit blank).
+/// (never submit blank). `school` is the account's authed client (subject images + course tools);
+/// `llm_client` is the cookie-less LLM client — never the same client.
 #[allow(clippy::too_many_arguments)]
 pub async fn shared_answers(
-    client: &Client,
+    school: &Client,
+    llm_client: &Client,
     cfg: &LlmConfig,
     cb: llm::EventCb,
     activity_token: &str,
@@ -162,12 +199,20 @@ pub async fn shared_answers(
                 if answers.contains_key(&plan.subject_id) {
                     continue; // already answered on a prior pass — don't re-ask (token-thrifty)
                 }
-                if let Some(subject) = subjects.iter().find(|s| quiz::subject_id(s) == plan.subject_id) {
+                if let Some(subject) = subjects
+                    .iter()
+                    .find(|s| quiz::subject_id(s) == plan.subject_id)
+                {
                     // R5: build the user content ONCE per subject (may fetch + base64 images) and reuse it
                     // on every re-ask — never re-download/re-encode a subject's images per attempt.
-                    let user_content = build_user_content(client, base_url, subject).await;
-                    let tool_ctx = (cfg.enable_tools && !course_id.is_empty())
-                        .then_some(llm::ToolCtx { base_url, course_id, max_iterations: cfg.max_tool_iterations });
+                    let user_content =
+                        build_user_content(school, llm_client, base_url, subject).await;
+                    let tool_ctx =
+                        (cfg.enable_tools && !course_id.is_empty()).then_some(llm::ToolCtx {
+                            base_url,
+                            course_id,
+                            max_iterations: cfg.max_tool_iterations,
+                        });
                     let mut last_reply = String::new();
                     for attempt in 0..max_reask.max(1) {
                         // Non-accumulating (v1): each re-ask is a fresh, bounded list carrying ONLY the
@@ -181,7 +226,19 @@ pub async fn shared_answers(
                                 json!({ "role": "user", "content": CORRECTION_PROMPT }),
                             ]
                         };
-                        let reply = llm::answer_question(client, cfg, &messages, cb, activity_token, account_id, &plan.subject_id, tool_ctx.as_ref()).await.unwrap_or_default();
+                        let reply = llm::answer_question(
+                            llm_client,
+                            school,
+                            cfg,
+                            &messages,
+                            cb,
+                            activity_token,
+                            account_id,
+                            &plan.subject_id,
+                            tool_ctx.as_ref(),
+                        )
+                        .await
+                        .unwrap_or_default();
                         if !reply.is_empty() {
                             if let Some(a) = parse_answer(subject, &plan.qtype, &reply) {
                                 answers.insert(plan.subject_id.clone(), a);
@@ -200,7 +257,10 @@ pub async fn shared_answers(
 
 /// The ids of every non-`Skip` subject (per `decide_paper`) absent from `answers`. Empty ⇒ the paper is
 /// fully answered and ready to submit — the R3c all-or-nothing gate (never submit a half-paper).
-pub fn missing_subjects(subjects: &[Value], answers: &std::collections::HashMap<String, Answer>) -> Vec<String> {
+pub fn missing_subjects(
+    subjects: &[Value],
+    answers: &std::collections::HashMap<String, Answer>,
+) -> Vec<String> {
     quiz::decide_paper(subjects)
         .into_iter()
         .filter(|p| p.decision != Decision::Skip && !answers.contains_key(&p.subject_id))
@@ -215,7 +275,12 @@ fn subject_stem(subject: &Value) -> &str {
     // v1 `description or content or stem` — a null/empty field falls through (not "present but blank").
     ["description", "content", "stem"]
         .iter()
-        .find_map(|k| subject.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .find_map(|k| {
+            subject
+                .get(*k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or("")
 }
 
@@ -233,7 +298,9 @@ fn build_prompt(subject: &Value) -> String {
     } else if quiz::BLANK_TYPES.contains(&qtype) {
         let n = quiz::blank_count(subject);
         if n > 1 {
-            p.push_str(&format!("\n[Fill in {n} blank(s), in order, separated by ' ||| '.]"));
+            p.push_str(&format!(
+                "\n[Fill in {n} blank(s), in order, separated by ' ||| '.]"
+            ));
         } else {
             p.push_str("\n[Fill in the blank.]");
         }
@@ -243,8 +310,15 @@ fn build_prompt(subject: &Value) -> String {
 
 /// R5 multimodal: the user message content. A plain string unless the subject's stem or an option carries
 /// `<img>`, in which case a parts list `[{text}, {image_url:data-url}, …]` (dedup, cap 5) so the model can
-/// see the image. Each img: a `data:` url passes through; else authed-fetch → base64; a miss → the raw url.
-async fn build_user_content(client: &Client, base_url: &str, subject: &Value) -> Value {
+/// see the image. Each img: a `data:` url passes through; else a SAFE fetch → base64. A fetch that
+/// fails or violates the URL policy is DROPPED — never sent to the model as its raw URL (that would
+/// leak the URL to a third-party model and could exfiltrate an internal address).
+async fn build_user_content(
+    school: &Client,
+    external: &Client,
+    base_url: &str,
+    subject: &Value,
+) -> Value {
     let text = build_prompt(subject);
     let mut html = subject_stem(subject).to_string();
     if let Some(opts) = subject.get("options").and_then(Value::as_array) {
@@ -258,19 +332,27 @@ async fn build_user_content(client: &Client, base_url: &str, subject: &Value) ->
     }
     let mut parts = vec![json!({ "type": "text", "text": text })];
     for src in srcs.into_iter().take(5) {
-        parts.push(json!({ "type": "image_url", "image_url": { "url": to_data_url(client, base_url, &src).await } }));
+        if let Some(url) = to_data_url(school, external, base_url, &src).await {
+            parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+        }
     }
     Value::Array(parts)
 }
 
 /// `<img src>` values from an HTML fragment (deduped, in order).
 fn extract_img_srcs(html: &str) -> Vec<String> {
-    let Ok(dom) = tl::parse(html, tl::ParserOptions::default()) else { return Vec::new() };
+    let Ok(dom) = tl::parse(html, tl::ParserOptions::default()) else {
+        return Vec::new();
+    };
     let parser = dom.parser();
     let mut out = Vec::new();
     if let Some(imgs) = dom.query_selector("img") {
         for h in imgs {
-            if let Some(src) = h.get(parser).and_then(|n| n.as_tag()).and_then(|t| t.attributes().get("src").flatten()) {
+            if let Some(src) = h
+                .get(parser)
+                .and_then(|n| n.as_tag())
+                .and_then(|t| t.attributes().get("src").flatten())
+            {
                 let s = src.as_utf8_str().to_string();
                 if !s.is_empty() && !out.contains(&s) {
                     out.push(s);
@@ -281,24 +363,52 @@ fn extract_img_srcs(html: &str) -> Vec<String> {
     out
 }
 
-/// An `<img>` src → an inline `data:` url (base64) when we can authed-fetch it; else the resolved raw url.
-async fn to_data_url(client: &Client, base_url: &str, src: &str) -> String {
+/// An `<img>` src → an inline `data:` url (base64) when it can be fetched SAFELY; else `None`.
+/// Policy (untrusted URL, docs): relative srcs resolve against the page base; same-origin images may
+/// use the account's authed (cookie-carrying) client; CROSS-origin images (CDNs) are allowed only
+/// over HTTPS to a non-private host and are fetched with the COOKIE-LESS `external` client — school
+/// cookies must never leave the school origin. Fetch misses are dropped (None), never echoed back.
+async fn to_data_url(
+    school: &Client,
+    external: &Client,
+    base_url: &str,
+    src: &str,
+) -> Option<String> {
     if src.starts_with("data:") {
-        return src.to_string();
+        return Some(src.to_string());
     }
+    let base = reqwest::Url::parse(base_url).ok()?;
     let url = if src.starts_with("http://") || src.starts_with("https://") {
-        src.to_string()
+        reqwest::Url::parse(src).ok()?
     } else {
-        reqwest::Url::parse(base_url).and_then(|b| b.join(src)).map(|u| u.to_string()).unwrap_or_else(|_| src.to_string())
+        base.join(src).ok()?
     };
-    match crate::course_context::fetch_image(client, &url).await {
-        Some((bytes, mime)) => {
-            let sub = mime.strip_prefix("image/").unwrap_or("png");
-            let sub = if ["png", "jpeg", "gif", "webp"].contains(&sub) { sub } else { "png" };
-            format!("data:image/{sub};base64,{}", crate::login::encode_base64(&bytes))
-        }
-        None => url, // fetch miss → fall back to the raw url
+    let cross_origin = !http::same_origin(&base, &url);
+    if cross_origin
+        && (url.scheme() != "https" || http::is_private_host(url.host_str().unwrap_or("")))
+    {
+        return None; // no plaintext or private/link-local/loopback cross-origin fetches
     }
+    // Same-origin: the authed school client. Cross-origin: the cookie-less client. Either way a
+    // per-request total timeout keeps a silent image server from hanging the answer flow.
+    let client = if cross_origin { external } else { school };
+    let resp = client
+        .get(url.as_str())
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .ok()?;
+    let (bytes, mime) = crate::course_context::fetch_image_response(resp).await?;
+    let sub = mime.strip_prefix("image/").unwrap_or("png");
+    let sub = if ["png", "jpeg", "gif", "webp"].contains(&sub) {
+        sub
+    } else {
+        "png"
+    };
+    Some(format!(
+        "data:image/{sub};base64,{}",
+        crate::login::encode_base64(&bytes)
+    ))
 }
 
 /// Map the LLM reply back to a concrete answer for the subject's type (delegates to the pure quiz
@@ -314,7 +424,13 @@ fn parse_answer(subject: &Value, qtype: &str, text: &str) -> Option<Answer> {
         }
         t if quiz::BLANK_TYPES.contains(&t) => {
             let blanks = quiz::parse_blanks(text, quiz::blank_count(subject));
-            blanks.iter().any(|b| !b.is_empty()).then_some(Answer::Blanks(blanks))
+            let answer = Answer::Blanks(blanks);
+            // Full validate: too few blanks or whitespace-only values are NOT padded into a
+            // submission — the subject stays missing so prepare retries (never submit an empty
+            // string as an answer).
+            quiz::validate_answer(subject, &answer, false)
+                .ok()
+                .map(|_| answer)
         }
         _ => {
             let t = text.trim();
@@ -375,7 +491,11 @@ fn parent_id_str(subject: &Value) -> Option<String> {
 
 /// `[{sort:i, content}]` — 0-based per-blank (first pass; the resubmit overlay preserves the review's raw sort).
 fn blanks_sort_content(blanks: &[String]) -> Vec<Value> {
-    blanks.iter().enumerate().map(|(i, c)| json!({ "sort": i, "content": c })).collect()
+    blanks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!({ "sort": i, "content": c }))
+        .collect()
 }
 
 pub fn exam_body(instance_id: &str, entries: &[Value]) -> Value {
@@ -431,7 +551,11 @@ pub async fn submit_exam(
 ) -> Result<(String, bool), String> {
     let entries: Vec<Value> = subjects
         .iter()
-        .filter_map(|s| answers.get(&quiz::subject_id(s)).map(|a| exam_subject_entry(s, a))) // skip un-answered (never blank)
+        .filter_map(|s| {
+            answers
+                .get(&quiz::subject_id(s))
+                .map(|a| exam_subject_entry(s, a))
+        }) // skip un-answered (never blank)
         .collect();
     let body = exam_body(instance_id, &entries);
     let v = http::json_checked(
@@ -448,25 +572,30 @@ pub async fn submit_exam(
     if sid.is_empty() {
         return Err("submit exam: response missing submission_id".to_string());
     }
-    let retake = v.get("allow_retake_exam").and_then(Value::as_bool).unwrap_or(false);
+    let retake = v
+        .get("allow_retake_exam")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok((sid, retake))
 }
 
-/// Resubmit for full marks (docs 31 / v1 answer_flow.py:499-523): **re-distribute** for the fresh
-/// `exam_paper_instance_id` (a retake mints a new one — the original 400s) and member validation, read
-/// `correct_answers_data.correct_answers`, **overlay** onto the first answers where the **review value
-/// wins** (option_ids member-validated → cross-block dropped; blanks with the review's raw `sort`;
-/// short from the review `answer`), preserving `parent_id`, then resubmit. Any non-2xx is returned to
-/// the actor so a failed correction pass cannot be presented as a complete success.
+/// Resubmit for full marks (docs 31 / v1 answer_flow.py:499-523): read `correct_answers_data.correct_answers`
+/// from the review FIRST — a fresh distribute MINTS a new retake instance, so a missing or EMPTY
+/// review errors out before any distribute and can never consume a retake. Only with a confirmed
+/// review does it **re-distribute** for the fresh `exam_paper_instance_id` (the original 400s) and
+/// member validation, **overlay** onto the fresh subjects where the **review value wins** (option_ids
+/// member-validated → cross-block dropped; blanks with the review's raw `sort`; short from the review
+/// `answer`), preserving `parent_id`, then resubmit. Only subjects with an actual review overlay are
+/// re-sent — never the stale base answers. Any non-2xx is returned to the actor so a failed
+/// correction pass cannot be presented as a complete success.
 pub async fn resubmit_correct(
     client: &Client,
     ep: &Endpoints,
     activity_id: &str,
     submission_id: &str,
-    base_answers: &std::collections::HashMap<String, Answer>,
-    _base_subjects: &[Value],
 ) -> Result<(), String> {
-    let paper = fetch_paper(client, ep, Source::Exam, activity_id, "").await?; // fresh instance + subjects
+    // Fetch the review FIRST: a fresh distribute MINTS a new retake instance, so a missing/empty
+    // review must fail before any distribute — otherwise the retake is consumed with no correction.
     let review = http::json_checked(
         client.get(ep.exam_submission_review(activity_id, submission_id)),
         "fetch exam review",
@@ -477,20 +606,14 @@ pub async fn resubmit_correct(
         .and_then(Value::as_array)
         .map(|a| a.iter().map(|e| (quiz::subject_id(e), e.clone())).collect())
         .unwrap_or_default();
-
-    let mut entries = Vec::new();
-    for s in &paper.subjects {
-        let sid = quiz::subject_id(s);
-        let entry = match corrects.get(&sid) {
-            Some(rc) => overlay_entry(s, rc, base_answers.get(&sid)),
-            None => base_answers.get(&sid).map(|a| exam_subject_entry(s, a)),
-        };
-        if let Some(e) = entry {
-            entries.push(e);
-        }
+    if corrects.is_empty() {
+        return Err("fetch exam review: review contains no correct answers".to_string());
     }
+    // The review actually carries corrections — only NOW may the fresh distribute mint the retake.
+    let paper = fetch_paper(client, ep, Source::Exam, activity_id, "").await?; // fresh instance + subjects
+    let entries = correct_overlay_entries(&paper.subjects, &corrects);
     if entries.is_empty() {
-        return Ok(());
+        return Err("resubmit corrected exam: no correct answers could be overlaid".to_string());
     }
     let body = exam_body(&paper.instance_id, &entries);
     let response = http::mutation_checked(
@@ -505,8 +628,25 @@ pub async fn resubmit_correct(
     Ok(())
 }
 
-/// Overlay one review-correct entry onto a fresh subject — the review value WINS; `base` is fallback.
-fn overlay_entry(subject: &Value, review: &Value, base: Option<&Answer>) -> Option<Value> {
+/// Entries for the resubmit — ONLY subjects with an actual review overlay (a fresh retake must never
+/// re-send stale base answers as if they were corrections).
+fn correct_overlay_entries(
+    subjects: &[Value],
+    corrects: &std::collections::HashMap<String, Value>,
+) -> Vec<Value> {
+    subjects
+        .iter()
+        .filter_map(|s| {
+            corrects
+                .get(&quiz::subject_id(s))
+                .and_then(|rc| overlay_entry(s, rc))
+        })
+        .collect()
+}
+
+/// Overlay one review-correct entry onto a fresh subject — the review value WINS; `None` when the
+/// review carries no usable value for this subject (that subject is then left out of the resubmit).
+fn overlay_entry(subject: &Value, review: &Value) -> Option<Value> {
     let mut e = json!({ "subject_id": quiz::id_value(&quiz::subject_id(subject)), "answer_option_ids": [], "answer": "" });
     let mut set = false;
     if let Some(ids) = review.get("answer_option_ids").and_then(Value::as_array) {
@@ -514,7 +654,11 @@ fn overlay_entry(subject: &Value, review: &Value, base: Option<&Answer>) -> Opti
         // the resubmit never applied the correct option and the score never improved (confirmed live).
         let valid: Vec<String> = ids
             .iter()
-            .filter_map(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+            .filter_map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .or_else(|| x.as_i64().map(|n| n.to_string()))
+            })
             .filter(|id| subject_has_option(subject, id)) // cross-block ids dropped
             .collect();
         if !valid.is_empty() {
@@ -524,7 +668,11 @@ fn overlay_entry(subject: &Value, review: &Value, base: Option<&Answer>) -> Opti
     }
     if !set {
         // review blanks: keep the server's RAW sort (v1 answer_flow.py:511).
-        if let Some(arr) = review.get("answers").or_else(|| review.get("correct_answers")).and_then(Value::as_array) {
+        if let Some(arr) = review
+            .get("answers")
+            .or_else(|| review.get("correct_answers"))
+            .and_then(Value::as_array)
+        {
             let blanks: Vec<Value> = arr
                 .iter()
                 .filter_map(|b| {
@@ -539,18 +687,17 @@ fn overlay_entry(subject: &Value, review: &Value, base: Option<&Answer>) -> Opti
         }
     }
     if !set {
-        if let Some(t) = review.get("answer").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+        if let Some(t) = review
+            .get("answer")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
             e["answer"] = json!(t);
             set = true;
         }
     }
     if !set {
-        match base? {
-            Answer::Options(ids) => e["answer_option_ids"] = json!(quiz::id_values(ids)),
-            Answer::Text(t) => e["answer"] = json!(t),
-            Answer::Blanks(b) => e["answers"] = json!(blanks_sort_content(b)),
-            Answer::Vote(l) => e["answer_option_ids"] = json!(l),
-        }
+        return None;
     }
     if let Some(pid) = parent_id_str(subject) {
         e["parent_id"] = quiz::id_value(&pid);
@@ -566,7 +713,11 @@ fn subject_has_option(subject: &Value, id: &str) -> bool {
             a.iter().any(|o| {
                 let oid = o.get("id");
                 oid.and_then(Value::as_str) == Some(id)
-                    || oid.and_then(Value::as_i64).map(|n| n.to_string()).as_deref() == Some(id)
+                    || oid
+                        .and_then(Value::as_i64)
+                        .map(|n| n.to_string())
+                        .as_deref()
+                        == Some(id)
             })
         })
         .unwrap_or(false)
@@ -594,21 +745,67 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// Serve exactly `responses.len()` requests in order, capturing each request's first line so a
+    /// test can prove which calls happened (e.g. that NO resubmit POST followed an empty review).
+    async fn scripted_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::sync::oneshot::Receiver<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut lines = Vec::new();
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let head_end = request
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .unwrap_or(request.len());
+                lines.push(
+                    String::from_utf8_lossy(&request[..head_end])
+                        .trim()
+                        .to_string(),
+                );
+                let reason = if status >= 400 { "Error" } else { "OK" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+            let _ = tx.send(lines);
+        });
+        (format!("http://{address}"), rx)
+    }
+
     #[test]
     fn exam_body_shapes_verbatim() {
         let entries = vec![
             exam_subject_entry(&json!({"id":"s1"}), &Answer::Options(vec!["o2".into()])),
             exam_subject_entry(&json!({"id":"s2"}), &Answer::Text("<p>巴黎</p>".into())),
-            exam_subject_entry(&json!({"id":"s3"}), &Answer::Blanks(vec!["<b>1</b>".into(), "2".into()])),
-            exam_subject_entry(&json!({"id":"L1","parent_id":"m"}), &Answer::Options(vec!["o1".into()])),
+            exam_subject_entry(
+                &json!({"id":"s3"}),
+                &Answer::Blanks(vec!["<b>1</b>".into(), "2".into()]),
+            ),
+            exam_subject_entry(
+                &json!({"id":"L1","parent_id":"m"}),
+                &Answer::Options(vec!["o1".into()]),
+            ),
         ];
         let body = exam_body("inst-1", &entries);
         assert_eq!(body["examFinished"], true);
         assert_eq!(body["exam_paper_instance_id"], "inst-1");
         assert_eq!(body["subjects"][0]["answer_option_ids"], json!(["o2"]));
         assert_eq!(body["subjects"][1]["answer"], "<p>巴黎</p>"); // verbatim, not stripped
-        // fill/cloze: per-blank [{sort,content}] (0-based), HTML kept.
-        assert_eq!(body["subjects"][2]["answers"], json!([{"sort":0,"content":"<b>1</b>"},{"sort":1,"content":"2"}]));
+                                                                  // fill/cloze: per-blank [{sort,content}] (0-based), HTML kept.
+        assert_eq!(
+            body["subjects"][2]["answers"],
+            json!([{"sort":0,"content":"<b>1</b>"},{"sort":1,"content":"2"}])
+        );
         // a flattened matching sub carries parent_id.
         assert_eq!(body["subjects"][3]["parent_id"], "m");
     }
@@ -624,9 +821,130 @@ mod tests {
         ];
         let mut answers: HashMap<String, Answer> = HashMap::new();
         answers.insert("s1".into(), Answer::Text("done".into()));
-        assert_eq!(missing_subjects(&subjects, &answers), vec!["s2".to_string()]);
+        assert_eq!(
+            missing_subjects(&subjects, &answers),
+            vec!["s2".to_string()]
+        );
         answers.insert("s2".into(), Answer::Text("done".into()));
-        assert!(missing_subjects(&subjects, &answers).is_empty(), "all non-Skip answered ⇒ ready");
+        assert!(
+            missing_subjects(&subjects, &answers).is_empty(),
+            "all non-Skip answered ⇒ ready"
+        );
+    }
+
+    #[test]
+    fn incomplete_blank_reply_is_rejected() {
+        let subject = json!({
+            "id": "blank-1",
+            "type": "fill_in_blank",
+            "answer_number": 2
+        });
+        assert_eq!(parse_answer(&subject, "fill_in_blank", "Paris"), None);
+        // whitespace-only padding is rejected too, not submitted as an empty string.
+        assert_eq!(
+            parse_answer(&subject, "fill_in_blank", "Paris |||   "),
+            None
+        );
+        // a complete non-empty reply is still accepted.
+        assert_eq!(
+            parse_answer(&subject, "fill_in_blank", "Paris ||| France"),
+            Some(Answer::Blanks(vec!["Paris".into(), "France".into()]))
+        );
+    }
+
+    #[test]
+    fn resubmit_entries_only_include_actual_review_overlays() {
+        let subjects = vec![
+            json!({"id":"s1","type":"single_selection","options":[{"id":"123"},{"id":"456"}]}),
+            json!({"id":"s2","type":"single_selection","options":[{"id":"1"},{"id":"2"}]}),
+            json!({"id":"s3","type":"short_answer"}),
+        ];
+        let corrects = std::collections::HashMap::from([
+            (
+                "s1".to_string(),
+                json!({"subject_id":"s1","answer_option_ids":[123]}),
+            ), // valid overlay
+            (
+                "s2".to_string(),
+                json!({"subject_id":"s2","answer_option_ids":[999]}),
+            ), // cross-block id → dropped
+            ("s3".to_string(), json!({"subject_id":"s3","answer":""})), // empty text → dropped
+        ]);
+        let entries = correct_overlay_entries(&subjects, &corrects);
+        assert_eq!(
+            entries.len(),
+            1,
+            "only subjects with a real overlay may be resubmitted"
+        );
+        assert_eq!(entries[0]["subject_id"], "s1");
+        assert_eq!(entries[0]["answer_option_ids"], json!([123]));
+        assert!(entries[0].get("parent_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn resubmit_correct_without_review_answers_never_posts() {
+        // ONE response only: an empty review must abort before ANY fresh distribute (which would mint
+        // a retake instance) — so the whole exchange is exactly one review GET.
+        let (base, lines_rx) = scripted_server(vec![(200, r#"{}"#)]).await;
+        let err = resubmit_correct(&Client::new(), &Endpoints::derive(&base), "exam-1", "sub-1")
+            .await
+            .expect_err("an empty review must fail the correction pass");
+        assert!(
+            err.contains("no correct answers"),
+            "unexpected error: {err}"
+        );
+        let lines = lines_rx.await.unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "an empty review must not mint a retake (no distribute)"
+        );
+        assert!(
+            lines[0].starts_with("GET"),
+            "only the review GET may happen: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("submissions/"),
+            "the call must be the review endpoint: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("/distribute"),
+            "no fresh distribute for an empty review: {}",
+            lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmit_correct_posts_overlaid_answers() {
+        let (base, lines_rx) = scripted_server(vec![
+            (200, r#"{"correct_answers_data":{"correct_answers":[{"subject_id":"s1","answer_option_ids":[123]}]}}"#), // review FIRST
+            (200, r#"{}"#), // qualification (best-effort)
+            (200, r#"{"exam_paper_instance_id":777,"subjects":[{"id":"s1","type":"single_selection","options":[{"id":"123"},{"id":"456"}]}]}"#),
+            (200, r#"{"submission_id":999}"#),
+        ])
+        .await;
+        resubmit_correct(&Client::new(), &Endpoints::derive(&base), "exam-1", "sub-1")
+            .await
+            .expect("review with correct answers must resubmit");
+        let lines = lines_rx.await.unwrap();
+        assert_eq!(lines.len(), 4);
+        assert!(
+            lines[0].contains("submissions/"),
+            "review must be fetched FIRST: {}",
+            lines[0]
+        );
+        assert!(
+            lines[2].contains("/distribute"),
+            "the fresh distribute only follows a valid review: {}",
+            lines[2]
+        );
+        assert!(
+            lines[3].starts_with("POST"),
+            "correction pass must resubmit: {}",
+            lines[3]
+        );
     }
 
     #[test]
@@ -659,7 +977,10 @@ mod tests {
             &[],
         )
         .await;
-        assert!(result.is_err(), "HTTP 500 must never be reported as a successful submit");
+        assert!(
+            result.is_err(),
+            "HTTP 500 must never be reported as a successful submit"
+        );
 
         let base = one_shot_response(200, r#"{"allow_retake_exam":false}"#).await;
         let result = submit_exam(
@@ -671,30 +992,161 @@ mod tests {
             &[],
         )
         .await;
-        assert!(result.is_err(), "a success response without submission_id is not a valid submit receipt");
+        assert!(
+            result.is_err(),
+            "a success response without submission_id is not a valid submit receipt"
+        );
     }
 
     #[test]
     fn per_source_bodies_match_contract() {
-        assert_eq!(vote_body(&["A".into(), "C".into()]), json!({ "votes": ["A", "C"] }));
+        assert_eq!(
+            vote_body(&["A".into(), "C".into()]),
+            json!({ "votes": ["A", "C"] })
+        );
         assert_eq!(
             homework_body("my essay"),
             json!({ "comment": "my essay", "is_draft": false, "slides": [], "uploads": [] })
         );
         // classroom-exam: full exam wrapper with exactly the one subject.
-        let cb = classroom_body("inst-9", &json!({"id":"s5"}), &Answer::Text("answer".into()));
+        let cb = classroom_body(
+            "inst-9",
+            &json!({"id":"s5"}),
+            &Answer::Text("answer".into()),
+        );
         assert_eq!(cb["exam_paper_instance_id"], "inst-9");
         assert_eq!(cb["subjects"].as_array().unwrap().len(), 1);
         assert_eq!(cb["subjects"][0]["subject_id"], "s5");
         // courseware: subjects_answers, distinct builder (both keys present).
-        let cw = courseware_body(&[("s1".into(), "short_answer".into(), Answer::Text("hi".into()))]);
+        let cw = courseware_body(&[(
+            "s1".into(),
+            "short_answer".into(),
+            Answer::Text("hi".into()),
+        )]);
         assert_eq!(cw["subjects_answers"][0]["subject_id"], "s1");
         assert_eq!(cw["subjects_answers"][0]["type"], "short_answer");
-        assert_eq!(cw["subjects_answers"][0]["answers"], json!([{"sort":0,"content":"hi"}]));
+        assert_eq!(
+            cw["subjects_answers"][0]["answers"],
+            json!([{"sort":0,"content":"hi"}])
+        );
         // questionnaire: exam wrapper, NO examFinished.
-        let qb = questionnaire_body("inst-q", &[exam_subject_entry(&json!({"id":"q1"}), &Answer::Options(vec!["a".into()]))]);
+        let qb = questionnaire_body(
+            "inst-q",
+            &[exam_subject_entry(
+                &json!({"id":"q1"}),
+                &Answer::Options(vec!["a".into()]),
+            )],
+        );
         assert_eq!(qb["exam_paper_instance_id"], "inst-q");
         assert!(qb.get("examFinished").is_none());
         assert_eq!(qb["subjects"][0]["subject_id"], "q1");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_plaintext_image_is_dropped_not_sent_to_the_model() {
+        // Cross-origin images are HTTPS-only: an `http://` CDN/other-host src must be dropped —
+        // and the DROPPED image must not appear as its raw URL anywhere in the user content.
+        let school = Client::new();
+        let external = Client::new();
+        let subject = json!({
+            "id": "s-img",
+            "type": "single_selection",
+            "description": "Which image? <img src=\"http://192.168.1.50/img.png\">",
+            "options": []
+        });
+        let content =
+            build_user_content(&school, &external, "https://school.example/api", &subject).await;
+        let Value::Array(parts) = content else {
+            panic!("images present ⇒ parts list")
+        };
+        assert_eq!(
+            parts.len(),
+            1,
+            "only the text part survives a rejected image"
+        );
+        assert!(
+            !serde_json::to_string(&parts)
+                .unwrap()
+                .contains("192.168.1.50"),
+            "a rejected cross-origin URL must never reach the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_origin_relative_image_is_inlined_with_account_client() {
+        // A relative src resolves against the page base; same-origin → the school client fetches it
+        // and the result is a base64 data-url.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = [0x89, b'P', b'N', b'G', 0x0d, 0x0a];
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let school = Client::new();
+        let external = Client::new();
+        let base = format!("http://{address}/api");
+        let subject = json!({
+            "id": "s-img",
+            "type": "single_selection",
+            "description": "Which image? <img src=\"/files/chart.png\">",
+            "options": []
+        });
+        let content = build_user_content(&school, &external, &base, &subject).await;
+        let Value::Array(parts) = content else {
+            panic!("images present ⇒ parts list")
+        };
+        assert_eq!(parts.len(), 2, "text + one inlined image");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        assert!(
+            !url.contains("/files/chart.png"),
+            "the raw URL must not leak, got {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_miss_drops_the_image_instead_of_falling_back_to_the_raw_url() {
+        // 404 on a same-origin image: the part is dropped (None) — the raw URL is NOT sent to the
+        // model as a fallback.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let school = Client::new();
+        let external = Client::new();
+        let base = format!("http://{address}/api");
+        let subject = json!({
+            "id": "s-img",
+            "type": "single_selection",
+            "description": "Which image? <img src=\"/files/missing.png\">",
+            "options": []
+        });
+        let content = build_user_content(&school, &external, &base, &subject).await;
+        let Value::Array(parts) = content else {
+            panic!("images present ⇒ parts list")
+        };
+        assert_eq!(parts.len(), 1, "a fetch miss drops the image part entirely");
+        assert!(
+            !serde_json::to_string(&parts)
+                .unwrap()
+                .contains("missing.png"),
+            "a failed fetch must never fall back to the raw URL"
+        );
     }
 }

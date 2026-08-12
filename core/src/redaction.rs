@@ -33,7 +33,10 @@ static LOG_LEVEL: AtomicU8 = AtomicU8::new(0);
 
 /// Set the global log level from Settings (`normal` | `debug`). Called on Init and UpdateConfig.
 pub fn set_level(level: &str) {
-    LOG_LEVEL.store(u8::from(level.eq_ignore_ascii_case("debug")), Ordering::Relaxed);
+    LOG_LEVEL.store(
+        u8::from(level.eq_ignore_ascii_case("debug")),
+        Ordering::Relaxed,
+    );
 }
 
 fn is_debug() -> bool {
@@ -71,5 +74,8 @@ pub fn log_line(cb: EventCb, level: &str, text: &str) {
     if level.eq_ignore_ascii_case("debug") && !is_debug() {
         return;
     }
-    emit(cb, &json!({ "id": null, "event": "LogLine", "level": level, "text": text }));
+    emit(
+        cb,
+        &json!({ "id": null, "event": "LogLine", "level": level, "text": text }),
+    );
 }

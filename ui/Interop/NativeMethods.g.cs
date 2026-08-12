@@ -20,7 +20,9 @@ namespace TronClass.Interop
 
         /// <summary>
         ///  Start the core. `cb` is invoked (from runtime worker threads) with UTF-8 JSON event
-        ///  bytes that are valid only for the duration of each call. Returns an opaque handle.
+        ///  bytes that are valid only for the duration of each call. Returns an opaque handle; a null
+        ///  `cb` (or a runtime build failure) yields a null handle, which the host must treat as
+        ///  core-unavailable.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "core_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern void* core_init(delegate* unmanaged[Cdecl]<byte*, nuint, void> cb);

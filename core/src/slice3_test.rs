@@ -15,10 +15,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(bytes).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(bytes).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -39,7 +47,11 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
 fn account_id(label: &str) -> Option<String> {
     for ev in snapshot().iter().rev() {
         if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"].as_array()?.iter().find(|a| a["label"] == label) {
+            if let Some(a) = ev["accounts"]
+                .as_array()?
+                .iter()
+                .find(|a| a["label"] == label)
+            {
                 return a["id"].as_str().map(str::to_string);
             }
         }
@@ -48,13 +60,18 @@ fn account_id(label: &str) -> Option<String> {
 }
 fn submitted(quiz_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (q, a) = (quiz_id.to_string(), account.to_string());
-    move |v| v["event"] == "QuizSubmitted" && v["quiz_id"] == q && v["account_id"].as_str() == Some(&a)
+    move |v| {
+        v["event"] == "QuizSubmitted" && v["quiz_id"] == q && v["account_id"].as_str() == Some(&a)
+    }
 }
 
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -82,7 +99,7 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     let base = start_fake();
     let data_dir = std::env::temp_dir().join(format!("tron-slice3-{}", new_id()));
     let data_dir = data_dir.to_string_lossy().replace('\\', "/");
-    let h = crate::core_init(collect);
+    let h = crate::core_init(Some(collect));
     let mut id = 0u64;
     let mut next = || {
         id += 1;
@@ -90,22 +107,41 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     };
 
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{data_dir}"}}"#));
+    send(
+        h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{data_dir}"}}"#),
+    );
     assert!(wait_for(reply_ok(i), 10).is_some());
     // fast countdown + quick quiz detection + point the LLM at the fake's endpoint
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"llm_endpoint":"{base}/v1/chat/completions"}}}}"#));
+    send(
+        h,
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"llm_endpoint":"{base}/v1/chat/completions"}}}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"fake-key"}}"#));
+    send(
+        h,
+        &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"fake-key"}}"#),
+    );
     assert!(wait_for(reply_ok(i), 5).unwrap()["ok"] == true, "SetLlmKey");
 
     for label in ["alice", "bob"] {
         let i = next();
-        send(h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"{label}","school":"{base}","username":"{label}","password":"secret"}}"#));
+        send(
+            h,
+            &format!(
+                r#"{{"id":{i},"cmd":"AddAccount","label":"{label}","school":"{base}","username":"{label}","password":"secret"}}"#
+            ),
+        );
         wait_for(reply_ok(i), 5);
     }
     let alice = account_id("alice").unwrap();
@@ -114,7 +150,10 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     let i = next();
     send(h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     assert!(wait_for(reply_ok(i), 15).is_some());
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
 
     // Open an exam with two subjects: s1 (selection, LLM → option "o1"), s2 (short_answer, LLM → text).
     // bob has an EXISTING answer on s1 = "o2" → a per-account conflict (o2 ≠ LLM's o1). alice: none.
@@ -131,9 +170,18 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     post(&base, "/_test/open_quiz", quiz);
 
     // Prepared with bob's conflict; reasoning streamed for the LLM subjects.
-    let prepared = wait_for(|v| v["event"] == "QuizPrepared" && v["quiz_id"] == "EX1", 20).expect("QuizPrepared");
-    let activity_token = prepared["activity_token"].as_str().expect("quiz activity token");
-    assert!(prepared["conflict_count"].as_u64().unwrap_or(0) >= 1, "bob has a conflict on s1");
+    let prepared = wait_for(
+        |v| v["event"] == "QuizPrepared" && v["quiz_id"] == "EX1",
+        20,
+    )
+    .expect("QuizPrepared");
+    let activity_token = prepared["activity_token"]
+        .as_str()
+        .expect("quiz activity token");
+    assert!(
+        prepared["conflict_count"].as_u64().unwrap_or(0) >= 1,
+        "bob has a conflict on s1"
+    );
     assert!(
         wait_for(
             |v| v["event"] == "ReasoningChunk" && v["activity_token"] == activity_token,
@@ -143,38 +191,86 @@ fn slice3_quiz_prepare_conflict_and_submit() {
         "reasoning streamed"
     );
     // alice (no conflict) should NOT auto-submit while bob's conflict is unresolved.
-    assert!(wait_for(submitted("EX1", &alice), 4).is_none(), "no submit while a conflict is unresolved");
+    assert!(
+        wait_for(submitted("EX1", &alice), 4).is_none(),
+        "no submit while a conflict is unresolved"
+    );
 
     // Resolve bob's conflict → countdown → both submit.
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"SetAnswer","activity_token":"{activity_token}","account_id":"{bob}","subject_id":"s1","answer":{{"kind":"options","option_ids":["bob-o1"]}}}}"#));
+    send(
+        h,
+        &format!(
+            r#"{{"id":{i},"cmd":"SetAnswer","activity_token":"{activity_token}","account_id":"{bob}","subject_id":"s1","answer":{{"kind":"options","option_ids":["bob-o1"]}}}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
-    assert!(wait_for(submitted("EX1", &alice), 15).is_some(), "alice submits after resolution");
-    assert!(wait_for(submitted("EX1", &bob), 15).is_some(), "bob submits after resolution");
+    assert!(
+        wait_for(submitted("EX1", &alice), 15).is_some(),
+        "alice submits after resolution"
+    );
+    assert!(
+        wait_for(submitted("EX1", &bob), 15).is_some(),
+        "bob submits after resolution"
+    );
 
     // 題目語意相同但 option ID 契約不同，未建立安全映射前不得跨帳號重用答案。
-    let calls: Value = serde_json::from_str(&fetch(&base, "/_test/llm_calls")).unwrap_or(Value::Null);
-    assert_eq!(calls["count"].as_u64().unwrap_or(99), 4, "different paper contracts are answered independently");
+    let calls: Value =
+        serde_json::from_str(&fetch(&base, "/_test/llm_calls")).unwrap_or(Value::Null);
+    assert_eq!(
+        calls["count"].as_u64().unwrap_or(99),
+        4,
+        "different paper contracts are answered independently"
+    );
 
-    let submissions: Value = serde_json::from_str(&fetch(&base, "/_test/submissions")).unwrap_or(Value::Null);
-    assert_eq!(submissions["alice"]["exam_paper_instance_id"], "instance-alice");
-    assert_eq!(submissions["alice"]["subjects"][0]["answer_option_ids"], serde_json::json!(["alice-o1"]));
+    let submissions: Value =
+        serde_json::from_str(&fetch(&base, "/_test/submissions")).unwrap_or(Value::Null);
+    assert_eq!(
+        submissions["alice"]["exam_paper_instance_id"],
+        "instance-alice"
+    );
+    assert_eq!(
+        submissions["alice"]["subjects"][0]["answer_option_ids"],
+        serde_json::json!(["alice-o1"])
+    );
     assert_eq!(submissions["bob"]["exam_paper_instance_id"], "instance-bob");
-    assert_eq!(submissions["bob"]["subjects"][0]["answer_option_ids"], serde_json::json!(["bob-o1"]));
+    assert_eq!(
+        submissions["bob"]["subjects"][0]["answer_option_ids"],
+        serde_json::json!(["bob-o1"])
+    );
 
     // 完整 paper contract 相同且 tools 關閉時，才允許跨帳號重用完整答案。
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"enable_llm_tools":false}}}}"#));
-    assert_eq!(wait_for(reply_ok(i), 5).expect("disable tools reply")["ok"], true);
-    post(&base, "/_test/open_quiz", r#"{"activity_id":"EX2","course_id":"C1","course_name":"Math",
+    send(
+        h,
+        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"enable_llm_tools":false}}}}"#),
+    );
+    assert_eq!(
+        wait_for(reply_ok(i), 5).expect("disable tools reply")["ok"],
+        true
+    );
+    post(
+        &base,
+        "/_test/open_quiz",
+        r#"{"activity_id":"EX2","course_id":"C1","course_name":"Math",
         "instance_id":"same-contract-instance",
         "subjects":[{"id":"same-s1","type":"single_selection","content":"pick","options":[{"id":"same-o1","content":"A"},{"id":"same-o2","content":"B"}]},
-                    {"id":"same-s2","type":"short_answer","content":"why"}]}"#);
-    assert!(wait_for(|v| v["event"] == "QuizPrepared" && v["quiz_id"] == "EX2", 20).is_some());
+                    {"id":"same-s2","type":"short_answer","content":"why"}]}"#,
+    );
+    assert!(wait_for(
+        |v| v["event"] == "QuizPrepared" && v["quiz_id"] == "EX2",
+        20
+    )
+    .is_some());
     assert!(wait_for(submitted("EX2", &alice), 15).is_some());
     assert!(wait_for(submitted("EX2", &bob), 15).is_some());
-    let calls: Value = serde_json::from_str(&fetch(&base, "/_test/llm_calls")).unwrap_or(Value::Null);
-    assert_eq!(calls["count"].as_u64().unwrap_or(99), 6, "identical contract reuses two complete answers");
+    let calls: Value =
+        serde_json::from_str(&fetch(&base, "/_test/llm_calls")).unwrap_or(Value::Null);
+    assert_eq!(
+        calls["count"].as_u64().unwrap_or(99),
+        6,
+        "identical contract reuses two complete answers"
+    );
 
     let i = next();
     send(h, &format!(r#"{{"id":{i},"cmd":"StopMonitoring"}}"#));

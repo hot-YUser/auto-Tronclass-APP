@@ -124,10 +124,17 @@ fn default_tool_iterations() -> u32 {
     3
 }
 fn default_autoanswer_types() -> Vec<String> {
-    ["exam", "questionnaire", "homework", "vote", "classroom", "courseware"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "exam",
+        "questionnaire",
+        "homework",
+        "vote",
+        "classroom",
+        "courseware",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 fn default_radar_strategy() -> Vec<String> {
     vec!["empty_answer".to_string(), "global_wgs84".to_string()]
@@ -226,7 +233,10 @@ impl Operating {
         let weekday = (local.div_euclid(86400) + 3).rem_euclid(7) as u8;
         let minute = (local.rem_euclid(86400) / 60) as u32;
         match self.days.iter().find(|d| d.weekday == weekday) {
-            Some(d) if d.enabled => d.windows.iter().any(|w| window_contains(&w.start, &w.end, minute)),
+            Some(d) if d.enabled => d
+                .windows
+                .iter()
+                .any(|w| window_contains(&w.start, &w.end, minute)),
             Some(_) => false, // listed but disabled → closed
             // not listed → inherit always-on. ponytail: a future v1-config import (v1 has a per-day enable
             // gate where unlisted ≠ always-on) must materialize all 7 days (enabled=false for unlisted)
@@ -265,7 +275,10 @@ fn parse_hhmm(s: &str) -> Option<u32> {
 #[allow(dead_code)] // wired only when a v1-config import path lands; exercised by slice4_test today
 pub fn simple_weekday_to_internal(v1_weekday: u8) -> u8 {
     // v1: 0=Sun,1=Mon,..6=Sat → internal: {0:6, 1:0, 2:1, 3:2, 4:3, 5:4, 6:5}.
-    [6, 0, 1, 2, 3, 4, 5].get(v1_weekday as usize).copied().unwrap_or(0)
+    [6, 0, 1, 2, 3, 4, 5]
+        .get(v1_weekday as usize)
+        .copied()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -323,9 +336,49 @@ impl Config {
     }
 }
 
-/// A random opaque account id (hex of 16 CSPRNG bytes) — avoids a uuid dependency.
+/// A random opaque account id (hex of 16 CSPRNG bytes) — avoids a uuid dependency. When the OS RNG
+/// is unavailable, falls back to `fallback_id` instead of panicking: account ids are map keys, not
+/// tokens, so a non-cryptographic fallback is safe here.
 pub fn new_id() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("os rng");
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return fallback_id();
+    }
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Time + atomic-counter fallback id when the OS CSPRNG is unavailable. Unique within the process
+/// (monotonic counter mixed with the clock) and opaque-looking, but explicitly NOT security-boundary
+/// material — vault nonces and keys stay fail-closed and never use this path.
+fn fallback_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:016x}{:016x}", nanos ^ counter.rotate_left(32), counter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_id_is_32_hex_digits_and_unique() {
+        let a = new_id();
+        let b = new_id();
+        assert_eq!(a.len(), 32, "16 bytes as hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "ids must be unique across calls");
+    }
+
+    #[test]
+    fn fallback_id_is_unique_and_hex_shaped() {
+        let a = fallback_id();
+        let b = fallback_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "time+counter fallback must not repeat");
+    }
 }

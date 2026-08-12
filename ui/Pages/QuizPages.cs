@@ -7,18 +7,20 @@ namespace Ui;
 /// <summary>答題列表:進行中與近期紀錄(合併後一活動一列)。</summary>
 public sealed class QuizListPage : ContentPage
 {
+    readonly AppState _state;
+    readonly EmptyState _empty;
+    bool _attached;
+
     public QuizListPage(AppState state)
     {
+        _state = state;
         Title = "答題";
 
         var host = new VerticalStackLayout { Spacing = 10 };
         BindableLayout.SetItemsSource(host, state.Quizzes);
         BindableLayout.SetItemTemplate(host, new DataTemplate(() => new QuizRow()));
 
-        var empty = new EmptyState("尚無答題紀錄", "開始監控後,偵測到的測驗會由 LLM 備答並出現在這裡,並保留為紀錄。");
-        void SyncEmpty() => empty.IsVisible = state.Quizzes.Count == 0;
-        state.Quizzes.CollectionChanged += (_, _) => SyncEmpty();
-        SyncEmpty();
+        _empty = new EmptyState("尚無答題紀錄", "開始監控後,偵測到的測驗會由 LLM 備答並出現在這裡,並保留為紀錄。");
 
         Content = new ScrollView
         {
@@ -26,10 +28,32 @@ public sealed class QuizListPage : ContentPage
             {
                 Padding = 16,
                 Spacing = 12,
-                Children = { new StatusBanner(state), empty, host },
+                Children = { new StatusBanner(state), _empty, host },
             },
         };
     }
+
+    // singleton 訂閱綁頁面生命週期:離開畫面即退訂(長命 Quizzes 不握住本頁)。
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        if (_attached) return;
+        _attached = true;
+        _state.Quizzes.CollectionChanged += OnQuizzesChanged;
+        SyncEmpty();
+    }
+
+    protected override void OnDisappearing()
+    {
+        base.OnDisappearing();
+        if (!_attached) return;
+        _attached = false;
+        _state.Quizzes.CollectionChanged -= OnQuizzesChanged;
+    }
+
+    void OnQuizzesChanged(object? _, NotifyCollectionChangedEventArgs __) => SyncEmpty();
+
+    void SyncEmpty() => _empty.IsVisible = _state.Quizzes.Count == 0;
 }
 
 /// <summary>紀錄卡:測驗徽章 + 課程 + 狀態膠囊 + meta(題數·時間) + 逐帳號送出 chips + 迷你倒數。</summary>
@@ -87,9 +111,10 @@ sealed class QuizRow : Border
         Content = grid;
     }
 
-    /// 狀態膠囊短標籤 + 語意色:已送出綠、暫緩琥珀、捨棄紅、待定案琥珀、審題中主色。
+    /// 狀態膠囊短標籤 + 語意色:已送出綠、全滅結束中性(不宣稱成功)、暫緩琥珀、捨棄紅、待定案琥珀、審題中主色。
     static (string, Color, Color, Color, Color) QuizToneOf(QuizVm vm) => vm.Status switch
     {
+        "done" when vm.SubmittedCount == 0 => (vm.StatusTag, Theme.DimL, Theme.DimD, Theme.Card2L, Theme.Card2D),
         "done" => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
         "held" => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
         "discarded" => (vm.StatusTag, Theme.DangerL, Theme.DangerD, Theme.DangerBgL, Theme.DangerBgD),

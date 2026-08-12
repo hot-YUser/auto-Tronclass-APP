@@ -30,7 +30,9 @@ pub fn validate_answer(subject: &Value, answer: &Answer, vote: bool) -> Result<(
         return match answer {
             Answer::Vote(letters)
                 if !letters.is_empty()
-                    && letters.iter().all(|letter| subject_has_option(subject, letter)) =>
+                    && letters
+                        .iter()
+                        .all(|letter| subject_has_option(subject, letter)) =>
             {
                 Ok(())
             }
@@ -85,8 +87,8 @@ pub enum Decision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubjectPlan {
     pub subject_id: String,
-    pub qtype: String,             // decision/LLM type (a degenerate matching decides as a selection)
-    pub answer_type: String,       // submit type (courseware carries it; degenerate matching = "matching")
+    pub qtype: String, // decision/LLM type (a degenerate matching decides as a selection)
+    pub answer_type: String, // submit type (courseware carries it; degenerate matching = "matching")
     pub parent_id: Option<String>, // set for a flattened matching sub
     pub decision: Decision,
 }
@@ -94,7 +96,11 @@ pub struct SubjectPlan {
 pub fn subject_id(s: &Value) -> String {
     s.get("subject_id")
         .or_else(|| s.get("id"))
-        .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+        .and_then(|x| {
+            x.as_str()
+                .map(str::to_string)
+                .or_else(|| x.as_i64().map(|n| n.to_string()))
+        })
         .unwrap_or_default()
 }
 
@@ -118,13 +124,21 @@ pub fn id_values(ids: &[String]) -> Vec<Value> {
 
 fn option_id(o: &Value) -> String {
     o.get("id")
-        .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+        .and_then(|x| {
+            x.as_str()
+                .map(str::to_string)
+                .or_else(|| x.as_i64().map(|n| n.to_string()))
+        })
         .unwrap_or_default()
 }
 
 /// The type a subject is answered by: matching decides as a selection; everything else is its type.
 fn decide_type(qtype: &str) -> &str {
-    if qtype == "matching" { "single_selection" } else { qtype }
+    if qtype == "matching" {
+        "single_selection"
+    } else {
+        qtype
+    }
 }
 
 /// Flatten group/matching containers into individually-answerable leaf subjects (v1 answer_flow.py
@@ -144,7 +158,10 @@ pub fn flatten_paper(subjects: &[Value]) -> Vec<Value> {
 
 fn flatten_subject(s: &Value, out: &mut Vec<Value>) {
     let qtype = s.get("type").and_then(Value::as_str).unwrap_or("");
-    let subs = s.get("sub_subjects").and_then(Value::as_array).filter(|a| !a.is_empty());
+    let subs = s
+        .get("sub_subjects")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty());
 
     if qtype == "matching" {
         if let Some(subs) = subs {
@@ -152,7 +169,11 @@ fn flatten_subject(s: &Value, out: &mut Vec<Value>) {
             let mut subs_sorted: Vec<&Value> = subs.iter().collect();
             // ids are integers → sort NUMERICALLY (string sort mis-pairs 9/10, 999/1000 → silent 0).
             subs_sorted.sort_by_key(|a| subject_id(a).parse::<i64>().unwrap_or(0));
-            let mut opts: Vec<Value> = s.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
+            let mut opts: Vec<Value> = s
+                .get("options")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             opts.sort_by_key(|o| option_id(o).parse::<i64>().unwrap_or(0));
             let n = subs_sorted.len();
             let k = if opts.is_empty() { 0 } else { opts.len() / n };
@@ -161,7 +182,11 @@ fn flatten_subject(s: &Value, out: &mut Vec<Value>) {
                 child["type"] = Value::from("single_selection");
                 child["answer_type"] = Value::from("single_selection");
                 child["parent_id"] = Value::from(parent.clone());
-                let has_own = sub.get("options").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
+                let has_own = sub
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
                 if !has_own && k > 0 {
                     let block: Vec<Value> = opts[i * k..((i + 1) * k).min(opts.len())].to_vec();
                     child["options"] = Value::Array(block);
@@ -196,18 +221,43 @@ pub fn decide_paper(subjects: &[Value]) -> Vec<SubjectPlan> {
 }
 
 fn decide_subject(s: &Value) -> SubjectPlan {
-    let qtype = s.get("type").and_then(Value::as_str).unwrap_or("").to_string();
-    let answer_type = s.get("answer_type").and_then(Value::as_str).unwrap_or(&qtype).to_string();
-    let parent_id = s.get("parent_id").and_then(Value::as_str).map(str::to_string);
+    let qtype = s
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let answer_type = s
+        .get("answer_type")
+        .and_then(Value::as_str)
+        .unwrap_or(&qtype)
+        .to_string();
+    let parent_id = s
+        .get("parent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let id = subject_id(s);
-    if SKIP_TYPES.contains(&qtype.as_str()) {
-        return SubjectPlan { subject_id: id, qtype, answer_type, parent_id, decision: Decision::Skip };
+    // media/analysis here are LEAVES (a container with sub_subjects is flattened away upstream); they
+    // are not answerable — the same rule validate_answer enforces, so they must never reach the LLM.
+    if SKIP_TYPES.contains(&qtype.as_str()) || GROUP_TYPES.contains(&qtype.as_str()) {
+        return SubjectPlan {
+            subject_id: id,
+            qtype,
+            answer_type,
+            parent_id,
+            decision: Decision::Skip,
+        };
     }
     let decision = match leaked_answer(s, &qtype) {
         Some(a) => Decision::Replay(a),
         None => Decision::Pending,
     };
-    SubjectPlan { subject_id: id, qtype, answer_type, parent_id, decision }
+    SubjectPlan {
+        subject_id: id,
+        qtype,
+        answer_type,
+        parent_id,
+        decision,
+    }
 }
 
 /// Server-leaked correct answer at DISTRIBUTE — choice/matching read option `is_answer` **only**
@@ -241,10 +291,17 @@ fn leaked_answer(s: &Value, qtype: &str) -> Option<Answer> {
 /// `correct_answers:[{sort,content}]` → contents sorted by `sort`, verbatim. The real leaked shape for
 /// fill/cloze/short — not a flat string array, and no singular `correct_answer` field.
 pub fn correct_answers_contents(s: &Value) -> Vec<String> {
-    let Some(arr) = s.get("correct_answers").and_then(Value::as_array) else { return vec![] };
+    let Some(arr) = s.get("correct_answers").and_then(Value::as_array) else {
+        return vec![];
+    };
     let mut items: Vec<(i64, String)> = arr
         .iter()
-        .filter_map(|e| Some((e.get("sort").and_then(Value::as_i64).unwrap_or(0), e.get("content").and_then(Value::as_str)?.to_string())))
+        .filter_map(|e| {
+            Some((
+                e.get("sort").and_then(Value::as_i64).unwrap_or(0),
+                e.get("content").and_then(Value::as_str)?.to_string(),
+            ))
+        })
         .collect();
     items.sort_by_key(|(sort, _)| *sort);
     items.into_iter().map(|(_, c)| c).collect()
@@ -312,7 +369,11 @@ fn compact_letters(reply: &str) -> Vec<String> {
 }
 
 fn normalize(s: &str) -> String {
-    clean_html(s).to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    clean_html(s)
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Content fallback: match the reply against option content (exact normalized, else substring).
@@ -327,7 +388,11 @@ fn match_by_content(reply: &str, options: &[Value]) -> Option<String> {
             if c.is_empty() {
                 continue;
             }
-            let hit = if exact { c == r } else { r.contains(&c) || c.contains(&r) };
+            let hit = if exact {
+                c == r
+            } else {
+                r.contains(&c) || c.contains(&r)
+            };
             if hit {
                 return Some(option_id(o));
             }
@@ -336,15 +401,105 @@ fn match_by_content(reply: &str, options: &[Value]) -> Option<String> {
     None
 }
 
+/// A bare letter list ("A, C", "A C", "A、C") — every non-separator character is a letter. Prose
+/// (words) is not a list.
+fn is_letter_list(reply: &str) -> bool {
+    let t = reply.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let tokens: Vec<&str> = t
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；' | '-' | '.')
+        })
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens
+        .iter()
+        .all(|token| token.chars().count() == 1 && token.chars().all(|c| c.is_ascii_alphabetic()))
+        || (tokens.len() == 1
+            && t.chars().count() <= 8
+            && t.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// The isolated letter following the LAST "answer"-phrase mention ("answer is", "answer:", "answer",
+/// "答案") — an explicit statement usually names the intended choice. Returns only letters that were
+/// isolated in the reply.
+fn phrase_letter(reply: &str, letters: &[String]) -> Option<String> {
+    let lower = reply.to_lowercase();
+    let mut last: Option<usize> = None;
+    for marker in ["answer is", "answer:", "answer", "答案"] {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(marker) {
+            let end = from + pos + marker.len();
+            last = Some(end);
+            from = end;
+        }
+    }
+    let after = last?;
+    let bytes = reply.as_bytes();
+    let mut i = after;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_uppercase() {
+            let prev_ok = i == 0 || !(bytes[i - 1] as char).is_alphabetic();
+            let next_ok = i + 1 >= bytes.len() || !(bytes[i + 1] as char).is_alphabetic();
+            if prev_ok && next_ok {
+                let s = c.to_string();
+                if letters.contains(&s) {
+                    return Some(s);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// For a single-choice reply, reduce several isolated letters to one: an explicit "answer"-phrase
+/// letter wins; else a bare letter list keeps its FIRST valid label ("A, C"); else prose keeps the
+/// LAST valid label (the final statement usually carries the answer — an earlier article letter must
+/// not win).
+fn disambiguate_single_letters(
+    mut letters: Vec<String>,
+    reply: &str,
+    options: &[Value],
+) -> Vec<String> {
+    if letters.len() <= 1 {
+        return letters;
+    }
+    let valid = |l: &String| label_to_index(l).is_some_and(|idx| options.get(idx).is_some());
+    if let Some(letter) = phrase_letter(reply, &letters) {
+        if valid(&letter) {
+            return vec![letter];
+        }
+    }
+    if is_letter_list(reply) {
+        if let Some(first) = letters.iter().find(|l| valid(l)) {
+            return vec![first.clone()];
+        }
+    } else if let Some(last) = letters.iter().rev().find(|l| valid(l)) {
+        return vec![last.clone()];
+    }
+    letters.truncate(1);
+    letters
+}
+
 /// Parse an LLM reply into option IDs for a choice/matching subject. `single` keeps only the first.
 pub fn parse_choice_reply(reply: &str, options: &[Value], single: bool) -> Vec<String> {
     let mut letters = isolated_letters(reply);
     if letters.is_empty() {
         letters = compact_letters(reply);
     }
+    if single {
+        letters = disambiguate_single_letters(letters, reply, options);
+    }
     let mut ids: Vec<String> = Vec::new();
     for l in &letters {
-        if let Some(id) = label_to_index(l).and_then(|idx| options.get(idx)).map(option_id) {
+        if let Some(id) = label_to_index(l)
+            .and_then(|idx| options.get(idx))
+            .map(option_id)
+        {
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -369,7 +524,11 @@ pub fn parse_blanks(reply: &str, count: usize) -> Vec<String> {
     let mut parts: Vec<String> = if reply.contains("|||") {
         reply.split("|||").map(|s| s.trim().to_string()).collect()
     } else {
-        reply.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+        reply
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
     };
     if parts.is_empty() {
         parts.push(reply.trim().to_string());
@@ -393,7 +552,12 @@ pub fn blank_count(subject: &Value) -> usize {
     if markers > 0 {
         return markers;
     }
-    subject.get("correct_answers").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0).max(1)
+    subject
+        .get("correct_answers")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0)
+        .max(1)
 }
 
 fn count_blank_markers(s: &str) -> usize {
@@ -444,7 +608,10 @@ mod tests {
             {"id":"a","is_answer":false},{"id":"b","is_answer":true}]});
         let blind = json!({"id":"s2","type":"single_selection","options":[{"id":"a"},{"id":"b"}]});
         let plans = decide_paper(&[leaked, blind]);
-        assert_eq!(plans[0].decision, Decision::Replay(Answer::Options(vec!["b".into()])));
+        assert_eq!(
+            plans[0].decision,
+            Decision::Replay(Answer::Options(vec!["b".into()]))
+        );
         assert_eq!(plans[1].decision, Decision::Pending);
     }
 
@@ -458,11 +625,26 @@ mod tests {
         let blank = json!({"id":"fb","type":"fill_in_blank","correct_answers":[{"sort":1,"content":"<b>2</b>"},{"sort":0,"content":"<p>Paris</p>"}]});
         let flat = flatten_paper(&[group, skip, blank]);
         let plans = decide_paper(&flat);
-        assert_eq!(plans.iter().map(|p| p.subject_id.as_str()).collect::<Vec<_>>(), ["c1", "c2", "p", "fb"]);
-        assert_eq!(plans[0].decision, Decision::Replay(Answer::Options(vec!["t".into()])));
+        assert_eq!(
+            plans
+                .iter()
+                .map(|p| p.subject_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c1", "c2", "p", "fb"]
+        );
+        assert_eq!(
+            plans[0].decision,
+            Decision::Replay(Answer::Options(vec!["t".into()]))
+        );
         assert_eq!(plans[1].decision, Decision::Pending);
         assert_eq!(plans[2].decision, Decision::Skip);
-        assert_eq!(plans[3].decision, Decision::Replay(Answer::Blanks(vec!["<p>Paris</p>".into(), "<b>2</b>".into()])));
+        assert_eq!(
+            plans[3].decision,
+            Decision::Replay(Answer::Blanks(vec![
+                "<p>Paris</p>".into(),
+                "<b>2</b>".into()
+            ]))
+        );
     }
 
     #[test]
@@ -478,9 +660,15 @@ mod tests {
         assert_eq!(flat[0]["parent_id"], "m");
         assert_eq!(flat[0]["type"], "single_selection");
         assert_eq!(flat[0]["options"], json!([{"id":"8"},{"id":"9"}])); // options numeric-sorted, k=2
-        assert_eq!(flat[1]["options"], json!([{"id":"10"},{"id":"11","is_answer":true}]));
+        assert_eq!(
+            flat[1]["options"],
+            json!([{"id":"10"},{"id":"11","is_answer":true}])
+        );
         let plans = decide_paper(&flat);
-        assert_eq!(plans[1].decision, Decision::Replay(Answer::Options(vec!["11".into()]))); // block leak
+        assert_eq!(
+            plans[1].decision,
+            Decision::Replay(Answer::Options(vec!["11".into()]))
+        ); // block leak
         assert_eq!(plans[1].parent_id.as_deref(), Some("m"));
     }
 
@@ -499,28 +687,103 @@ mod tests {
         let o = opts.as_array().unwrap();
         let s = |a: &str| a.to_string();
         // isolated letters, multi; then single-cap.
-        assert_eq!(parse_choice_reply("A, C", o, false), ids(vec![s("o1"), s("o3")]));
+        assert_eq!(
+            parse_choice_reply("A, C", o, false),
+            ids(vec![s("o1"), s("o3")])
+        );
         assert_eq!(parse_choice_reply("A, C", o, true), ids(vec![s("o1")]));
         // prose isolated letter only ("is" lowercase; B isolated) — no leak from words.
-        assert_eq!(parse_choice_reply("The answer is B.", o, true), ids(vec![s("o2")]));
+        assert_eq!(
+            parse_choice_reply("The answer is B.", o, true),
+            ids(vec![s("o2")])
+        );
+        // A prose article must not win over the actual final answer label.
+        assert_eq!(
+            parse_choice_reply("A careful reading suggests B.", o, true),
+            ids(vec![s("o2")])
+        );
         // matching-style "1-A, 2-C".
-        assert_eq!(parse_choice_reply("1-A, 2-C", o, false), ids(vec![s("o1"), s("o3")]));
+        assert_eq!(
+            parse_choice_reply("1-A, 2-C", o, false),
+            ids(vec![s("o1"), s("o3")])
+        );
         // compact-run fallback "AC" and lowercase "b".
-        assert_eq!(parse_choice_reply("AC", o, false), ids(vec![s("o1"), s("o3")]));
+        assert_eq!(
+            parse_choice_reply("AC", o, false),
+            ids(vec![s("o1"), s("o3")])
+        );
         assert_eq!(parse_choice_reply("b", o, true), ids(vec![s("o2")]));
         // content fallback (no usable letter) → exact match "dog".
         assert_eq!(parse_choice_reply("dog", o, true), ids(vec![s("o2")]));
     }
 
     #[test]
+    fn single_prose_picks_phrase_or_last_valid_label() {
+        let opts = json!([{"id":"o1","content":"cat"},{"id":"o2","content":"dog"},{"id":"o3","content":"fish"}]);
+        let o = opts.as_array().unwrap();
+        let s = |a: &str| a.to_string();
+        // An explicit answer phrase wins over earlier letters.
+        assert_eq!(
+            parse_choice_reply("A is tempting, but the answer is C.", o, true),
+            ids(vec![s("o3")])
+        );
+        // Prose without a phrase keeps the LAST valid label (an article letter must not win).
+        assert_eq!(
+            parse_choice_reply("A careful reading suggests B.", o, true),
+            ids(vec![s("o2")])
+        );
+        // A phrase letter that is not a real option falls back to the last valid label.
+        assert_eq!(
+            parse_choice_reply("The answer is Z, though A is possible.", o, true),
+            ids(vec![s("o1")])
+        );
+        // A bare letter list still keeps the FIRST for single.
+        assert_eq!(parse_choice_reply("C, A", o, true), ids(vec![s("o3")]));
+        assert_eq!(parse_choice_reply("C A", o, true), ids(vec![s("o3")]));
+        // Multiple choice is untouched by the single-choice disambiguation.
+        assert_eq!(
+            parse_choice_reply("A careful reading suggests B.", o, false),
+            ids(vec![s("o1"), s("o2")])
+        );
+    }
+
+    #[test]
+    fn media_and_analysis_leaves_are_skipped() {
+        // Containers with sub_subjects are flattened away upstream; a media/analysis LEAF is not
+        // answerable (validate_answer agrees) and must never be handed to the LLM.
+        let plans = decide_paper(&[
+            json!({"id":"m1","type":"media"}),
+            json!({"id":"a1","type":"analysis","options":[{"id":"1"}]}),
+        ]);
+        assert_eq!(plans[0].decision, Decision::Skip);
+        assert_eq!(plans[1].decision, Decision::Skip);
+        assert_eq!(plans[0].qtype, "media");
+    }
+
+    #[test]
     fn parse_blanks_split_pad_truncate() {
-        assert_eq!(parse_blanks("Paris ||| France", 2), vec!["Paris".to_string(), "France".to_string()]);
-        assert_eq!(parse_blanks("only", 3), vec!["only".to_string(), String::new(), String::new()]);
-        assert_eq!(parse_blanks("a ||| b ||| c", 2), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            parse_blanks("Paris ||| France", 2),
+            vec!["Paris".to_string(), "France".to_string()]
+        );
+        assert_eq!(
+            parse_blanks("only", 3),
+            vec!["only".to_string(), String::new(), String::new()]
+        );
+        assert_eq!(
+            parse_blanks("a ||| b ||| c", 2),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(parse_blanks("<b>x</b>", 1), vec!["<b>x</b>".to_string()]); // verbatim HTML
-        // `|||` tolerant of spacing (no spaces / doubled spaces) → still splits.
-        assert_eq!(parse_blanks("aa|||bb", 2), vec!["aa".to_string(), "bb".to_string()]);
-        assert_eq!(parse_blanks("aa  |||  bb", 2), vec!["aa".to_string(), "bb".to_string()]);
+                                                                               // `|||` tolerant of spacing (no spaces / doubled spaces) → still splits.
+        assert_eq!(
+            parse_blanks("aa|||bb", 2),
+            vec!["aa".to_string(), "bb".to_string()]
+        );
+        assert_eq!(
+            parse_blanks("aa  |||  bb", 2),
+            vec!["aa".to_string(), "bb".to_string()]
+        );
     }
 
     #[test]
@@ -529,8 +792,17 @@ mod tests {
         assert_eq!(option_label(25), "Z");
         assert_eq!(option_label(26), "AA");
         // blank_count: answer_number wins; else full-width/variable markers; else 1.
-        assert_eq!(blank_count(&json!({"type":"fill_in_blank","answer_number":3,"content":"__"})), 3);
-        assert_eq!(blank_count(&json!({"type":"cloze","content":"____ and ＿＿ and __blank__"})), 3);
-        assert_eq!(blank_count(&json!({"type":"fill_in_blank","content":"no markers"})), 1);
+        assert_eq!(
+            blank_count(&json!({"type":"fill_in_blank","answer_number":3,"content":"__"})),
+            3
+        );
+        assert_eq!(
+            blank_count(&json!({"type":"cloze","content":"____ and ＿＿ and __blank__"})),
+            3
+        );
+        assert_eq!(
+            blank_count(&json!({"type":"fill_in_blank","content":"no markers"})),
+            1
+        );
     }
 }

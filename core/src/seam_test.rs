@@ -19,11 +19,19 @@ fn events() -> &'static Mutex<Vec<String>> {
 
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(bytes).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(bytes).into_owned());
 }
 
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
@@ -44,7 +52,10 @@ fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
 fn start_fake() -> u16 {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -80,41 +91,77 @@ fn seam_login_flow_end_to_end() {
     let data_dir = std::env::temp_dir().join(format!("tron-seam-{}", new_id()));
     let data_dir = data_dir.to_string_lossy().replace('\\', "/"); // JSON-safe path
 
-    let handle = crate::core_init(collect);
+    let handle = crate::core_init(Some(collect));
 
-    send(handle,&format!(r#"{{"id":1,"cmd":"Init","data_dir":"{data_dir}"}}"#));
+    send(
+        handle,
+        &format!(r#"{{"id":1,"cmd":"Init","data_dir":"{data_dir}"}}"#),
+    );
     assert!(wait_for(reply_ok(1), 10).is_some(), "Init should reply");
 
-    send(handle,r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#);
-    assert!(wait_for(reply_ok(2), 10).unwrap()["ok"] == true, "CreateVault ok");
+    send(
+        handle,
+        r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#,
+    );
+    assert!(
+        wait_for(reply_ok(2), 10).unwrap()["ok"] == true,
+        "CreateVault ok"
+    );
 
     // Good account → successful real-form login.
     send(
         handle,
-        &format!(r#"{{"id":3,"cmd":"AddAccount","label":"good","school":"{base}","username":"test","password":"secret"}}"#),
+        &format!(
+            r#"{{"id":3,"cmd":"AddAccount","label":"good","school":"{base}","username":"test","password":"secret"}}"#
+        ),
     );
-    assert!(wait_for(reply_ok(3), 10).unwrap()["ok"] == true, "AddAccount good ok");
+    assert!(
+        wait_for(reply_ok(3), 10).unwrap()["ok"] == true,
+        "AddAccount good ok"
+    );
     let good_id = wait_for(|_| account_id_by_label("good").is_some(), 5)
         .and_then(|_| account_id_by_label("good"))
         .expect("good account id");
-    send(handle,&format!(r#"{{"id":4,"cmd":"Login","account_id":"{good_id}"}}"#));
-    let good_login = wait_for(|v| v["event"] == "LoginResult" && v["id"] == 4, 15).expect("good LoginResult");
-    assert_eq!(good_login["ok"], true, "good creds must log in via the real form");
+    send(
+        handle,
+        &format!(r#"{{"id":4,"cmd":"Login","account_id":"{good_id}"}}"#),
+    );
+    let good_login =
+        wait_for(|v| v["event"] == "LoginResult" && v["id"] == 4, 15).expect("good LoginResult");
+    assert_eq!(
+        good_login["ok"], true,
+        "good creds must log in via the real form"
+    );
 
     // Bad account → the fake serves 200+login-page; content-based verify_session must reject it.
     send(
         handle,
-        &format!(r#"{{"id":5,"cmd":"AddAccount","label":"bad","school":"{base}","username":"test","password":"WRONG"}}"#),
+        &format!(
+            r#"{{"id":5,"cmd":"AddAccount","label":"bad","school":"{base}","username":"test","password":"WRONG"}}"#
+        ),
     );
     wait_for(reply_ok(5), 10);
     let bad_id = account_id_by_label("bad").expect("bad account id");
-    send(handle,&format!(r#"{{"id":6,"cmd":"Login","account_id":"{bad_id}"}}"#));
-    let bad_login = wait_for(|v| v["event"] == "LoginResult" && v["id"] == 6, 15).expect("bad LoginResult");
-    assert_eq!(bad_login["ok"], false, "bad creds must fail loudly (200-with-login-page is not success)");
+    send(
+        handle,
+        &format!(r#"{{"id":6,"cmd":"Login","account_id":"{bad_id}"}}"#),
+    );
+    let bad_login =
+        wait_for(|v| v["event"] == "LoginResult" && v["id"] == 6, 15).expect("bad LoginResult");
+    assert_eq!(
+        bad_login["ok"], false,
+        "bad creds must fail loudly (200-with-login-page is not success)"
+    );
 
     // Skeleton risks still hold.
-    assert!(wait_for(|v| v["event"] == "Tick", 3).is_some(), "heartbeat ticks");
-    assert!(snapshot().iter().any(|v| v["event"] == "StateChanged"), "unsolicited StateChanged");
+    assert!(
+        wait_for(|v| v["event"] == "Tick", 3).is_some(),
+        "heartbeat ticks"
+    );
+    assert!(
+        snapshot().iter().any(|v| v["event"] == "StateChanged"),
+        "unsolicited StateChanged"
+    );
 
     unsafe { crate::core_free(handle) };
 }

@@ -1,3 +1,4 @@
+using System.Collections.Specialized;
 using System.ComponentModel;
 using Microsoft.Maui.Controls.Shapes;
 
@@ -11,6 +12,12 @@ public sealed class HomePage : ContentPage
     readonly FlexLayout _accountChips = new() { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap };
     readonly VerticalStackLayout _feed = new() { Spacing = 8 };
     readonly ContentView _nextClassHost = new() { IsVisible = false };
+    readonly Ellipse _dot;
+    readonly Border _nextWhenPill;
+    readonly Label _nextWhen;
+    readonly Label _stateText;
+    readonly Button _toggle;
+    bool _attached;
 
     public HomePage(AppState state)
     {
@@ -18,40 +25,14 @@ public sealed class HomePage : ContentPage
         Title = "首頁";
 
         // --- 監控總開關卡 ---
-        var dot = Theme.Dot(Theme.DimL, Theme.DimD, 11);
-        var stateText = Theme.Strong("", 17);
-        stateText.VerticalOptions = LayoutOptions.Center;
-        var toggle = Theme.Primary("", async () =>
+        _dot = Theme.Dot(Theme.DimL, Theme.DimD, 11);
+        _stateText = Theme.Strong("", 17);
+        _stateText.VerticalOptions = LayoutOptions.Center;
+        _toggle = Theme.Primary("", async () =>
             await (state.IsMonitoring ? state.StopMonitoring() : state.StartMonitoring()));
 
-        void SyncMonitor()
-        {
-            stateText.Text = state.MonitorStateText;
-            var (l, d) = state.MonitorState switch
-            {
-                "monitoring" => (Theme.OkL, Theme.OkD),
-                "login_failed" or "offline" => (Theme.DangerL, Theme.DangerD),
-                _ => (Theme.DimL, Theme.DimD),
-            };
-            dot.SetAppTheme<Brush>(Shape.FillProperty, new SolidColorBrush(l), new SolidColorBrush(d));
-            toggle.Text = state.IsMonitoring ? "停止監控" : "開始監控";
-            toggle.IsEnabled = state.CanToggleMonitoring;
-        }
-        state.PropertyChanged += (_, a) =>
-        {
-            if (a.PropertyName is nameof(AppState.MonitorState) or nameof(AppState.CanToggleMonitoring)) SyncMonitor();
-            else if (a.PropertyName == nameof(AppState.NextClass)) BuildNextClass();
-        };
-        SyncMonitor();
-        BuildNextClass();
-
-        // Tick 心跳:狀態點微脈動(core 活著的證明)
-        state.Ticked += async () =>
-        {
-            if (!state.IsMonitoring) return;
-            await dot.ScaleToAsync(1.3, 120, Easing.CubicOut);
-            await dot.ScaleToAsync(1.0, 260, Easing.CubicIn);
-        };
+        _nextWhen = Theme.Text("", 11.5, Theme.FontSemibold, Theme.PrimL, Theme.PrimD);
+        _nextWhenPill = Theme.Pill(_nextWhen, Theme.PrimBgL, Theme.PrimBgD);
 
         var fgPill = Theme.TextPill("僅前景執行 · 螢幕關閉時暫停監控", Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD);
         fgPill.BindingContext = state.Caps;
@@ -62,22 +43,12 @@ public sealed class HomePage : ContentPage
             Spacing = 12,
             Children =
             {
-                new HorizontalStackLayout { Spacing = 8, Children = { dot, stateText } },
+                new HorizontalStackLayout { Spacing = 8, Children = { _dot, _stateText } },
                 Theme.Dim("監控開啟時,偵測到點名會自動簽到、偵測到測驗會由 LLM 備答後自動送出;有時限操作前都會先彈窗讓你介入。", 13),
-                toggle,
+                _toggle,
                 fgPill,
             },
         });
-
-        // --- 帳號摘要 chips ---
-        state.Accounts.CollectionChanged += (_, _) => { SyncAccountHooks(); BuildAccountChips(); };
-        SyncAccountHooks();
-        BuildAccountChips();
-
-        // --- 近期活動 ---
-        state.Rollcalls.CollectionChanged += (_, _) => BuildFeed();
-        state.Quizzes.CollectionChanged += (_, _) => BuildFeed();
-        BuildFeed();
 
         Content = new ScrollView
         {
@@ -98,7 +69,96 @@ public sealed class HomePage : ContentPage
             },
         };
     }
+    void SyncMonitor()
+    {
+        _stateText.Text = _state.MonitorStateText;
+        var (light, dark) = _state.MonitorState switch
+        {
+            "monitoring" => (Theme.OkL, Theme.OkD),
+            "login_failed" or "offline" => (Theme.DangerL, Theme.DangerD),
+            _ => (Theme.DimL, Theme.DimD),
+        };
+        _dot.SetAppTheme<Brush>(
+            Shape.FillProperty,
+            new SolidColorBrush(light),
+            new SolidColorBrush(dark));
+        _toggle.Text = _state.IsMonitoring ? "停止監控" : "開始監控";
+        _toggle.IsEnabled = _state.CanToggleMonitoring;
+    }
 
+    // 所有 singleton/collection 訂閱都綁頁面生命週期:離開畫面即退訂,
+    // 長命發布者(AppState/Accounts/Rollcalls/Quizzes/Ticked)不會握住本頁 → 舊頁可被 GC。
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        if (_attached) return;
+        _attached = true;
+        _state.PropertyChanged += OnStateChanged;
+        _state.Ticked += OnTicked;
+        _state.Accounts.CollectionChanged += OnAccountsChanged;
+        _state.Rollcalls.CollectionChanged += OnRollcallsChanged;
+        _state.Quizzes.CollectionChanged += OnQuizzesChanged;
+        // 每次進場都以現值同步(暫離期間可能漏掉的事件一併補上)
+        SyncMonitor();
+        BuildNextClass();
+        SyncAccountHooks();
+        BuildAccountChips();
+        BuildFeed();
+    }
+
+    protected override void OnDisappearing()
+    {
+        base.OnDisappearing();
+        if (!_attached) return;
+        _attached = false;
+        _state.PropertyChanged -= OnStateChanged;
+        _state.Ticked -= OnTicked;
+        _state.Accounts.CollectionChanged -= OnAccountsChanged;
+        _state.Rollcalls.CollectionChanged -= OnRollcallsChanged;
+        _state.Quizzes.CollectionChanged -= OnQuizzesChanged;
+        UnhookAccounts(); // 長命 AccountVm 不得握住本頁
+    }
+
+    void OnStateChanged(object? _, PropertyChangedEventArgs a)
+    {
+        if (a.PropertyName is nameof(AppState.MonitorState) or nameof(AppState.CanToggleMonitoring)) SyncMonitor();
+        else if (a.PropertyName == nameof(AppState.NextClass)) BuildNextClass();
+    }
+
+    void OnAccountsChanged(object? _, NotifyCollectionChangedEventArgs __) { SyncAccountHooks(); BuildAccountChips(); }
+    void OnRollcallsChanged(object? _, NotifyCollectionChangedEventArgs __) => BuildFeed();
+    void OnQuizzesChanged(object? _, NotifyCollectionChangedEventArgs __) => BuildFeed();
+
+    /// <summary>
+    /// 既有 Tick 心跳:更新下一堂課相對時間 + 狀態點微脈動(core 活著的證明)。
+    /// 例外全接(卸離/釋放中的視圖上動畫可能失敗);卸離後不再動畫。
+    /// </summary>
+    async void OnTicked()
+    {
+        if (!_attached) return;
+        RefreshNextClassTime();
+        if (!_state.IsMonitoring) return;
+        try
+        {
+            await _dot.ScaleToAsync(1.3, 120, Easing.CubicOut);
+            if (!_attached) return; // 卸離後不再動畫
+            await _dot.ScaleToAsync(1.0, 260, Easing.CubicIn);
+        }
+        catch (Exception)
+        {
+            // 心跳本身不可外洩例外(頁面可能正在卸離/釋放)
+        }
+    }
+
+    /// <summary>下一堂課的相對時間文字只在變化時寫入(Tick 每秒一發,文字每分鐘才變)。</summary>
+    void RefreshNextClassTime()
+    {
+        if (_state.NextClass is not { } nc || !_nextClassHost.IsVisible) return;
+        var text = NextClassWhen(nc);
+        if (_nextWhen.Text != text) _nextWhen.Text = text;
+    }
+
+    /// <summary>下一堂課卡。重建只發生在 NextClass 變動;相對時間由 Tick 原地更新(不新增 timer)。</summary>
     void BuildNextClass()
     {
         if (_state.NextClass is not { } nc)
@@ -110,7 +170,8 @@ public sealed class HomePage : ContentPage
         _nextClassHost.IsVisible = true;
         var accLabel = _state.Accounts.FirstOrDefault(a => a.Id == nc.AccountId)?.Label;
         var meta = new HorizontalStackLayout { Spacing = 8 };
-        meta.Children.Add(Theme.TextPill(nc.When, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD));
+        _nextWhen.Text = NextClassWhen(nc);
+        meta.Children.Add(_nextWhenPill);
         if (!string.IsNullOrEmpty(nc.Location)) meta.Children.Add(Centered(Theme.Dim(nc.Location, 13)));
         if (!string.IsNullOrEmpty(accLabel)) meta.Children.Add(Centered(Theme.Dim($"· {accLabel}", 13)));
         _nextClassHost.Content = Theme.Card(new VerticalStackLayout
@@ -119,6 +180,10 @@ public sealed class HomePage : ContentPage
             Children = { Theme.Section("下一堂課"), Theme.Strong(nc.Course, 16), meta },
         });
     }
+
+    /// <summary>已開始的課不得顯示「即將開始」(模型 When 對負差也回「即將開始」,這裡補正)。</summary>
+    static string NextClassWhen(NextClassVm nc) =>
+        nc.StartTime <= DateTimeOffset.Now ? "已開始" : nc.When;
 
     static Label Centered(Label l) { l.VerticalOptions = LayoutOptions.Center; return l; }
 
@@ -139,6 +204,12 @@ public sealed class HomePage : ContentPage
             a.PropertyChanged -= _accHooks[a];
             _accHooks.Remove(a);
         }
+    }
+
+    void UnhookAccounts()
+    {
+        foreach (var (a, h) in _accHooks) a.PropertyChanged -= h;
+        _accHooks.Clear();
     }
 
     void BuildAccountChips()

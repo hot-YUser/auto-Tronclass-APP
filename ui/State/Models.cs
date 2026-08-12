@@ -221,6 +221,17 @@ public sealed class RollcallAccountVm : ObservableObject
 
 // ---------------- 答題 ----------------
 
+/// <summary>
+/// 答題完成的權威述詞(純邏輯、零 UI 相依;ProtocolContract.Check 直接編譯驗證)。
+/// 只有「已送出」或 AttemptState ∈ {failed, gone} 是終端;waiting/preparing/ready/submitting
+/// 都還在路上,會持續阻擋整份測驗被標記完成。
+/// </summary>
+public static class QuizCompletion
+{
+    public static bool IsTerminal(string? attemptState, bool submitted) =>
+        submitted || attemptState is "failed" or "gone";
+}
+
 public sealed class QuizVm : ObservableObject, ICountdownVm
 {
     public required string ActivityToken { get; init; }
@@ -257,9 +268,16 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     /// 徽章字紋:答題沒有子類型,固定「測驗」。
     public string KindEmblem => "測驗";
     public string SubtitleText => $"{QuestionCount} 題 · {DetectedAtText}";
+    /// <summary>整份測驗是否已達終端:所有預期帳號都已送出、準備失敗或活動已結束。
+    /// 這是「完成」狀態與 Hero 關閉的唯一判準(waiting/preparing/ready/submitting 都會阻擋)。</summary>
+    public bool IsComplete => ExpectedAccountIds.Count > 0 &&
+        ExpectedAccountIds.All(id => PerAccount.FirstOrDefault(a => a.AccountId == id) is { } acc && acc.IsTerminal);
+
     /// 右上狀態膠囊的短標籤(顏色由畫面依 Status/衝突 決定)。
     public string StatusTag => Status switch
     {
+        // 全部失敗/已結束時不得宣稱「已送出」——誠實呈現活動結束。
+        "done" when SubmittedCount == 0 => "已結束",
         "done" => "已送出",
         "held" => "已暫緩",
         "discarded" => "已捨棄",
@@ -267,6 +285,8 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     };
     public string StatusText => Status switch
     {
+        // 全部失敗/已結束:0 個送出,不能寫「已送出 0/N」假裝成功。
+        "done" when SubmittedCount == 0 => "活動已結束 · 未送出作答",
         "done" => $"已送出 {SubmittedCount}/{PerAccount.Count}",
         "held" => "已暫緩 · 待手動送出",
         "discarded" => "已捨棄",
@@ -276,7 +296,7 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     /// <summary>某題 conflict 旗標變動後呼叫,一次刷新所有衍生的閘門/警示/狀態文字。</summary>
     public void RaiseConflictState() { Raise(nameof(AnyConflict)); Raise(nameof(ConflictCount)); Raise(nameof(CanSubmit)); Raise(nameof(HasConflicts)); Raise(nameof(ConflictText)); Raise(nameof(StatusText)); Raise(nameof(StatusTag)); }
 
-    public void RaiseProgress() { Raise(nameof(SubmittedCount)); Raise(nameof(StatusText)); Raise(nameof(SubtitleText)); }
+    public void RaiseProgress() { Raise(nameof(SubmittedCount)); Raise(nameof(StatusText)); Raise(nameof(StatusTag)); Raise(nameof(IsComplete)); Raise(nameof(SubtitleText)); }
 }
 
 public sealed class QuizAccountVm : ObservableObject
@@ -287,7 +307,7 @@ public sealed class QuizAccountVm : ObservableObject
     public string AttemptState
     {
         get => _attemptState;
-        set { if (Set(ref _attemptState, value)) Raise(nameof(ChipText)); }
+        set { if (Set(ref _attemptState, value)) { Raise(nameof(ChipText)); Raise(nameof(IsTerminal)); } }
     }
 
     public string Label { get => _label; set { if (Set(ref _label, value)) Raise(nameof(ChipText)); } }
@@ -295,9 +315,11 @@ public sealed class QuizAccountVm : ObservableObject
     public string? SubmitResult
     {
         get => _submitResult;
-        set { if (Set(ref _submitResult, value)) { Raise(nameof(Submitted)); Raise(nameof(ChipText)); } }
+        set { if (Set(ref _submitResult, value)) { Raise(nameof(Submitted)); Raise(nameof(IsTerminal)); Raise(nameof(ChipText)); } }
     }
     public bool Submitted => SubmitResult != null;
+    /// <summary>該帳號是否已到終端(送出成功,或準備失敗/活動已結束);終端之後不再阻擋整份測驗完成。</summary>
+    public bool IsTerminal => QuizCompletion.IsTerminal(AttemptState, Submitted);
     /// 列表卡的逐帳號膠囊文字。
     public string ChipText => Submitted ? $"✓ {Label}" : AttemptState switch
     {

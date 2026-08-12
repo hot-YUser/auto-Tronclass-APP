@@ -40,7 +40,8 @@ const CAPTCHA_PAGE: &str = concat!(
 );
 
 /// An enterprise-SSO page (SAML/NetIQ NAM) — detected as `SsoRedirect`, routed to the cookie fallback.
-const SSO_PAGE: &str = "<!doctype html><html><body>redirecting to nidp SAML single sign-on</body></html>";
+const SSO_PAGE: &str =
+    "<!doctype html><html><body>redirecting to nidp SAML single sign-on</body></html>";
 
 /// The form served AFTER a `/login` → `/sso/login-page` redirect: a RELATIVE action (`authenticate`),
 /// so a correct urljoin posts to `/sso/authenticate` and a base-join wrongly posts to `/authenticate`.
@@ -68,13 +69,13 @@ struct Rollcall {
     requires_coords: bool,
     location: Option<(f64, f64)>, // radar: the HIDDEN true target (never exposed via lite)
     signed: HashSet<String>,
-    hide_code: bool,   // number_code null in the roster → forces a brute-force
-    number_fatal: bool, // number answer returns 403 → the code must abort the whole round
-    throttle: u32,     // first N number answers return 429 → transient/cooldown path
+    hide_code: bool,      // number_code null in the roster → forces a brute-force
+    number_fatal: bool,   // number answer returns 403 → the code must abort the whole round
+    throttle: u32,        // first N number answers return 429 → transient/cooldown path
     number_attempts: u32, // count of number-code PUTs (test asserts read-not-brute: 1, not thousands)
-    use_beacon: bool,       // radar: lite advertises a beacon → answer must carry radarSignal
-    beacon_nonce: String,   // radar: beacon nonce fed to the radarSignal md5
-    scope_radius_m: f64,    // radar: a submitted coord within this of the target signs
+    use_beacon: bool,     // radar: lite advertises a beacon → answer must carry radarSignal
+    beacon_nonce: String, // radar: beacon nonce fed to the radarSignal md5
+    scope_radius_m: f64,  // radar: a submitted coord within this of the target signs
 }
 
 struct QuizDef {
@@ -83,27 +84,27 @@ struct QuizDef {
     course_name: String,
     source: String,
     instance_id: String,
-    subjects: Value,        // array of subject objects (real distribute shapes incl. leaks)
+    subjects: Value, // array of subject objects (real distribute shapes incl. leaks)
     per_user_papers: Value, // { user: { instance_id, subjects } } — randomized per-account paper
-    existing: Value,        // { user: { subject_id: answer_value } } → per-user prior answer
-    review: Value,          // correct_answers_data.correct_answers for the resubmit read
-    stem: String,           // homework question stem (GET /api/activities/{id})
-    vote_items: Value,      // vote: { "A": "text", ... } letter→text map
-    vote_type: String,      // vote: "single" | "multiple"
-    vote_students: Value,   // vote: [{ "user_no": "..." }] who already voted (skip if caller is in it)
+    existing: Value, // { user: { subject_id: answer_value } } → per-user prior answer
+    review: Value,   // correct_answers_data.correct_answers for the resubmit read
+    stem: String,    // homework question stem (GET /api/activities/{id})
+    vote_items: Value, // vote: { "A": "text", ... } letter→text map
+    vote_type: String, // vote: "single" | "multiple"
+    vote_students: Value, // vote: [{ "user_no": "..." }] who already voted (skip if caller is in it)
     allow_retake: bool,
     reveal: bool,
-    submitted: bool,        // once true, distribute mints a fresh (retake) instance id
+    submitted: bool, // once true, distribute mints a fresh (retake) instance id
     // --- R4 per-family detection gate fields (real list-endpoint shapes) ---
-    is_started: bool,           // exam/questionnaire/courseware: activity has opened
-    is_closed: bool,            // any: activity closed (past window)
-    has_submitted: bool,        // exam/questionnaire/homework: caller already submitted → skip
-    submit_times: i64,          // exam: max attempts (0 = unlimited)
-    submission_count: i64,      // exam: attempts used → skip when submit_times>0 && count>=submit_times
-    started_subjects_count: i64,// classroom: >=1 to be answerable (drops to 0 after 收答 closes)
-    status: String,             // vote/classroom: "start" | "end"
-    my_submission: bool,        // courseware: a non-empty my-submission → already answered, skip
-    end_time: String,           // exam: ISO-8601 UTC window end (real tenants send a string, not epoch)
+    is_started: bool,      // exam/questionnaire/courseware: activity has opened
+    is_closed: bool,       // any: activity closed (past window)
+    has_submitted: bool,   // exam/questionnaire/homework: caller already submitted → skip
+    submit_times: i64,     // exam: max attempts (0 = unlimited)
+    submission_count: i64, // exam: attempts used → skip when submit_times>0 && count>=submit_times
+    started_subjects_count: i64, // classroom: >=1 to be answerable (drops to 0 after 收答 closes)
+    status: String,        // vote/classroom: "start" | "end"
+    my_submission: bool,   // courseware: a non-empty my-submission → already answered, skip
+    end_time: String,      // exam: ISO-8601 UTC window end (real tenants send a string, not epoch)
 }
 
 /// R5: a course material (handout) the `search_course_materials` tool can read; a `.pdf` attachment is
@@ -132,17 +133,19 @@ struct FakeState {
     captcha_expected: String,
     sso_mode: bool,
     saw_radar_signal: bool, // set once a radar coord answer carried a radarSignal (beacon test)
-    expired: bool,          // R4-D: authed requests serve a 200 login page until the account re-logins
-    expire_mode: String,    // R4.1 #5: "login_page" (default) | "401" | "redirect" — how expiry manifests
-    sso_redirect: bool,     // R4-C: GET /login 302-redirects to a DIFFERENT PATH with a RELATIVE form action
-                            // (same-host; a true cross-host 302 would need a 2nd loopback port — not worth it)
-    sign_expired: bool,     // R4.1 #2: ONLY the PUT answer_* (sign) routes expire; poll/detect stay healthy
+    expired: bool, // R4-D: authed requests serve a 200 login page until the account re-logins
+    expire_mode: String, // R4.1 #5: "login_page" (default) | "401" | "redirect" — how expiry manifests
+    sso_redirect: bool, // R4-C: GET /login 302-redirects to a DIFFERENT PATH with a RELATIVE form action
+    // (same-host; a true cross-host 302 would need a 2nd loopback port — not worth it)
+    sign_expired: bool, // R4.1 #2: ONLY the PUT answer_* (sign) routes expire; poll/detect stay healthy
     sign_expire_user: String, // R4.1 #2: expire only this user's signs (empty = all) → per-account double-sign test
-    down: bool,             // R4.1 stale-offline: the poll canary gets a 503 (transient blip, NOT auth-lost)
+    down: bool, // R4.1 stale-offline: the poll canary gets a 503 (transient blip, NOT auth-lost)
 }
 
 pub async fn bind_ephemeral() -> (u16, TcpListener) {
-    let l = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    let l = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
     let port = l.local_addr().unwrap().port();
     (port, l)
 }
@@ -214,12 +217,21 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
                 LOGIN_PAGE
             }
         };
-        return html(200, &format!("Set-Cookie: csrftoken={CSRF}; Path=/\r\n"), page);
+        return html(
+            200,
+            &format!("Set-Cookie: csrftoken={CSRF}; Path=/\r\n"),
+            page,
+        );
     }
     if request_line.starts_with("GET /sso/login-page") {
-        return html(200, &format!("Set-Cookie: csrftoken={CSRF}; Path=/\r\n"), SSO_LOGIN_FORM);
+        return html(
+            200,
+            &format!("Set-Cookie: csrftoken={CSRF}; Path=/\r\n"),
+            SSO_LOGIN_FORM,
+        );
     }
-    if request_line.starts_with("POST /login") || request_line.starts_with("POST /sso/authenticate") {
+    if request_line.starts_with("POST /login") || request_line.starts_with("POST /sso/authenticate")
+    {
         let captcha_ok = {
             let st = state.lock().unwrap();
             !st.captcha_required || form_field(body, "captcha") == st.captcha_expected
@@ -231,8 +243,16 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             && captcha_ok;
         return if ok {
             // a successful (re-)login refreshes the session → clear every expiry flag.
-            { let mut st = state.lock().unwrap(); st.expired = false; st.sign_expired = false; }
-            html(200, &format!("Set-Cookie: session=sk-{username}; Path=/\r\n"), "<html>ok</html>")
+            {
+                let mut st = state.lock().unwrap();
+                st.expired = false;
+                st.sign_expired = false;
+            }
+            html(
+                200,
+                &format!("Set-Cookie: session=sk-{username}; Path=/\r\n"),
+                "<html>ok</html>",
+            )
         } else {
             html(200, "", LOGIN_PAGE) // 200-with-login-page (the false-positive trap)
         };
@@ -304,7 +324,10 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         let mut st = state.lock().unwrap();
         st.rollcalls.push(Rollcall {
             id: v["id"].as_str().unwrap_or("RC").to_string(),
-            kind: v["kind"].as_str().unwrap_or("self_registration").to_string(),
+            kind: v["kind"]
+                .as_str()
+                .unwrap_or("self_registration")
+                .to_string(),
             course: v["course"].as_str().unwrap_or("Course").to_string(),
             number_code: v["number_code"].as_str().map(str::to_string),
             attendance_rate: v["attendance_rate"].as_f64().unwrap_or(100.0),
@@ -319,14 +342,24 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             throttle: v["throttle"].as_u64().unwrap_or(0) as u32,
             number_attempts: 0,
             use_beacon: v["use_beacon"].as_bool().unwrap_or(false),
-            beacon_nonce: v["beacon_nonce"].as_str().unwrap_or("nonce-abc").to_string(),
+            beacon_nonce: v["beacon_nonce"]
+                .as_str()
+                .unwrap_or("nonce-abc")
+                .to_string(),
             scope_radius_m: v["scope_radius"].as_f64().unwrap_or(100.0),
         });
         return json(200, r#"{"ok":true}"#);
     }
-    if let Some(id) = request_line.strip_prefix("GET /_test/number_attempts/").and_then(|s| s.split_whitespace().next()) {
+    if let Some(id) = request_line
+        .strip_prefix("GET /_test/number_attempts/")
+        .and_then(|s| s.split_whitespace().next())
+    {
         let st = state.lock().unwrap();
-        let n = st.rollcalls.iter().find(|r| r.id == id).map_or(0, |r| r.number_attempts);
+        let n = st
+            .rollcalls
+            .iter()
+            .find(|r| r.id == id)
+            .map_or(0, |r| r.number_attempts);
         return json(200, &format!(r#"{{"attempts":{n}}}"#));
     }
 
@@ -345,8 +378,17 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         if !v["stream"].as_bool().unwrap_or(true) {
             if has_tool_result {
                 // Answer from the fetched material — the text after the PDF "內文）:" marker (the sentinel).
-                let tc = msgs.iter().rev().find(|m| m["role"] == "tool").and_then(|m| m["content"].as_str()).unwrap_or("");
-                let ans = tc.split("內文）:").nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| "unknown".to_string());
+                let tc = msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "tool")
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("");
+                let ans = tc
+                    .split("內文）:")
+                    .nth(1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
                 return json(200, &llm_msg(&ans));
             }
             if user_text.contains("handout") {
@@ -356,7 +398,10 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
                         "function": { "name": "search_course_materials", "arguments": "{\"query\":\"handout\"}" } }] } }] }).to_string());
             }
             // No tool needed → the SAME canned logic as the streaming path (existing tests stay green).
-            return json(200, &llm_msg(&llm_canned(&user_text, st.llm_calls, st.llm_fail_times)));
+            return json(
+                200,
+                &llm_msg(&llm_canned(&user_text, st.llm_calls, st.llm_fail_times)),
+            );
         }
 
         // Streaming (no-tools) path — a tiny SSE stream: one reasoning delta, then the answer, then [DONE].
@@ -368,7 +413,10 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         return response(200, "text/event-stream", "", &sse);
     }
     if request_line.starts_with("GET /_test/llm_calls") {
-        return json(200, &format!(r#"{{"count":{}}}"#, state.lock().unwrap().llm_calls));
+        return json(
+            200,
+            &format!(r#"{{"count":{}}}"#, state.lock().unwrap().llm_calls),
+        );
     }
     if request_line.starts_with("POST /_test/llm_fail_times") {
         let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
@@ -390,9 +438,17 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     }
     // R5: the executor GETs these (authed) — served here (no session gate needed). The document/url route
     // returns an ABSOLUTE url (built from the request Host) so the executor's reqwest GET can resolve it.
-    if let Some(uid) = request_line.strip_prefix("GET /_test/pdf/").and_then(|r| r.split_whitespace().next()) {
+    if let Some(uid) = request_line
+        .strip_prefix("GET /_test/pdf/")
+        .and_then(|r| r.split_whitespace().next())
+    {
         let st = state.lock().unwrap();
-        let sentinel = st.materials.iter().find(|m| m.pdf_upload_id == uid).map(|m| m.pdf_sentinel.clone()).unwrap_or_default();
+        let sentinel = st
+            .materials
+            .iter()
+            .find(|m| m.pdf_upload_id == uid)
+            .map(|m| m.pdf_sentinel.clone())
+            .unwrap_or_default();
         let pdf = String::from_utf8(minimal_pdf(&sentinel)).unwrap_or_default(); // minimal_pdf is pure ASCII
         return response(200, "application/pdf", "", &pdf);
     }
@@ -406,7 +462,10 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         return json(200, &state.lock().unwrap().submissions.to_string());
     }
     if request_line.starts_with("GET /_test/saw_radar_signal") {
-        return json(200, &format!(r#"{{"saw":{}}}"#, state.lock().unwrap().saw_radar_signal));
+        return json(
+            200,
+            &format!(r#"{{"saw":{}}}"#, state.lock().unwrap().saw_radar_signal),
+        );
     }
     if request_line.starts_with("GET /_test/last_llm_request") {
         return json(200, &state.lock().unwrap().last_llm_request.to_string());
@@ -446,12 +505,19 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     }
 
     // Everything below needs a session.
-    let Some(user) = user else { return html(200, "", LOGIN_PAGE) };
+    let Some(user) = user else {
+        return html(200, "", LOGIN_PAGE);
+    };
 
     if request_line.starts_with("GET /api/radar/rollcalls") {
         let st = state.lock().unwrap();
         if st.down {
-            return response(503, "application/json", "", r#"{"error":"service unavailable"}"#); // transient blip
+            return response(
+                503,
+                "application/json",
+                "",
+                r#"{"error":"service unavailable"}"#,
+            ); // transient blip
         }
         let items: Vec<String> = st.rollcalls.iter().map(rollcall_json).collect();
         return json(200, &format!(r#"{{"rollcalls":[{}]}}"#, items.join(",")));
@@ -473,22 +539,37 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     if request_line.starts_with("GET /api/courses/") && request_line.contains("/exam-list") {
         let cid = course_id_from(request_line);
         let st = state.lock().unwrap();
-        let items: Vec<Value> = st.quizzes.iter().filter(|q| q.course_id == cid && q.source == "exam")
-            .map(|q| json!({ "id": q.activity_id, "is_started": q.is_started, "is_closed": q.is_closed,
+        let items: Vec<Value> = st
+            .quizzes
+            .iter()
+            .filter(|q| q.course_id == cid && q.source == "exam")
+            .map(|q| {
+                json!({ "id": q.activity_id, "is_started": q.is_started, "is_closed": q.is_closed,
                 "is_in_progress": !q.is_closed, "has_submitted": q.has_submitted,
                 "submit_times": q.submit_times, "submission_count": q.submission_count,
-                "end_time": q.end_time, "course_name": q.course_name })).collect();
+                "end_time": q.end_time, "course_name": q.course_name })
+            })
+            .collect();
         return json(200, &json!({ "exams": items }).to_string());
     }
-    if request_line.starts_with("GET /api/courses/") && request_line.contains("/questionnaire-list") {
+    if request_line.starts_with("GET /api/courses/") && request_line.contains("/questionnaire-list")
+    {
         let cid = course_id_from(request_line);
         let st = state.lock().unwrap();
-        let items: Vec<Value> = st.quizzes.iter().filter(|q| q.course_id == cid && q.source == "questionnaire")
-            .map(|q| json!({ "id": q.activity_id, "is_started": q.is_started, "is_closed": q.is_closed,
-                "has_submitted": q.has_submitted, "course_name": q.course_name })).collect();
+        let items: Vec<Value> = st
+            .quizzes
+            .iter()
+            .filter(|q| q.course_id == cid && q.source == "questionnaire")
+            .map(|q| {
+                json!({ "id": q.activity_id, "is_started": q.is_started, "is_closed": q.is_closed,
+                "has_submitted": q.has_submitted, "course_name": q.course_name })
+            })
+            .collect();
         return json(200, &json!({ "questionnaires": items }).to_string());
     }
-    if request_line.starts_with("GET /api/courses/") && request_line.contains("/homework-activities") {
+    if request_line.starts_with("GET /api/courses/")
+        && request_line.contains("/homework-activities")
+    {
         let cid = course_id_from(request_line);
         let st = state.lock().unwrap();
         let items: Vec<Value> = st.quizzes.iter().filter(|q| q.course_id == cid && q.source == "homework")
@@ -532,8 +613,19 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     }
     if let Some(qid) = api_suffix_id(request_line, "GET", "courseware-quiz/quiz", "my-submission") {
         let st = state.lock().unwrap();
-        let done = st.quizzes.iter().any(|q| q.activity_id == qid && q.my_submission);
-        return json(200, &if done { json!({ "id": "sub-1" }) } else { Value::Null }.to_string());
+        let done = st
+            .quizzes
+            .iter()
+            .any(|q| q.activity_id == qid && q.my_submission);
+        return json(
+            200,
+            &if done {
+                json!({ "id": "sub-1" })
+            } else {
+                Value::Null
+            }
+            .to_string(),
+        );
     }
     if request_line.contains("/check-exam-qualification") {
         return json(200, r#"{"ok":true}"#);
@@ -542,7 +634,9 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     for seg in ["exams", "questionnaire", "classroom"] {
         if let Some(id) = api_suffix_id(request_line, "GET", seg, "distribute") {
             let st = state.lock().unwrap();
-            let Some(q) = st.quizzes.iter().find(|q| q.activity_id == id) else { return json(404, "{}") };
+            let Some(q) = st.quizzes.iter().find(|q| q.activity_id == id) else {
+                return json(404, "{}");
+            };
             let user_paper = q.per_user_papers.get(&user);
             let raw_subjects = user_paper
                 .and_then(|paper| paper.get("subjects"))
@@ -553,52 +647,107 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
                 .and_then(|paper| paper.get("instance_id"))
                 .and_then(Value::as_str)
                 .unwrap_or(&q.instance_id);
-            let inst = if q.submitted { format!("{base_instance}-retake") } else { base_instance.to_string() };
-            return json(200, &json!({ "exam_paper_instance_id": inst, "subjects": subjects,
+            let inst = if q.submitted {
+                format!("{base_instance}-retake")
+            } else {
+                base_instance.to_string()
+            };
+            return json(
+                200,
+                &json!({ "exam_paper_instance_id": inst, "subjects": subjects,
                 "allow_retake_exam": q.allow_retake,
-                "announce_answer": if q.reveal { "immediate" } else { "never" } }).to_string());
+                "announce_answer": if q.reveal { "immediate" } else { "never" } })
+                .to_string(),
+            );
         }
     }
     if let Some(id) = api_suffix_id(request_line, "GET", "courseware-quiz/quiz", "subjects") {
         let st = state.lock().unwrap();
-        let Some(q) = st.quizzes.iter().find(|q| q.activity_id == id) else { return json(404, "{}") };
-        return json(200, &json!({ "exam_paper_instance_id": q.instance_id, "subjects": q.subjects.clone() }).to_string());
+        let Some(q) = st.quizzes.iter().find(|q| q.activity_id == id) else {
+            return json(404, "{}");
+        };
+        return json(
+            200,
+            &json!({ "exam_paper_instance_id": q.instance_id, "subjects": q.subjects.clone() })
+                .to_string(),
+        );
     }
     if let Some(id) = api_id(request_line, "GET", "votes") {
         let st = state.lock().unwrap();
-        let (items, vtype, students) = st.quizzes.iter().find(|q| q.activity_id == id)
-            .map(|q| (q.vote_items.clone(), q.vote_type.clone(), q.vote_students.clone()))
+        let (items, vtype, students) = st
+            .quizzes
+            .iter()
+            .find(|q| q.activity_id == id)
+            .map(|q| {
+                (
+                    q.vote_items.clone(),
+                    q.vote_type.clone(),
+                    q.vote_students.clone(),
+                )
+            })
             .unwrap_or((Value::Null, "single".to_string(), Value::Null));
         // `students` = who already voted; detection skips when the caller's user_no is present.
-        return json(200, &json!({ "students": students,
-            "interaction": { "data": { "vote_option_items": items, "vote_type": vtype } } }).to_string());
+        return json(
+            200,
+            &json!({ "students": students,
+            "interaction": { "data": { "vote_option_items": items, "vote_type": vtype } } })
+            .to_string(),
+        );
     }
     // R5 material chain: attachments of a material, then a preview url for an upload id.
     if let Some(aid) = api_suffix_id(request_line, "GET", "activities", "upload_references") {
         let st = state.lock().unwrap();
-        let refs: Vec<Value> = st.materials.iter().find(|m| m.id == aid).filter(|m| !m.pdf_upload_id.is_empty())
+        let refs: Vec<Value> = st
+            .materials
+            .iter()
+            .find(|m| m.id == aid)
+            .filter(|m| !m.pdf_upload_id.is_empty())
             .map(|m| vec![json!({ "name": "handout.pdf", "upload_id": m.pdf_upload_id })])
             .unwrap_or_default();
         return json(200, &json!({ "upload_references": refs }).to_string());
     }
     if let Some(uid) = api_suffix_id(request_line, "GET", "uploads/document", "url") {
-        return json(200, &json!({ "url": format!("http://{}/_test/pdf/{uid}", host_of(full)) }).to_string());
+        return json(
+            200,
+            &json!({ "url": format!("http://{}/_test/pdf/{uid}", host_of(full)) }).to_string(),
+        );
     }
     if let Some(id) = api_id(request_line, "GET", "activities") {
         let st = state.lock().unwrap();
         if let Some(m) = st.materials.iter().find(|m| m.id == id) {
-            return json(200, &json!({ "title": m.title, "description": m.description }).to_string());
+            return json(
+                200,
+                &json!({ "title": m.title, "description": m.description }).to_string(),
+            );
         }
-        let stem = st.quizzes.iter().find(|q| q.activity_id == id).map(|q| q.stem.clone()).unwrap_or_default();
+        let stem = st
+            .quizzes
+            .iter()
+            .find(|q| q.activity_id == id)
+            .map(|q| q.stem.clone())
+            .unwrap_or_default();
         return json(200, &json!({ "description": stem }).to_string());
     }
     // review (exam submissions/{sid}) → correct_answers_data.correct_answers
     if request_line.starts_with("GET /api/exams/") && request_line.contains("/submissions/") {
         let id = path_seg(request_line, "/api/exams/");
         let st = state.lock().unwrap();
-        let arr = st.quizzes.iter().find(|q| q.activity_id == id)
-            .map(|q| if q.review.is_array() { q.review.clone() } else { json!([]) }).unwrap_or(json!([]));
-        return json(200, &json!({ "correct_answers_data": { "correct_answers": arr } }).to_string());
+        let arr = st
+            .quizzes
+            .iter()
+            .find(|q| q.activity_id == id)
+            .map(|q| {
+                if q.review.is_array() {
+                    q.review.clone()
+                } else {
+                    json!([])
+                }
+            })
+            .unwrap_or(json!([]));
+        return json(
+            200,
+            &json!({ "correct_answers_data": { "correct_answers": arr } }).to_string(),
+        );
     }
     // --- submit endpoints (record the last body; classroom rejects a flat body) ---
     if let Some(id) = api_suffix_id(request_line, "POST", "exams", "submissions") {
@@ -609,23 +758,37 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             st.submissions = json!({});
         }
         st.submissions[&user] = v;
-        let (retake, sid) = st.quizzes.iter_mut().find(|q| q.activity_id == id)
-            .map(|q| { q.submitted = true; (q.allow_retake, format!("sub-{user}")) })
+        let (retake, sid) = st
+            .quizzes
+            .iter_mut()
+            .find(|q| q.activity_id == id)
+            .map(|q| {
+                q.submitted = true;
+                (q.allow_retake, format!("sub-{user}"))
+            })
             .unwrap_or((false, format!("sub-{user}")));
-        return json(200, &json!({ "submission_id": sid, "allow_retake_exam": retake }).to_string());
+        return json(
+            200,
+            &json!({ "submission_id": sid, "allow_retake_exam": retake }).to_string(),
+        );
     }
     if api_suffix_id(request_line, "POST", "questionnaire", "submissions").is_some()
         || api_suffix_id(request_line, "POST", "courseware-quiz/quiz", "submissions").is_some()
         || api_suffix_id(request_line, "POST", "course/activities", "submissions").is_some()
-        || api_id(request_line, "POST", "votes").map(|_| request_line.contains("/vote")).unwrap_or(false)
+        || api_id(request_line, "POST", "votes")
+            .map(|_| request_line.contains("/vote"))
+            .unwrap_or(false)
     {
-        state.lock().unwrap().last_submission = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
+        state.lock().unwrap().last_submission =
+            serde_json::from_str(body.trim()).unwrap_or(Value::Null);
         return json(200, r#"{"ok":true}"#);
     }
     if request_line.starts_with("POST /api/classroom/") && request_line.contains("/submit/") {
         let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
         // Flat body (no exam wrapper) → 400; the wrapper is required per subject.
-        if v.get("exam_paper_instance_id").is_none() || !v.get("subjects").map(|s| s.is_array()).unwrap_or(false) {
+        if v.get("exam_paper_instance_id").is_none()
+            || !v.get("subjects").map(|s| s.is_array()).unwrap_or(false)
+        {
             return json(400, r#"{"error":"classroom flat body rejected"}"#);
         }
         state.lock().unwrap().last_submission = v;
@@ -633,7 +796,10 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
     }
 
     // --- teacher QR: source the portable data ---
-    if request_line.starts_with("POST /api/course/") && request_line.contains("/rollcall") && !request_line.contains("qr_code") {
+    if request_line.starts_with("POST /api/course/")
+        && request_line.contains("/rollcall")
+        && !request_line.contains("qr_code")
+    {
         return json(200, r#"{"rollcall_id":"teacher-qr-1"}"#);
     }
     if request_line.contains("/qr_code") {
@@ -645,7 +811,10 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
 
     // --- current user (for user_no capture) ---
     if request_line.starts_with("GET /api/user") {
-        return json(200, &format!(r#"{{"user_no":"{user}","user_id":"{user}"}}"#));
+        return json(
+            200,
+            &format!(r#"{{"user_no":"{user}","user_id":"{user}"}}"#),
+        );
     }
 
     // --- per-rollcall reads/answers (real contract: object roster of strings) ---
@@ -667,10 +836,13 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         // Real lite carries NO target coordinate (radar.rs §1) — only beacon metadata.
         let st = state.lock().unwrap();
         return match st.rollcalls.iter().find(|r| r.id == id) {
-            Some(r) => json(200, &format!(
-                r#"{{"rollcall_id":"{}","use_beacon":{},"beacon_nonce":"{}"}}"#,
-                r.id, r.use_beacon, r.beacon_nonce
-            )),
+            Some(r) => json(
+                200,
+                &format!(
+                    r#"{{"rollcall_id":"{}","use_beacon":{},"beacon_nonce":"{}"}}"#,
+                    r.id, r.use_beacon, r.beacon_nonce
+                ),
+            ),
             None => json(200, "{}"),
         };
     }
@@ -686,7 +858,9 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             // healthy), so the SIGN path is what discovers the dead session. Per-user for the double-sign test.
             {
                 let st = state.lock().unwrap();
-                if st.sign_expired && (st.sign_expire_user.is_empty() || st.sign_expire_user == user) {
+                if st.sign_expired
+                    && (st.sign_expire_user.is_empty() || st.sign_expire_user == user)
+                {
                     return html(200, "", LOGIN_PAGE);
                 }
             }
@@ -701,21 +875,44 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
 /// plus the caller's own entry, and a top-level status that is `on_call_fine` only when present==total.
 fn student_rollcalls_body(r: &Rollcall, user: &str) -> String {
     let present_syn = (r.attendance_rate.round() as i64).clamp(0, 100);
-    let code_json = if r.hide_code { "null".to_string() } else { json_str_or_null(&r.number_code) };
+    let code_json = if r.hide_code {
+        "null".to_string()
+    } else {
+        json_str_or_null(&r.number_code)
+    };
     let mut entries: Vec<String> = (0..100)
         .map(|i| {
-            let status = if (i as i64) < present_syn { "on_call_fine" } else { "in_progress" };
-            format!(r#"{{"user_no":"c{i}","rollcall_status":"{status}","number_code":{code_json}}}"#)
+            let status = if (i as i64) < present_syn {
+                "on_call_fine"
+            } else {
+                "in_progress"
+            };
+            format!(
+                r#"{{"user_no":"c{i}","rollcall_status":"{status}","number_code":{code_json}}}"#
+            )
         })
         .collect();
     // The caller's OWN entry — reflects their sign, so my_present is testable apart from top-level.
     let me_fine = r.signed.contains(user);
-    let me_status = if me_fine { "on_call_fine" } else { "in_progress" };
-    entries.push(format!(r#"{{"user_no":"{user}","rollcall_status":"{me_status}","number_code":{code_json}}}"#));
+    let me_status = if me_fine {
+        "on_call_fine"
+    } else {
+        "in_progress"
+    };
+    entries.push(format!(
+        r#"{{"user_no":"{user}","rollcall_status":"{me_status}","number_code":{code_json}}}"#
+    ));
     let present = present_syn as usize + if me_fine { 1 } else { 0 };
     let total = entries.len(); // 101
-    let top = if present == total { "on_call_fine" } else { "in_progress" };
-    format!(r#"{{"status":"{top}","rollcallStatus":"{top}","student_rollcalls":[{}]}}"#, entries.join(","))
+    let top = if present == total {
+        "on_call_fine"
+    } else {
+        "in_progress"
+    };
+    format!(
+        r#"{{"status":"{top}","rollcallStatus":"{top}","student_rollcalls":[{}]}}"#,
+        entries.join(",")
+    )
 }
 
 /// Apply a student answer; sign the user when the answer is correct for the type.
@@ -725,7 +922,9 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
     if kind == "radar" && body.contains("radarSignal") {
         st.saw_radar_signal = true; // beacon test: the answer carried a radarSignal
     }
-    let Some(r) = st.rollcalls.iter_mut().find(|r| r.id == id) else { return json(404, "{}") };
+    let Some(r) = st.rollcalls.iter_mut().find(|r| r.id == id) else {
+        return json(404, "{}");
+    };
 
     // number: real servers return distinguishable codes + a body success flag (docs 30 classifier).
     if kind == "number" {
@@ -760,16 +959,22 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
         {
             let dist = crate::radar::haversine(
                 crate::radar::GeoPoint { lat, lon },
-                crate::radar::GeoPoint { lat: tlat, lon: tlng },
+                crate::radar::GeoPoint {
+                    lat: tlat,
+                    lon: tlng,
+                },
             );
             if dist <= r.scope_radius_m {
                 r.signed.insert(user.to_string());
                 return json(200, r#"{"success":true}"#);
             }
             // Out of scope → HTTP 200 + nested error envelope (radar.rs §1: 200-with-error_code).
-            return json(200, &format!(
-                r#"{{"error_code":"radar_out_of_rollcall_scope","data":{{"distance":{dist}}}}}"#
-            ));
+            return json(
+                200,
+                &format!(
+                    r#"{{"error_code":"radar_out_of_rollcall_scope","data":{{"distance":{dist}}}}}"#
+                ),
+            );
         }
         return json(200, r#"{"ok":true}"#);
     }
@@ -789,7 +994,13 @@ fn rollcall_json(r: &Rollcall) -> String {
     let f = |k: &str| if r.kind == k { "true" } else { "false" };
     format!(
         r#"{{"rollcall_id":"{}","id":"{}","course_name":"{}","is_number":{},"is_radar":{},"is_self_registration":{},"unsupported_qrcode":{}}}"#,
-        r.id, r.id, r.course, f("number"), f("radar"), f("self_registration"), f("qrcode")
+        r.id,
+        r.id,
+        r.course,
+        f("number"),
+        f("radar"),
+        f("self_registration"),
+        f("qrcode")
     )
 }
 
@@ -840,7 +1051,12 @@ fn merge_existing(subjects: &Value, existing: &Value, user: &str) -> Value {
     let mut arr = subjects.as_array().cloned().unwrap_or_default();
     if let Some(uex) = existing.get(user) {
         for s in arr.iter_mut() {
-            let sid = s.get("subject_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or("").to_string();
+            let sid = s
+                .get("subject_id")
+                .or_else(|| s.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if let Some(ans) = uex.get(&sid) {
                 if let Some(opts) = ans.get("options") {
                     s["student_answer_option_ids"] = opts.clone();
@@ -874,7 +1090,10 @@ fn session_user(full: &str) -> Option<String> {
     let lower = full.to_lowercase();
     let idx = lower.find("session=sk-")?;
     let after = &full[idx + "session=sk-".len()..];
-    let user: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+    let user: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
     if user.is_empty() {
         None
     } else {
@@ -896,7 +1115,6 @@ fn json_str_or_null(s: &Option<String>) -> String {
     }
 }
 
-
 /// A minimal, VALID single-page PDF whose text layer is `text` (correct byte-offset xref so `pdf-extract`
 /// parses it). `text` must not contain `(`/`)` (unescaped PDF string delimiters). Used to prove the R5
 /// executor→pdf-extract→answer chain end-to-end.
@@ -916,11 +1134,17 @@ pub fn minimal_pdf(text: &str) -> Vec<u8> {
         pdf.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
     }
     let xref_pos = pdf.len();
-    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+    pdf.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objs.len() + 1
+    ));
     for off in &offsets {
         pdf.push_str(&format!("{off:010} 00000 n \n"));
     }
-    pdf.push_str(&format!("trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref_pos}\n%%EOF", objs.len() + 1));
+    pdf.push_str(&format!(
+        "trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref_pos}\n%%EOF",
+        objs.len() + 1
+    ));
     pdf.into_bytes()
 }
 
@@ -929,7 +1153,11 @@ pub fn minimal_pdf(text: &str) -> Vec<u8> {
 fn llm_user_text(msgs: &[Value]) -> String {
     match msgs.get(1).map(|m| &m["content"]) {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" "),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
     }
 }

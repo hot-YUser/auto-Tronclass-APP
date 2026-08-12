@@ -1,3 +1,4 @@
+using System.Collections.Specialized;
 using Microsoft.Maui.Controls.Shapes;
 
 namespace Ui;
@@ -5,18 +6,20 @@ namespace Ui;
 /// <summary>點名列表:進行中與近期紀錄(合併後一活動一列,新的在最上)。</summary>
 public sealed class RollcallListPage : ContentPage
 {
+    readonly AppState _state;
+    readonly EmptyState _empty;
+    bool _attached;
+
     public RollcallListPage(AppState state)
     {
+        _state = state;
         Title = "點名";
 
         var host = new VerticalStackLayout { Spacing = 10 };
         BindableLayout.SetItemsSource(host, state.Rollcalls);
         BindableLayout.SetItemTemplate(host, new DataTemplate(() => new RollcallRow()));
 
-        var empty = new EmptyState("尚無點名紀錄", "開始監控後,偵測到的點名會即時出現在這裡,並保留為紀錄。");
-        void SyncEmpty() => empty.IsVisible = state.Rollcalls.Count == 0;
-        state.Rollcalls.CollectionChanged += (_, _) => SyncEmpty();
-        SyncEmpty();
+        _empty = new EmptyState("尚無點名紀錄", "開始監控後,偵測到的點名會即時出現在這裡,並保留為紀錄。");
 
         Content = new ScrollView
         {
@@ -24,10 +27,32 @@ public sealed class RollcallListPage : ContentPage
             {
                 Padding = 16,
                 Spacing = 12,
-                Children = { new StatusBanner(state), empty, host },
+                Children = { new StatusBanner(state), _empty, host },
             },
         };
     }
+
+    // singleton 訂閱綁頁面生命週期:離開畫面即退訂(長命 Rollcalls 不握住本頁)。
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        if (_attached) return;
+        _attached = true;
+        _state.Rollcalls.CollectionChanged += OnRollcallsChanged;
+        SyncEmpty();
+    }
+
+    protected override void OnDisappearing()
+    {
+        base.OnDisappearing();
+        if (!_attached) return;
+        _attached = false;
+        _state.Rollcalls.CollectionChanged -= OnRollcallsChanged;
+    }
+
+    void OnRollcallsChanged(object? _, NotifyCollectionChangedEventArgs __) => SyncEmpty();
+
+    void SyncEmpty() => _empty.IsVisible = _state.Rollcalls.Count == 0;
 }
 
 /// <summary>紀錄卡:類型徽章 + 課程 + 狀態膠囊 + meta(類型·時間·簽到率) + 逐帳號簽到 chips + 迷你倒數。</summary>

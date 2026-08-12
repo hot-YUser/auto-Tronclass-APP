@@ -39,6 +39,9 @@
 		<ApplicationId>com.autotronclass.app</ApplicationId>
 
 		<!-- Versions -->
+		<!-- 本地開發預設值；正式發行由 tools/release.ps1 依嚴格 SemVer tag 以 -p: 覆寫
+		     ApplicationVersion(Android versionCode)/ApplicationDisplayVersion(Android versionName)
+		     並以 aapt/FileVersionInfo 驗證產物，不得手改後依賴 release 沿用。 -->
 		<ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
 		<ApplicationVersion>11</ApplicationVersion>
 

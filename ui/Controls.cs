@@ -75,6 +75,17 @@ public sealed class ChipsView : ContentView
 
     void Rebuild()
     {
+        // 先解除並移除「已不在集合裡」的 item hooks(與 UnhookAll 同一路徑):集合縮減時,
+        // 長命 VM 不被本視圖握住、也不再因它的 PropertyChanged 白做重建(hooks 有界)。
+        var present = new HashSet<object>(_items.Cast<object>());
+        foreach (var (npc, h) in _hooks.ToList())
+            if (!present.Contains(npc))
+            {
+                npc.PropertyChanged -= h;
+                _hooks.Remove(npc);
+            }
+
+        // 再訂閱新面孔
         foreach (var obj in _items)
             if (obj is INotifyPropertyChanged npc && !_hooks.ContainsKey(npc))
             {

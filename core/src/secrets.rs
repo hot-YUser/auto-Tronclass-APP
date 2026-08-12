@@ -65,7 +65,10 @@ pub struct AccountSecret {
 impl AccountSecret {
     /// Transfer ownership without leaving an additional copy for Drop to wipe.
     pub fn into_parts(mut self) -> (String, String) {
-        (std::mem::take(&mut self.password), std::mem::take(&mut self.cookies))
+        (
+            std::mem::take(&mut self.password),
+            std::mem::take(&mut self.cookies),
+        )
     }
 }
 
@@ -106,7 +109,12 @@ impl VaultFile {
             key.zeroize();
             return Err(error.to_string());
         }
-        let vault = VaultFile { path: path.to_path_buf(), salt, key: Some(key), data: BTreeMap::new() };
+        let vault = VaultFile {
+            path: path.to_path_buf(),
+            salt,
+            key: Some(key),
+            data: BTreeMap::new(),
+        };
         vault.persist_new()?;
         Ok(vault)
     }
@@ -130,7 +138,14 @@ impl VaultFile {
         salt.copy_from_slice(&bytes[..SALT_LEN]);
         let nonce = &bytes[SALT_LEN..SALT_LEN + NONCE_LEN];
         let ciphertext = &bytes[SALT_LEN + NONCE_LEN..];
-        Self::open_with_key(path, salt, key, nonce, ciphertext, "stored key does not match vault")
+        Self::open_with_key(
+            path,
+            salt,
+            key,
+            nonce,
+            ciphertext,
+            "stored key does not match vault",
+        )
     }
 
     /// Shared decrypt+parse for both unlock paths. `salt`/`key` are already recovered; `err` is the
@@ -153,14 +168,21 @@ impl VaultFile {
         };
         let data = match serde_json::from_slice(&plaintext) {
             Ok(data) => data,
-            Err(error) => {
+            // Fixed message, never the serde literal: the plaintext IS secrets (passwords, cookies,
+            // the LLM key), and serde's "invalid type: string \"<value>\"" would echo them verbatim.
+            Err(_) => {
                 plaintext.zeroize();
                 key.zeroize();
-                return Err(error.to_string());
+                return Err("vault data corrupt".into());
             }
         };
         plaintext.zeroize();
-        Ok(VaultFile { path: path.to_path_buf(), salt, key: Some(key), data })
+        Ok(VaultFile {
+            path: path.to_path_buf(),
+            salt,
+            key: Some(key),
+            data,
+        })
     }
 
     fn sealed_bytes(&self) -> Result<Vec<u8>, String> {
@@ -196,6 +218,7 @@ impl VaultFile {
     }
 
     pub fn get(&self, account_id: &str) -> Option<AccountSecret> {
+        self.key.as_ref()?;
         self.data.get(account_id).cloned()
     }
 
@@ -224,10 +247,19 @@ impl VaultFile {
     }
 
     // The LLM API key rides in a reserved vault entry (never in config/logs).
-    pub fn set_llm_key(&mut self, key: String) -> Result<(), String> {
-        self.set(LLM_KEY_ID, AccountSecret { password: key, cookies: String::new() })
+    pub fn set_llm_key(&mut self, mut key: String) -> Result<(), String> {
+        let result = self.set(
+            LLM_KEY_ID,
+            AccountSecret {
+                password: std::mem::take(&mut key),
+                cookies: String::new(),
+            },
+        );
+        key.zeroize(); // whatever remains after the take — the value is now owned by the map
+        result
     }
     pub fn get_llm_key(&self) -> Option<String> {
+        self.key.as_ref()?;
         self.data
             .get(LLM_KEY_ID)
             .map(|secret| secret.password.clone())
@@ -238,6 +270,13 @@ impl VaultFile {
         if let Some(mut key) = self.key.take() {
             key.zeroize();
         }
+        // Locking must also destroy the decrypted plaintext map, or a locked vault (e.g. after
+        // Shutdown) would still hand out secrets through a stale reference.
+        for secret in self.data.values_mut() {
+            secret.password.zeroize();
+            secret.cookies.zeroize();
+        }
+        self.data.clear();
     }
 }
 
@@ -267,8 +306,8 @@ pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
         // Another initializer won the race. Its complete key is authoritative; never replace it.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             key.zeroize();
-            let mut bytes = std::fs::read(key_path)
-                .map_err(|e| format!("read raced device key: {e}"))?;
+            let mut bytes =
+                std::fs::read(key_path).map_err(|e| format!("read raced device key: {e}"))?;
             let result = parse_device_key(&bytes);
             bytes.zeroize();
             result
@@ -347,11 +386,12 @@ mod tests {
 
     #[test]
     fn decodes_strict_32_byte_device_key_base64() {
-        let decoded = decode_device_key_base64(
-            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
-        )
-        .unwrap();
-        assert_eq!(decoded, std::array::from_fn::<_, 32, _>(|index| index as u8));
+        let decoded =
+            decode_device_key_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+        assert_eq!(
+            decoded,
+            std::array::from_fn::<_, 32, _>(|index| index as u8)
+        );
 
         for malformed in [
             "",
@@ -361,6 +401,95 @@ mod tests {
         ] {
             assert!(decode_device_key_base64(malformed).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn locked_vault_reads_are_unavailable_and_plaintext_cleared() {
+        let dir = std::env::temp_dir().join(format!("tron-vault-lock-{}", crate::config::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [9u8; 32];
+        let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
+        vault
+            .set(
+                "acc",
+                AccountSecret {
+                    password: "pw-secret".into(),
+                    cookies: "ck-secret".into(),
+                },
+            )
+            .unwrap();
+        vault.set_llm_key("llm-secret".into()).unwrap();
+        assert!(vault.get("acc").is_some());
+        assert_eq!(vault.get_llm_key().as_deref(), Some("llm-secret"));
+
+        vault.lock();
+
+        assert!(
+            vault.get("acc").is_none(),
+            "locked vault must never serve plaintext secrets"
+        );
+        assert!(
+            vault.get_llm_key().is_none(),
+            "locked vault must never serve the LLM key"
+        );
+        assert!(
+            vault.data.is_empty(),
+            "lock must clear the decrypted plaintext map"
+        );
+        assert!(
+            vault
+                .set(
+                    "acc",
+                    AccountSecret {
+                        password: "x".into(),
+                        cookies: String::new()
+                    }
+                )
+                .is_err(),
+            "locked vault must not accept writes"
+        );
+        assert!(vault.set_llm_key("y".into()).is_err());
+        assert!(
+            vault.delete("acc").is_ok(),
+            "delete on a locked vault is a no-op"
+        );
+        assert!(vault.get("acc").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupt_vault_plaintext_error_never_echoes_decrypted_content() {
+        let dir = std::env::temp_dir().join(format!("tron-vault-echo-{}", crate::config::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [0x5au8; 32];
+        let path = dir.join("vault.bin");
+        drop(VaultFile::create_with_key(&path, key).unwrap());
+
+        // Replace the ciphertext with an encryption of a plaintext whose serde error literal would
+        // echo it verbatim ("invalid type: string \"VAULT-SECRET-ECHO\", expected a map ...").
+        let mut raw = std::fs::read(&path).unwrap();
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let mut payload = b"\"VAULT-SECRET-ECHO\"".to_vec();
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&raw[SALT_LEN..SALT_LEN + NONCE_LEN]),
+                payload.as_ref(),
+            )
+            .unwrap();
+        payload.zeroize();
+        raw.truncate(SALT_LEN + NONCE_LEN);
+        raw.extend_from_slice(&ciphertext);
+        std::fs::write(&path, &raw).unwrap();
+
+        let error = VaultFile::unlock_with_key(&path, key)
+            .err()
+            .expect("corrupt vault must fail to unlock");
+        assert!(
+            !error.contains("VAULT-SECRET-ECHO"),
+            "vault parse error must not echo decrypted content: {error}"
+        );
+        assert_eq!(error, "vault data corrupt");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

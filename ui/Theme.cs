@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Maui.Controls.Shapes;
 
 namespace Ui;
@@ -134,10 +135,27 @@ public static class Theme
     }
 
     // ---------- 按鈕 ----------
+
+    // 每個控件各自持有一個 busy 旗標(closure 綁控件實例,非全域):連點/重入只在第一次觸發時
+    // 執行,其餘忽略 → 不會雙 Push、不會雙送。例外一律進安全可見提示(AppState.Notify → Toast),
+    // 不從 async void 事件外洩(否則整個程序崩潰)。
+    static void WireButton(Button b, Func<Task> onTap)
+    {
+        var busy = false;
+        b.Clicked += async (_, _) =>
+        {
+            if (busy) return;
+            busy = true;
+            try { await onTap(); }
+            catch (Exception error) { ReportActionError(error); }
+            finally { busy = false; }
+        };
+    }
+
     public static Button Primary(string text, Func<Task> onTap)
     {
         var b = new Button { Text = text }; // 隱式樣式已給主色底/圓角
-        b.Clicked += async (_, _) => await onTap();
+        WireButton(b, onTap);
         return b;
     }
 
@@ -146,7 +164,7 @@ public static class Theme
         var b = new Button { Text = text, BackgroundColor = Colors.Transparent, BorderWidth = 1 };
         b.Themed(Button.TextColorProperty, PrimL, PrimD);
         b.Themed(Button.BorderColorProperty, LineL, LineD);
-        b.Clicked += async (_, _) => await onTap();
+        WireButton(b, onTap);
         return b;
     }
 
@@ -155,7 +173,7 @@ public static class Theme
         var b = new Button { Text = text, BackgroundColor = Colors.Transparent, BorderWidth = 1 };
         b.Themed(Button.TextColorProperty, DangerL, DangerD);
         b.Themed(Button.BorderColorProperty, LineL, LineD);
-        b.Clicked += async (_, _) => await onTap();
+        WireButton(b, onTap);
         return b;
     }
 
@@ -164,15 +182,44 @@ public static class Theme
     {
         var b = new Button { Text = text, BackgroundColor = Colors.Transparent, BorderWidth = 0, Padding = new Thickness(8, 4), MinimumHeightRequest = 36, MinimumWidthRequest = 36 };
         b.Themed(Button.TextColorProperty, DimL, DimD);
-        b.Clicked += async (_, _) => await onTap();
+        WireButton(b, onTap);
         return b;
     }
 
     public static void OnTap(this View v, Func<Task> onTap)
     {
         var g = new TapGestureRecognizer();
-        g.Tapped += async (_, _) => await onTap();
+        var busy = false;
+        g.Tapped += async (_, _) =>
+        {
+            if (busy) return;
+            busy = true;
+            try { await onTap(); }
+            catch (Exception error) { ReportActionError(error); }
+            finally { busy = false; }
+        };
         v.GestureRecognizers.Add(g);
+    }
+
+    /// <summary>
+    /// 按鈕/手勢 handler 的例外統一轉成既有 Toast 通道(安全可見),絕不吞。
+    /// 取 AppState 失敗(關閉中/無 DI)時也只能放棄——不能再從這裡拋例外。
+    /// </summary>
+    static void ReportActionError(Exception error)
+    {
+        try
+        {
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                try
+                {
+                    var services = Application.Current?.Handler?.MauiContext?.Services;
+                    services?.GetService<AppState>()?.Notify("error", $"操作失敗:{error.Message}");
+                }
+                catch { /* 通知通道本身失敗;原始例外已在呼叫端處理 */ }
+            });
+        }
+        catch { /* 關閉中的 App 可能已無法 dispatch */ }
     }
 
     /// <summary>

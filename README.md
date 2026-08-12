@@ -68,7 +68,7 @@ Rust core（登入、持久化、監控、點名、測驗、LLM、redaction）
 
 ## 從原始碼建置與測試
 
-需求：Rust stable、可用的 .NET SDK（目前專案 target .NET 11 preview）、Windows MAUI workload；Android 建置另需 Android SDK/NDK、JDK 及對應 workload。工具鏈路徑可用環境變數指定，請勿把金鑰寫入腳本或提交。
+需求：PowerShell 7.4+（發版腳本 `#requires`）、Rust 1.97.1（root `rust-toolchain.toml` 固定，rustup 自動採用）、可用的 .NET SDK（目前專案 target .NET 11 preview；`tools/release.ps1` 開頭會 gate SDK 必須是 11.0.100-preview feature band）、Windows MAUI workload；Android 建置另需 Android SDK/NDK（只接受 major 27，`build-core.ps1` 解析 `source.properties` 檢查）、JDK 及對應 workload。工具鏈路徑可用環境變數指定，請勿把金鑰寫入腳本或提交。
 
 ```powershell
 # Rust 核心單元/整合測試與 lint
@@ -87,13 +87,17 @@ dotnet build ui/Ui.csproj -f net11.0-android -c Debug
 
 # 發行流程：測試、雙 head、產物 hash/簽章/smoke gate
 ./tools/release.ps1 -Tag v2.0.0-alpha.XX
+# 只驗算版本（DisplayVersion/versionCode/Windows 數值版本），不建置：
+./tools/release.ps1 -Tag v2.0.0-alpha.XX -ValidateOnly
 ```
 
-`tools/release.ps1` 需要 Android 簽章資訊與私有 keystore 才能做完整 APK 發行；私鑰不在 Repository。若只做 Windows 開發驗證，可依腳本參數跳過 Android，但跳過的 head 不得被當成完整雙平台發行證據。`tools/checks/DeviceKey.Check` 是無第三方依賴的 Windows 裝置金鑰/遷移 runnable check；CI 也應執行它與協定 contract check。
+`tools/release.ps1` 需要 Android 簽章資訊與私有 keystore 才能做完整 APK 發行；私鑰不在 Repository。若只做 Windows 開發驗證，可依腳本參數跳過 Android，但跳過的 head 不得被當成完整雙平台發行證據。`tools/checks/DeviceKey.Check` 是無第三方依賴的 Windows 裝置金鑰/遷移 runnable check；CI 與發版也會執行協定 contract check（`ProtocolContract.Check`）與設定頁未儲存編輯保護檢查（`UiSettings.Check`）。
+
+發版閘：git 工作樹必須乾淨（尊重 .gitignore）、`-Tag` 必須是嚴格 SemVer（`v?M.m.p[-alpha|beta|rc.N]`）並由共享公式計算 DisplayVersion／Android versionCode／Windows 數值版本（不依賴 Ui.csproj 手動版本欄位）；預設不要求 git tag 已存在，`-RequireTaggedHead` 才驗證 tag 指向 HEAD。CI 的 Windows job 會以 `v0.0.0-alpha.0` 跑一次 unsigned release dry-run（簽章密鑰不進 CI）。
 
 ## 發行驗證與簽章
 
-正式產物必須由 `tools/release.ps1` 產生並通過：Rust test/clippy、native marker（hash/mtime）、Windows publish native hash、隔離資料 smoke test、APK `apksigner verify`、APK 內兩個 ABI 的 native hash 比對，以及完整資產存在性檢查。未通過任何一項都不應發布。
+正式產物必須由 `tools/release.ps1` 產生並通過：Rust test/clippy、native marker（hash/mtime）、Windows publish native hash、隔離資料 smoke test、APK `apksigner verify`、APK 內兩個 ABI 的 native hash 比對，以及完整資產存在性檢查。腳本另以 `aapt` 核對 APK 的 versionName/versionCode、以 `FileVersionInfo` 核對 Windows `Ui.exe` 的 File/ProductVersion，並產出 `build-metadata.json`（tag/版本/commit/工具鏈）與 `SHA256SUMS.txt`。未通過任何一項都不應發布。
 
 目前公開 Android 憑證指紋固定為：
 
@@ -104,9 +108,9 @@ Subject: CN=Auto TronClass, OU=Dev, O=hot-YUser, C=TW
 
 指紋只驗證公開憑證，不包含私鑰。若要輪替簽章金鑰，必須在獨立變更中更新 `tools/android-signing.json`、發布說明與升級策略；不能以環境變數靜默改成另一把未審查的金鑰。
 
-## 審查與目前限制
+## 目前限制
 
-第一輪審查的逐項結論已由第二輪審查承接、並在 alpha.11 全部封閉；審查文件已完成任務、不隨 repo 維護（可自 git 歷史取得）。目前限制請以本 README 與實際發行 gate 為準：沒有證據的 DeepSeek/Kimi 反駁、以及報告中未交付的 A–E 命題，都保持 `unverified`，不會被寫成共識。
+Windows 目前是前景程序模型；關閉視窗就停止監控，不提供 tray／背景常駐。Android 的前景服務仍受系統時限與程序生命週期約束。完整 Android release 另依賴本機私有 keystore 與密碼配對，這些秘密不在 Repository，因此 CI 只驗證未簽 Windows 發行路徑。
 
 ## 授權
 

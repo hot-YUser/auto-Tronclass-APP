@@ -4,11 +4,11 @@
 //! data dir. A school is just a `base_url`; every endpoint derives from it. The user can still add
 //! their own school in-UI or type a raw base_url (which `resolve` passes through verbatim).
 
+use crate::atomic_file;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use crate::atomic_file;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct School {
@@ -49,7 +49,8 @@ impl Registry {
             }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let registry = Registry::factory();
-                let bytes = serde_json::to_vec_pretty(&registry).map_err(|error| error.to_string())?;
+                let bytes =
+                    serde_json::to_vec_pretty(&registry).map_err(|error| error.to_string())?;
                 atomic_file::create_new(path, &bytes)
                     .map_err(|error| format!("無法建立 providers.json：{error}"))?;
                 Ok(registry)
@@ -68,7 +69,8 @@ impl Registry {
         self.schools
             .iter()
             .find(|s| {
-                s.key.to_lowercase() == needle || s.aliases.iter().any(|a| a.to_lowercase() == needle)
+                s.key.to_lowercase() == needle
+                    || s.aliases.iter().any(|a| a.to_lowercase() == needle)
             })
             .map(|s| s.base_url.clone())
     }
@@ -87,7 +89,12 @@ pub struct Endpoints {
 
 impl Endpoints {
     pub fn derive(base_url: &str) -> Endpoints {
-        Endpoints { base: base_url.trim_end_matches('/').to_string() }
+        Endpoints {
+            base: base_url.trim_end_matches('/').to_string(),
+        }
+    }
+    pub fn base_url(&self) -> &str {
+        &self.base
     }
     pub fn login_page(&self) -> String {
         format!("{}/login", self.base)
@@ -106,11 +113,17 @@ impl Endpoints {
     }
     /// courseware: generic activities list, filtered to `type=="material"`, then the quizzes chain.
     pub fn course_activities(&self, cid: &str) -> String {
-        format!("{}/api/courses/{cid}/activities?page=1&page_size=200", self.base)
+        format!(
+            "{}/api/courses/{cid}/activities?page=1&page_size=200",
+            self.base
+        )
     }
     /// exam family list (real endpoint; `exams` key). v1 sends `conditions=` + page params.
     pub fn course_exam_list(&self, cid: &str) -> String {
-        format!("{}/api/courses/{cid}/exam-list?conditions=&page=1&page_size=50", self.base)
+        format!(
+            "{}/api/courses/{cid}/exam-list?conditions=&page=1&page_size=50",
+            self.base
+        )
     }
     pub fn course_questionnaire_list(&self, cid: &str) -> String {
         format!("{}/api/courses/{cid}/questionnaire-list", self.base)
@@ -126,10 +139,16 @@ impl Endpoints {
     }
     /// courseware: per-material quiz list, then the quiz's my-submission (skip when already answered).
     pub fn courseware_quizzes(&self, activity_id: &str) -> String {
-        format!("{}/api/courseware-quiz/activity/{activity_id}/quizzes", self.base)
+        format!(
+            "{}/api/courseware-quiz/activity/{activity_id}/quizzes",
+            self.base
+        )
     }
     pub fn courseware_my_submission(&self, quiz_id: &str) -> String {
-        format!("{}/api/courseware-quiz/quiz/{quiz_id}/my-submission", self.base)
+        format!(
+            "{}/api/courseware-quiz/quiz/{quiz_id}/my-submission",
+            self.base
+        )
     }
 
     // --- exam (docs 31) ---
@@ -155,10 +174,16 @@ impl Endpoints {
     }
     /// R5 course-material tool: a material's file attachments, and a preview URL for an upload id.
     pub fn upload_references(&self, activity_id: &str) -> String {
-        format!("{}/api/activities/{activity_id}/upload_references", self.base)
+        format!(
+            "{}/api/activities/{activity_id}/upload_references",
+            self.base
+        )
     }
     pub fn upload_document_url(&self, upload_id: &str) -> String {
-        format!("{}/api/uploads/document/{upload_id}/url?preview=true", self.base)
+        format!(
+            "{}/api/uploads/document/{upload_id}/url?preview=true",
+            self.base
+        )
     }
     pub fn exam_submissions(&self, eid: &str) -> String {
         format!("{}/api/exams/{eid}/submissions", self.base)
@@ -178,10 +203,16 @@ impl Endpoints {
         format!("{}/api/courseware-quiz/quiz/{id}/submissions", self.base)
     }
     pub fn classroom_submit(&self, activity_id: &str, subject_id: &str) -> String {
-        format!("{}/api/classroom/{activity_id}/submit/{subject_id}", self.base)
+        format!(
+            "{}/api/classroom/{activity_id}/submit/{subject_id}",
+            self.base
+        )
     }
     pub fn homework_submissions(&self, activity_id: &str) -> String {
-        format!("{}/api/course/activities/{activity_id}/submissions", self.base)
+        format!(
+            "{}/api/course/activities/{activity_id}/submissions",
+            self.base
+        )
     }
     pub fn questionnaire_submissions(&self, activity_id: &str) -> String {
         format!("{}/api/questionnaire/{activity_id}/submissions", self.base)
@@ -199,7 +230,10 @@ impl Endpoints {
         format!("{}/api/rollcall/{id}/answer?api_version=1.76", self.base)
     }
     pub fn answer_self_registration(&self, id: &str) -> String {
-        format!("{}/api/rollcall/{id}/answer_self_registration_rollcall", self.base)
+        format!(
+            "{}/api/rollcall/{id}/answer_self_registration_rollcall",
+            self.base
+        )
     }
     pub fn answer_qr(&self, id: &str) -> String {
         format!("{}/api/rollcall/{id}/answer_qr_rollcall", self.base)

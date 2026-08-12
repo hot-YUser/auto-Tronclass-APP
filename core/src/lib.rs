@@ -68,10 +68,24 @@ mod live_test;
 use engine::Core;
 
 /// Start the core. `cb` is invoked (from runtime worker threads) with UTF-8 JSON event
-/// bytes that are valid only for the duration of each call. Returns an opaque handle.
+/// bytes that are valid only for the duration of each call. Returns an opaque handle; a null
+/// `cb` (or a runtime build failure) yields a null handle, which the host must treat as
+/// core-unavailable.
 #[no_mangle]
-pub extern "C" fn core_init(cb: extern "C" fn(*const u8, usize)) -> *mut c_void {
-    Box::into_raw(engine::init(cb)) as *mut c_void
+pub extern "C" fn core_init(cb: Option<extern "C" fn(*const u8, usize)>) -> *mut c_void {
+    // `Option<extern fn>` is a nullable function pointer in the C ABI. A panic here (e.g. runtime
+    // build failure) must never unwind across C — null is the only failure signal a host can consume.
+    // (The fn type is written literally, not as the EventCb alias, so csbindgen keeps emitting the
+    // same `delegate*` C# signature — Option<fn> has no C# annotation.)
+    std::panic::catch_unwind(|| match cb {
+        Some(cb) => engine::init(cb)
+            .ok()
+            .map(|core| Box::into_raw(core) as *mut c_void),
+        None => None,
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// Send one UTF-8 JSON command. Returns immediately; results arrive via the callback.
@@ -86,7 +100,14 @@ pub unsafe extern "C" fn core_send(handle: *mut c_void, json_ptr: *const u8, jso
     }
     let core = &*(handle as *const Core);
     let bytes = std::slice::from_raw_parts(json_ptr, json_len);
-    engine::send(core, bytes);
+    // Rust panics must never unwind across the C ABI (release profile unwinds, so this catch is
+    // real). On a caught panic the awaiting command is completed with a FIXED error — the input is
+    // never echoed back (it may carry secrets).
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine::send(core, bytes)));
+    if result.is_err() {
+        engine::panic_reply(core, bytes);
+    }
 }
 
 /// Free the handle and shut down its runtime. The handle must not be used afterwards.
@@ -98,5 +119,8 @@ pub unsafe extern "C" fn core_free(handle: *mut c_void) {
     if handle.is_null() {
         return;
     }
-    drop(Box::from_raw(handle as *mut Core));
+    // Dropping the runtime must not unwind across C either.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(Box::from_raw(handle as *mut Core));
+    }));
 }

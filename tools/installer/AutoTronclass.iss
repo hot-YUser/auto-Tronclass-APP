@@ -1,7 +1,8 @@
 ; ═══════════════════════════════════════════════════════════════════════════════════════════
 ; 自動 Tronclass — Inno Setup 安裝檔（per-user、完全免系統管理員/UAC、免在系統裝任何憑證）。
-; 由 release.ps1 呼叫 ISCC 建置，三個 /D 定義帶入：
+; 由 release.ps1 呼叫 ISCC 建置，四個 /D 定義帶入：
 ;   /DMyAppVersion=<tag>   例 v2.0.0-alpha.6（也決定輸出檔名）
+;   /DMyVersionInfoVersion=<major.minor.patch.rev>（數值版本；tag 帶 v/前置字元不適合當 VersionInfo）
 ;   /DPubDir=<publish>     self-contained 發佈資料夾（與 portable 同來源，但不含 .portable 標記）
 ;   /DOutDir=<dist>        setup.exe 產出位置
 ; 未簽章 → 首次執行會有 SmartScreen「不明發行者」提示（按「仍要執行」即可，不涉及任何憑證）。
@@ -9,6 +10,9 @@
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0-dev"
+#endif
+#ifndef MyVersionInfoVersion
+  #define MyVersionInfoVersion "0.0.0.0"
 #endif
 #ifndef PubDir
   #error 需以 /DPubDir=<self-contained 發佈資料夾> 呼叫
@@ -22,6 +26,8 @@
 AppId={{7E9C2B14-3A6D-4F82-9C0E-1D5A8B7F4C33}
 AppName=自動 Tronclass
 AppVersion={#MyAppVersion}
+; 數值版本由 release.ps1 依共享公式傳入（MyAppVersion 帶 v/前置字元，不適合當 VersionInfo）。
+VersionInfoVersion={#MyVersionInfoVersion}
 AppPublisher=hot-YUser
 AppPublisherURL=https://github.com/hot-YUser/auto-Tronclass-APP
 ; ── per-user：裝到 %LOCALAPPDATA%\Programs，完全免 UAC ──

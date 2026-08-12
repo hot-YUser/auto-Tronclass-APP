@@ -16,10 +16,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(b).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -40,7 +48,11 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
 fn account_id(label: &str) -> Option<String> {
     for ev in snapshot().iter().rev() {
         if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"].as_array()?.iter().find(|a| a["label"] == label) {
+            if let Some(a) = ev["accounts"]
+                .as_array()?
+                .iter()
+                .find(|a| a["label"] == label)
+            {
                 return a["id"].as_str().map(str::to_string);
             }
         }
@@ -50,7 +62,10 @@ fn account_id(label: &str) -> Option<String> {
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -70,7 +85,11 @@ fn post(base: &str, path: &str, body: &str) {
     http(base, &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body));
 }
 fn get_json(base: &str, path: &str) -> Value {
-    serde_json::from_str(&http(base, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))).unwrap_or(Value::Null)
+    serde_json::from_str(&http(
+        base,
+        &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    ))
+    .unwrap_or(Value::Null)
 }
 struct Harness {
     h: *mut std::ffi::c_void,
@@ -89,28 +108,56 @@ impl Drop for Harness {
 }
 fn boot(tag: &str, base: &str) -> (Harness, String) {
     events().lock().unwrap().clear();
-    let mut hz = Harness { h: crate::core_init(collect), id: 0 };
-    let dir = std::env::temp_dir().join(format!("tron-r3b-{tag}-{}", new_id())).to_string_lossy().replace('\\', "/");
+    let mut hz = Harness {
+        h: crate::core_init(Some(collect)),
+        id: 0,
+    };
+    let dir = std::env::temp_dir()
+        .join(format!("tron-r3b-{tag}-{}", new_id()))
+        .to_string_lossy()
+        .replace('\\', "/");
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"llm_endpoint":"{base}/v1/chat/completions"}}}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"llm_endpoint":"{base}/v1/chat/completions"}}}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let dave = account_id("dave").unwrap();
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     wait_for(reply_ok(i), 15);
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
     (hz, dave)
 }
 
@@ -124,11 +171,24 @@ fn llm_request_body_contract() {
     // A pending short_answer (no leak) forces an LLM call.
     let quiz = r#"{"activity_id":"Q1","course_id":"C1","source":"exam","subjects":[{"id":"s1","type":"short_answer","content":"why is the sky blue?"}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted" && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let req = get_json(&base, "/_test/last_llm_request");
-    assert!(req.get("chat_template_kwargs").is_none(), "generic endpoint received NVIDIA thinking_mode: {req}");
-    assert!(req.get("top_k").is_none(), "generic endpoint received NVIDIA top_k: {req}");
-    assert_eq!(req["messages"][0]["role"], "system", "first message must be the system prompt");
+    assert!(
+        req.get("chat_template_kwargs").is_none(),
+        "generic endpoint received NVIDIA thinking_mode: {req}"
+    );
+    assert!(
+        req.get("top_k").is_none(),
+        "generic endpoint received NVIDIA top_k: {req}"
+    );
+    assert_eq!(
+        req["messages"][0]["role"], "system",
+        "first message must be the system prompt"
+    );
     drop(hz);
 }
 
@@ -145,9 +205,19 @@ fn mc_letters_map_to_option_ids() {
         {"id":"s1","type":"multiple_selection","content":"pick two",
          "options":[{"id":"o1","content":"alpha"},{"id":"o2","content":"beta"},{"id":"o3","content":"gamma"}]}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "MC1" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted"
+            && v["quiz_id"] == "MC1"
+            && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let sub = get_json(&base, "/_test/last_submission");
-    assert_eq!(sub["subjects"][0]["answer_option_ids"], serde_json::json!(["o1", "o2"]), "A,B → first two option ids, got {sub}");
+    assert_eq!(
+        sub["subjects"][0]["answer_option_ids"],
+        serde_json::json!(["o1", "o2"]),
+        "A,B → first two option ids, got {sub}"
+    );
     drop(hz);
 }
 
@@ -162,9 +232,19 @@ fn multi_blank_fill_splits_to_answers() {
     let quiz = r#"{"activity_id":"BL1","course_id":"C1","source":"exam","subjects":[
         {"id":"s1","type":"fill_in_blank","answer_number":2,"content":"__ and __"}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "BL1" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted"
+            && v["quiz_id"] == "BL1"
+            && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let sub = get_json(&base, "/_test/last_submission");
-    assert_eq!(sub["subjects"][0]["answers"], serde_json::json!([{"sort":0,"content":"aa"},{"sort":1,"content":"bb"}]), "multi-blank split, got {sub}");
+    assert_eq!(
+        sub["subjects"][0]["answers"],
+        serde_json::json!([{"sort":0,"content":"aa"},{"sort":1,"content":"bb"}]),
+        "multi-blank split, got {sub}"
+    );
     drop(hz);
 }
 
@@ -178,10 +258,20 @@ fn single_vote_casts_one_letter() {
     let quiz = r#"{"activity_id":"VT1","course_id":"C1","source":"vote","vote_type":"single",
         "vote_items":{"A":"apple","B":"banana"}}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "VT1" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted"
+            && v["quiz_id"] == "VT1"
+            && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let sub = get_json(&base, "/_test/last_submission");
     let votes = sub["votes"].as_array().expect("votes array");
-    assert_eq!(votes.len(), 1, "single vote casts exactly one letter, got {sub}");
+    assert_eq!(
+        votes.len(),
+        1,
+        "single vote casts exactly one letter, got {sub}"
+    );
     assert_eq!(votes[0], "A", "capped to the first letter");
     drop(hz);
 }

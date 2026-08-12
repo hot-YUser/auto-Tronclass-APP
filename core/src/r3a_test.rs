@@ -16,10 +16,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(b).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -40,7 +48,11 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
 fn account_id(label: &str) -> Option<String> {
     for ev in snapshot().iter().rev() {
         if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"].as_array()?.iter().find(|a| a["label"] == label) {
+            if let Some(a) = ev["accounts"]
+                .as_array()?
+                .iter()
+                .find(|a| a["label"] == label)
+            {
                 return a["id"].as_str().map(str::to_string);
             }
         }
@@ -50,7 +62,10 @@ fn account_id(label: &str) -> Option<String> {
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -70,7 +85,11 @@ fn post(base: &str, path: &str, body: &str) {
     http(base, &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body));
 }
 fn last_submission(base: &str) -> Value {
-    serde_json::from_str(&http(base, "GET /_test/last_submission HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")).unwrap_or(Value::Null)
+    serde_json::from_str(&http(
+        base,
+        "GET /_test/last_submission HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    ))
+    .unwrap_or(Value::Null)
 }
 struct Harness {
     h: *mut std::ffi::c_void,
@@ -90,28 +109,56 @@ impl Drop for Harness {
 /// Boot one account monitoring, LLM pointed at the fake; returns (harness, base, account_id).
 fn boot(tag: &str, base: &str) -> (Harness, String) {
     events().lock().unwrap().clear();
-    let mut hz = Harness { h: crate::core_init(collect), id: 0 };
-    let dir = std::env::temp_dir().join(format!("tron-r3a-{tag}-{}", new_id())).to_string_lossy().replace('\\', "/");
+    let mut hz = Harness {
+        h: crate::core_init(Some(collect)),
+        id: 0,
+    };
+    let dir = std::env::temp_dir()
+        .join(format!("tron-r3a-{tag}-{}", new_id()))
+        .to_string_lossy()
+        .replace('\\', "/");
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"llm_endpoint":"{base}/v1/chat/completions"}}}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"llm_endpoint":"{base}/v1/chat/completions"}}}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let dave = account_id("dave").unwrap();
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     wait_for(reply_ok(i), 15);
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
     (hz, dave)
 }
 
@@ -124,10 +171,22 @@ fn fill_submits_sort_content_objects() {
     let quiz = r#"{"activity_id":"FILL1","course_id":"C1","source":"exam",
         "subjects":[{"id":"s1","type":"fill_in_blank","content":"cap __ of __","correct_answers":[{"sort":0,"content":"Paris"},{"sort":1,"content":"France"}]}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "FILL1" && v["account_id"].as_str() == Some(&dave), 25).is_some(), "submitted");
+    assert!(
+        wait_for(
+            |v| v["event"] == "QuizSubmitted"
+                && v["quiz_id"] == "FILL1"
+                && v["account_id"].as_str() == Some(&dave),
+            25
+        )
+        .is_some(),
+        "submitted"
+    );
     let sub = last_submission(&base);
     let ans = &sub["subjects"][0]["answers"][0];
-    assert!(ans["sort"].is_number(), "fill answers must be [{{sort,content}}] objects, got {sub}");
+    assert!(
+        ans["sort"].is_number(),
+        "fill answers must be [{{sort,content}}] objects, got {sub}"
+    );
     assert_eq!(ans["content"], "Paris");
     drop(hz);
 }
@@ -143,12 +202,25 @@ fn matching_flattens_and_submits_parent_id() {
         {"id":"m","type":"matching","sub_subjects":[{"id":"L1"},{"id":"L2"}],
          "options":[{"id":"o1"},{"id":"o2"},{"id":"o3","is_answer":true},{"id":"o4"}]}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "MAT1" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted"
+            && v["quiz_id"] == "MAT1"
+            && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let subs = last_submission(&base);
     let arr = subs["subjects"].as_array().expect("subjects");
-    let l2 = arr.iter().find(|s| s["subject_id"] == "L2").expect("L2 submitted as its own subject");
+    let l2 = arr
+        .iter()
+        .find(|s| s["subject_id"] == "L2")
+        .expect("L2 submitted as its own subject");
     assert_eq!(l2["parent_id"], "m", "matching sub carries parent_id");
-    assert_eq!(l2["answer_option_ids"], serde_json::json!(["o3"]), "L2's block is_answer leak replayed");
+    assert_eq!(
+        l2["answer_option_ids"],
+        serde_json::json!(["o3"]),
+        "L2's block is_answer leak replayed"
+    );
     drop(hz);
 }
 
@@ -169,14 +241,31 @@ fn resubmit_overlay_review_wins_and_gate() {
             {"subject_id":"s1","answer_option_ids":["o2","GHOST"]},
             {"subject_id":"s2","answers":[{"sort":3,"content":"RIGHT"}]}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "RS1" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted"
+            && v["quiz_id"] == "RS1"
+            && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let sub = last_submission(&base); // the RESUBMIT body (awaited before QuizSubmitted)
-    assert_eq!(sub["exam_paper_instance_id"], "inst-1-retake", "resubmit targets the fresh retake instance");
+    assert_eq!(
+        sub["exam_paper_instance_id"], "inst-1-retake",
+        "resubmit targets the fresh retake instance"
+    );
     let arr = sub["subjects"].as_array().unwrap();
     let s1 = arr.iter().find(|s| s["subject_id"] == "s1").unwrap();
-    assert_eq!(s1["answer_option_ids"], serde_json::json!(["o2"]), "review wins; cross-block GHOST discarded");
+    assert_eq!(
+        s1["answer_option_ids"],
+        serde_json::json!(["o2"]),
+        "review wins; cross-block GHOST discarded"
+    );
     let s2 = arr.iter().find(|s| s["subject_id"] == "s2").unwrap();
-    assert_eq!(s2["answers"], serde_json::json!([{"sort":3,"content":"RIGHT"}]), "review blank wins with raw sort");
+    assert_eq!(
+        s2["answers"],
+        serde_json::json!([{"sort":3,"content":"RIGHT"}]),
+        "review blank wins with raw sort"
+    );
     drop(hz);
 }
 
@@ -191,8 +280,17 @@ fn no_resubmit_when_not_retakeable() {
         "subjects":[{"id":"s1","type":"single_selection","options":[{"id":"o1"},{"id":"o2"}]}],
         "review":[{"subject_id":"s1","answer_option_ids":["o2"]}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(|v| v["event"] == "QuizSubmitted" && v["quiz_id"] == "NR1" && v["account_id"].as_str() == Some(&dave), 25).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "QuizSubmitted"
+            && v["quiz_id"] == "NR1"
+            && v["account_id"].as_str() == Some(&dave),
+        25
+    )
+    .is_some());
     let sub = last_submission(&base);
-    assert_eq!(sub["exam_paper_instance_id"], "inst-1", "no retake instance → resubmit did NOT fire");
+    assert_eq!(
+        sub["exam_paper_instance_id"], "inst-1",
+        "no retake instance → resubmit did NOT fire"
+    );
     drop(hz);
 }

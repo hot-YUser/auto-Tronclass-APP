@@ -44,10 +44,12 @@ name = "fake_tronclass"
 required-features = ["fakeserver"]
 
 # 信條：小巧＝一般情況的最高宗旨，只有「真衝突」才讓給速度/清晰。此核心 I/O-bound，
-# opt-z 對速度無實質衝突 → 選最小的 z。strip/lto/panic=abort 不犧牲速度也能縮小；panic 不跨 FFI 故 abort 正確。
+# opt-z 對速度無實質衝突 → 選最小的 z。strip/lto 不犧牲速度也能縮小。
+# panic 必須是 unwind：FFI 三入口用 catch_unwind 攔截，不讓 panic 跨 C ABI（panic=abort 會讓
+# catch_unwind 失效、任何內部 panic 直接殺掉整個 MAUI 程序）。unwinding 表的代價由 strip/lto 抵銷。
 [profile.release]
 opt-level = "z"     # 最小；I/O-bound 核心 opt-z 對速度無實質衝突 → 小巧優先
 lto = true          # link-time optimization：速度與大小通常都更好
 codegen-units = 1   # 更佳最佳化、更小
 strip = true        # 去除符號
-panic = "abort"     # 無 unwinding 表 → 更小、且 panic 不跨 FFI 故 abort 正確
+panic = "unwind"    # FFI seam 的 catch_unwind 需要 unwinding（見上）

@@ -4,10 +4,21 @@
 //! `reasoning_content` field, and only the **clean final answer** is returned. The API key comes
 //! from the vault and never enters a log.
 
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 pub type EventCb = extern "C" fn(*const u8, usize);
+
+/// Per-chunk read-idle timeout for LLM responses: a slow-but-chunked reasoning stream must never be
+/// cut by a total deadline, but a server that stops sending bytes must not hold the answer flow
+/// forever. There is deliberately NO short total-request timeout on the LLM client.
+const READ_IDLE: Duration = Duration::from_secs(180);
+/// Hard cap for a non-streaming chat-completions body (max_tokens-bounded completions are far below).
+const MAX_LLM_BODY: usize = 64 * 1024 * 1024;
+/// Hard cap for accumulated streaming content (a runaway/broken stream must not fill memory; a
+/// truncated answer is worse than none, so overflow degrades to `None` → the subject is re-asked).
+const MAX_STREAM_CONTENT: usize = 8 * 1024 * 1024;
 
 pub struct LlmConfig {
     pub endpoint: String,
@@ -37,6 +48,20 @@ pub fn resolve_max_tokens(configured: u32) -> u32 {
     } else {
         configured
     }
+}
+
+/// The LLM's own client, separate from the account (school) client: COOKIE-LESS — school session
+/// cookies must never reach the model endpoint — with a connect timeout and NO total-request
+/// deadline (long reasoning streams are bounded per-chunk by `READ_IDLE` in the read loops instead).
+/// Redirects are disabled: besides making bearer-token forwarding policy explicit, this prevents a
+/// tenant-supplied cross-origin image URL from redirecting the shared fetch client into a literal
+/// private address. Model providers should expose their final API endpoint directly.
+pub fn build_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("llm client: {error}"))
 }
 
 /// All events cross the seam through the single audited redaction pass (docs 90 §4).
@@ -143,9 +168,12 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], stream: bool, tools: 
 /// turns on a re-ask). Prepends the system prompt. Returns the clean answer text, or `None` on
 /// failure/empty (caller must then skip the subject — never blank). With `tools` set, runs the
 /// non-streaming tool-calling loop (course-material lookup); otherwise the streaming path (R3b).
+/// `llm_client` is the cookie-less LLM client; `school` is the account's authed client used ONLY
+/// for same-origin course-material fetches inside the tool loop — the two must never be conflated.
 #[allow(clippy::too_many_arguments)]
 pub async fn answer_question(
-    client: &Client,
+    llm_client: &Client,
+    school: &Client,
     cfg: &LlmConfig,
     messages: &[Value],
     cb: EventCb,
@@ -162,24 +190,51 @@ pub async fn answer_question(
     let mut full = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
     full.extend(messages.iter().cloned());
     match tools {
-        Some(ctx) => tool_loop(client, cfg, full, cb, activity_token, account_id, subject_id, ctx).await,
-        None => stream_answer(client, cfg, full, cb, activity_token, account_id, subject_id).await,
+        Some(ctx) => {
+            tool_loop(
+                llm_client,
+                school,
+                cfg,
+                full,
+                cb,
+                activity_token,
+                account_id,
+                subject_id,
+                ctx,
+            )
+            .await
+        }
+        None => {
+            stream_answer(
+                llm_client,
+                cfg,
+                full,
+                cb,
+                activity_token,
+                account_id,
+                subject_id,
+                READ_IDLE,
+            )
+            .await
+        }
     }
 }
 
 /// The R3b streaming path (no tools): SSE, reasoning streamed delta-by-delta as `ReasoningChunk`.
+#[allow(clippy::too_many_arguments)]
 async fn stream_answer(
-    client: &Client,
+    llm_client: &Client,
     cfg: &LlmConfig,
     full: Vec<Value>,
     cb: EventCb,
     activity_token: &str,
     account_id: &str,
     subject_id: &str,
+    idle: Duration,
 ) -> Option<String> {
     let body = build_request_body(cfg, &full, true, false);
 
-    let mut resp = client
+    let mut resp = llm_client
         .post(&cfg.endpoint)
         .bearer_auth(&cfg.api_key)
         .json(&body)
@@ -193,8 +248,15 @@ async fn stream_answer(
     // Parse the SSE stream incrementally with Response::chunk() (no futures-stream dependency).
     let mut pending = String::new();
     let mut content = String::new();
-    while let Ok(Some(bytes)) = resp.chunk().await {
-        pending.push_str(&String::from_utf8_lossy(&bytes));
+    // `[DONE]` must terminate the OUTER read loop: a compliant server closes the stream right after,
+    // but a slow one may keep the connection open — breaking only the line loop would hang forever.
+    'stream: loop {
+        let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break, // stream ended
+            _ => return None, // read-idle hit or transport failure → never answer from a partial stream
+        };
+        pending.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(nl) = pending.find('\n') {
             let line: String = pending.drain(..=nl).collect();
             let line = line.trim();
@@ -203,7 +265,7 @@ async fn stream_answer(
             };
             let data = data.trim();
             if data == "[DONE]" {
-                break;
+                break 'stream;
             }
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
@@ -219,6 +281,9 @@ async fn stream_answer(
             }
             if let Some(c) = delta.get("content").and_then(Value::as_str) {
                 content.push_str(c);
+                if content.len() > MAX_STREAM_CONTENT {
+                    return None; // runaway stream — truncated content must never be submitted as an answer
+                }
             }
         }
     }
@@ -232,10 +297,12 @@ async fn stream_answer(
 /// R5 tool-calling loop (non-streaming): the model may call `search_course_materials`; we run the
 /// executor, feed the result back, and loop. Bounded by `max_iterations + 2` so a final-answer turn
 /// always follows the last tool round. Each turn emits ONE `ReasoningChunk`; never raises — degrades to
-/// the last clean content.
+/// the last clean content. `school` is the account's authed client, used ONLY for the course-material
+/// executor (same-origin school API); the model endpoint itself is hit with the cookie-less `llm_client`.
 #[allow(clippy::too_many_arguments)]
 async fn tool_loop(
-    client: &Client,
+    llm_client: &Client,
+    school: &Client,
     cfg: &LlmConfig,
     mut messages: Vec<Value>,
     cb: EventCb,
@@ -247,7 +314,7 @@ async fn tool_loop(
     let mut fallback = String::new();
     for _ in 0..ctx.max_iterations + 2 {
         let body = build_request_body(cfg, &messages, false, true);
-        let resp = match client
+        let mut resp = match llm_client
             .post(&cfg.endpoint)
             .bearer_auth(&cfg.api_key)
             .json(&body)
@@ -257,7 +324,11 @@ async fn tool_loop(
             Ok(r) if r.status().is_success() => r,
             _ => return clean_or(&fallback),
         };
-        let Ok(v) = resp.json::<Value>().await else {
+        let bytes = match read_llm_body(&mut resp).await {
+            Some(bytes) => bytes,
+            None => return None, // read-idle/oversize → no answer this round; the caller re-asks
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             return clean_or(&fallback);
         };
         let msg = &v["choices"][0]["message"];
@@ -299,7 +370,7 @@ async fn tool_loop(
                             })
                             .unwrap_or_default();
                         crate::course_context::search_course_materials(
-                            client,
+                            school,
                             ctx.base_url,
                             ctx.course_id,
                             &query,
@@ -317,6 +388,25 @@ async fn tool_loop(
     }
     // Hit the cap → the last clean content (never blank if we ever saw one).
     clean_or(&fallback)
+}
+
+/// Read a full chat-completions body with per-chunk read-idle timeout and a hard size cap.
+/// `None` on idle/oversize/transport failure — a silent model endpoint must never hold the answer
+/// flow forever, and a truncated body must never be parsed as a complete answer.
+async fn read_llm_body(resp: &mut Response) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(READ_IDLE, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                if out.len() + chunk.len() > MAX_LLM_BODY {
+                    return None;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(Ok(None)) => return Some(out),
+            _ => return None,
+        }
+    }
 }
 
 /// The last clean content, or `None` if we never got any (caller then skips the subject).
@@ -376,7 +466,9 @@ fn strip_think(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request_body, strip_think, LlmConfig};
+    use super::{
+        answer_question, build_client, build_request_body, stream_answer, strip_think, LlmConfig,
+    };
     use serde_json::json;
 
     fn config(endpoint: &str) -> LlmConfig {
@@ -440,6 +532,168 @@ mod tests {
         assert!(stream.get("tools").is_none());
         assert!(tools["tools"].is_array());
         assert_eq!(tools["tool_choice"], "auto");
+    }
+
+    extern "C" fn noop_cb(_: *const u8, _: usize) {}
+
+    /// A one-shot HTTP server that writes `body` after reading the request. `keep_open` keeps the
+    /// connection alive after the body (a slow server) instead of closing it.
+    async fn raw_server(body: Vec<u8>, keep_open: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            if keep_open {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn sse_done_terminates_the_outer_read_loop() {
+        // A slow-but-compliant server sends the final `[DONE]` then KEEPS the connection open.
+        // Breaking only the line loop would hang on the next chunk(); `[DONE]` must end the whole
+        // read so the answer is returned without waiting for the server to close.
+        let stream = "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\ndata: [DONE]\n";
+        let base = raw_server(stream.as_bytes().to_vec(), true).await;
+        let cfg = config(&format!("{base}/v1/chat/completions"));
+        let llm_client = build_client().unwrap();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            answer_question(
+                &llm_client,
+                &reqwest::Client::new(),
+                &cfg,
+                &[json!({"role": "user", "content": "q"})],
+                noop_cb,
+                "t",
+                "a",
+                "s",
+                None,
+            ),
+        )
+        .await
+        .expect("[DONE] must end the read without waiting for the connection to close")
+        .expect("a complete stream yields an answer");
+        assert_eq!(answer, "B");
+    }
+
+    #[tokio::test]
+    async fn stream_read_idle_failure_returns_none() {
+        // One chunk, then silence: the read-idle timeout must end the read with `None` (the subject
+        // is re-asked) — never hang forever, and never submit a partial stream as the answer.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await; // then silence
+        });
+        let client = build_client().unwrap();
+        let cfg = config(&format!("http://{address}/v1/chat/completions"));
+        let full = vec![
+            json!({"role": "system", "content": crate::llm::SYSTEM_PROMPT}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        let answer = stream_answer(
+            &client,
+            &cfg,
+            full,
+            noop_cb,
+            "t",
+            "a",
+            "s",
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(
+            answer, None,
+            "read-idle failure must return None, not partial content"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_client_never_sends_school_cookies() {
+        // Same hostname, different port: the school client's jar holds a host-only session cookie
+        // (set by the school server). The cookie-less LLM client must not carry it to the model
+        // endpoint — the two clients share nothing.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let school_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let school_addr = school_listener.local_addr().unwrap();
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = school_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = "HTTP/1.1 200 OK\r\nSet-Cookie: session=secret; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        tokio::spawn(async move {
+            let (mut stream, _) = llm_listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let request_text = String::from_utf8_lossy(&request);
+            let _ = tx.send(request_text.to_ascii_lowercase().contains("cookie:"));
+            let sse_body =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\ndata: [DONE]\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let school = reqwest::Client::builder()
+            .cookie_provider(std::sync::Arc::new(
+                reqwest_cookie_store::CookieStoreMutex::new(cookie_store::CookieStore::default()),
+            ))
+            .build()
+            .unwrap();
+        school
+            .get(format!("http://{school_addr}/"))
+            .send()
+            .await
+            .unwrap(); // jar now holds the cookie
+
+        let llm_client = build_client().unwrap();
+        let cfg = config(&format!("http://{llm_addr}/v1/chat/completions"));
+        let answer = answer_question(
+            &llm_client,
+            &school,
+            &cfg,
+            &[json!({"role": "user", "content": "q"})],
+            noop_cb,
+            "t",
+            "a",
+            "s",
+            None,
+        )
+        .await;
+        assert_eq!(answer.as_deref(), Some("B"));
+        assert!(
+            !rx.await.unwrap(),
+            "the cookie-less LLM client must not carry school cookies"
+        );
     }
 
     #[test]

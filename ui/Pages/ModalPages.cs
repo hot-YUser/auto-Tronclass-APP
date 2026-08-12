@@ -154,7 +154,16 @@ public sealed class HeroRollcallPage : ModalPageBase
             vm.Accounts.CollectionChanged += OnAccounts;
             foreach (var p in vm.Accounts) HookAcc(p);
             BuildChips(); UpdateBig();
+            // Captcha may have pre-empted this modal while the rollcall reached a terminal state.
+            // Re-check on every appearance; otherwise the queued page reopens with stale controls.
+            if (vm.IsPending) _ = close(this);
+            else if (vm.IsDone) { ShowSuccess(); _ = CloseCompleted(); }
         };
+        async Task CloseCompleted()
+        {
+            await Task.Delay(800);
+            await close(this);
+        }
         _unsubscribe = () =>
         {
             vm.PropertyChanged -= OnVm;
@@ -209,10 +218,14 @@ public sealed class HeroQuizPage : ModalPageBase
             Theme.Danger("捨棄", () => state.DiscardAnswer(vm)),
             Theme.Ghost("詳細", async () => { await close(this); await goDetail(); })));
 
-        void ShowSuccess()
+        // 結束態:全滅結束不得宣稱「已送出」——用中性色與「活動已結束」。
+        void ShowEnded()
         {
             stack.Children.Clear();
-            stack.Children.Add(Centered(Theme.Text("✓ 已送出", 22, Theme.FontSemibold, Theme.OkL, Theme.OkD)));
+            var allFailed = vm.SubmittedCount == 0;
+            stack.Children.Add(Centered(Theme.Text(
+                allFailed ? "活動已結束" : "✓ 已送出", 22, Theme.FontSemibold,
+                allFailed ? Theme.DimL : Theme.OkL, allFailed ? Theme.DimD : Theme.OkD)));
             stack.Children.Add(Centered(Theme.Dim(vm.Course, 14)));
         }
 
@@ -221,10 +234,26 @@ public sealed class HeroQuizPage : ModalPageBase
             if (a.PropertyName == nameof(QuizVm.RemainingSecs)) { UpdateBig(); return; }
             if (a.PropertyName != nameof(QuizVm.Status)) return;
             if (vm.Status is "held" or "discarded") await close(this);
-            else if (vm.Status == "done") { ShowSuccess(); await Task.Delay(800); await close(this); }
+            else if (vm.Status == "done") { ShowEnded(); await Task.Delay(800); await close(this); }
         }
-        _subscribe = () => { vm.PropertyChanged += OnVm; UpdateBig(); };
+        _subscribe = () =>
+        {
+            vm.PropertyChanged += OnVm;
+            UpdateBig();
+            // 備答完成當下就已終結的測驗(例如全部帳號失敗):不給死題上的動作鈕,直接顯示結束態並關閉。
+            if (vm.Status == "done") { ShowEnded(); _ = CloseAfterShowing(); }
+        };
         _unsubscribe = () => vm.PropertyChanged -= OnVm;
+
+        async Task CloseAfterShowing()
+        {
+            try
+            {
+                await Task.Delay(800);
+                await close(this);
+            }
+            catch { /* close 內部已 rollback+Notify */ }
+        }
 
         SetCard(stack);
     }
@@ -249,12 +278,24 @@ public sealed class CaptchaModalPage : ModalPageBase
         var entry = new Entry { Placeholder = "驗證碼" };
         _image = new Image { Source = image, HeightRequest = 90, Aspect = Aspect.AspectFit };
 
+        // 單 flight:Enter 連發/送出鈕連點只送一次,不會雙送雙關;例外走既有 Notify,不吞。
+        var submitting = false;
         async Task Submit()
         {
+            if (submitting) return;
             var text = entry.Text?.Trim() ?? "";
             if (text.Length == 0) return;
-            await state.SubmitCaptcha(accountId, text);
-            await close(this);
+            submitting = true;
+            try
+            {
+                await state.SubmitCaptcha(accountId, text);
+                await close(this);
+            }
+            catch (Exception error)
+            {
+                state.Notify("error", $"驗證碼送出失敗:{error.Message}");
+            }
+            finally { submitting = false; }
         }
         entry.Completed += async (_, _) => await Submit();
 

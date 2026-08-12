@@ -1,0 +1,5 @@
+# 全 repo 固定 Rust 工具鏈：本機 rustup 與 CI（dtolnay/rust-toolchain）都以此為準。
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -4,7 +4,9 @@
 
 param(
     [ValidateSet("portable", "msix", "both")] [string]$Mode = "portable",
-    [switch]$DevelopmentOnly
+    [switch]$DevelopmentOnly,
+    # release.ps1 需要嚴格 SemVer（v?M.m.p[-alpha|beta|rc.N]）；開發用預設值，不需 git tag 已存在。
+    [string]$Tag = "v0.0.0-alpha.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,9 +40,9 @@ $tfm = "net11.0-windows10.0.19041.0"
 function Publish-Portable {
     # release.ps1 會執行 cargo、原生 marker、self-contained publish、真實資料隔離 smoke、資產檢查。
     Invoke-ScriptChecked -Path (Join-Path $tools "release.ps1") -Arguments @(
-        "-Tag", "dev-local", "-SkipAndroid", "-SkipInstaller"
+        "-Tag", $Tag, "-SkipAndroid", "-SkipInstaller"
     )
-    Write-Host "portable -> dist/AutoTronclass-dev-local-windows-x64-portable.zip" -ForegroundColor Green
+    Write-Host "portable -> dist/AutoTronclass-$Tag-windows-x64-portable.zip" -ForegroundColor Green
 }
 
 function Publish-MsixDevelopment {

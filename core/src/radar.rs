@@ -88,8 +88,12 @@ fn spherical_direct(origin: GeoPoint, bearing_deg: f64, dist: f64) -> GeoPoint {
     let lat1 = origin.lat.to_radians();
     let lon1 = origin.lon.to_radians();
     let lat2 = (lat1.sin() * delta.cos() + lat1.cos() * delta.sin() * brg.cos()).asin();
-    let lon2 = lon1 + (brg.sin() * delta.sin() * lat1.cos()).atan2(delta.cos() - lat1.sin() * lat2.sin());
-    GeoPoint { lat: lat2.to_degrees(), lon: normalize_lon(lon2.to_degrees()) }
+    let lon2 =
+        lon1 + (brg.sin() * delta.sin() * lat1.cos()).atan2(delta.cos() - lat1.sin() * lat2.sin());
+    GeoPoint {
+        lat: lat2.to_degrees(),
+        lon: normalize_lon(lon2.to_degrees()),
+    }
 }
 
 // ponytail: spherical stand-in for WGS84 — §3 explicitly sanctions spherical-first (diff <1 m,
@@ -107,10 +111,17 @@ fn unit_from_geo(p: GeoPoint) -> [f64; 3] {
 }
 fn geo_from_unit(v: [f64; 3]) -> GeoPoint {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    let (x, y, z) = if n > 0.0 { (v[0] / n, v[1] / n, v[2] / n) } else { (v[0], v[1], v[2]) };
+    let (x, y, z) = if n > 0.0 {
+        (v[0] / n, v[1] / n, v[2] / n)
+    } else {
+        (v[0], v[1], v[2])
+    };
     let lat = z.clamp(-1.0, 1.0).asin();
     let lon = y.atan2(x);
-    GeoPoint { lat: lat.to_degrees(), lon: normalize_lon(lon.to_degrees()) }
+    GeoPoint {
+        lat: lat.to_degrees(),
+        lon: normalize_lon(lon.to_degrees()),
+    }
 }
 
 /// ENU tangent frame (metres) at a center — used by the LM refine, which only moves near the target.
@@ -120,13 +131,23 @@ struct LocalFrame {
 }
 impl LocalFrame {
     fn new(center: GeoPoint) -> LocalFrame {
-        LocalFrame { center, cos_lat: center.lat.to_radians().cos() }
+        LocalFrame {
+            center,
+            cos_lat: center.lat.to_radians().cos(),
+        }
     }
     fn to_geo(&self, east_m: f64, north_m: f64) -> GeoPoint {
         let dlat = (north_m / MEAN_EARTH_RADIUS_M).to_degrees();
-        let denom = if self.cos_lat.abs() < 1e-9 { 1e-9 } else { self.cos_lat };
+        let denom = if self.cos_lat.abs() < 1e-9 {
+            1e-9
+        } else {
+            self.cos_lat
+        };
         let dlon = (east_m / (MEAN_EARTH_RADIUS_M * denom)).to_degrees();
-        GeoPoint { lat: self.center.lat + dlat, lon: normalize_lon(self.center.lon + dlon) }
+        GeoPoint {
+            lat: self.center.lat + dlat,
+            lon: normalize_lon(self.center.lon + dlon),
+        }
     }
 }
 
@@ -196,7 +217,8 @@ fn solve_3x3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
                 continue;
             }
             let factor = a[r][col] / a[col][col];
-            #[allow(clippy::needless_range_loop)] // indexes two rows (a[r] and a[col]) — no iterator form
+            #[allow(clippy::needless_range_loop)]
+            // indexes two rows (a[r] and a[col]) — no iterator form
             for c in col..3 {
                 a[r][c] -= factor * a[col][c];
             }
@@ -219,9 +241,11 @@ fn solve_2x2(a11: f64, a12: f64, a22: f64, b1: f64, b2: f64) -> Option<(f64, f64
 fn best_seed(obs: &[Observation]) -> Option<GeoPoint> {
     let mut candidates = global_anchor_points(ANCHOR_COUNT);
     candidates.extend(fibonacci_points(36));
-    candidates
-        .into_iter()
-        .min_by(|a, b| robust_cost(obs, *a).partial_cmp(&robust_cost(obs, *b)).unwrap_or(std::cmp::Ordering::Equal))
+    candidates.into_iter().min_by(|a, b| {
+        robust_cost(obs, *a)
+            .partial_cmp(&robust_cost(obs, *b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 /// `n` earth-scale anchor coordinates: the 12 icosahedron vertices, padded with fibonacci if n>12.
@@ -238,9 +262,18 @@ pub fn global_anchor_points(n: usize) -> Vec<GeoPoint> {
 fn icosahedron_vertices() -> Vec<GeoPoint> {
     let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
     [
-        [-1.0, phi, 0.0], [1.0, phi, 0.0], [-1.0, -phi, 0.0], [1.0, -phi, 0.0],
-        [0.0, -1.0, phi], [0.0, 1.0, phi], [0.0, -1.0, -phi], [0.0, 1.0, -phi],
-        [phi, 0.0, -1.0], [phi, 0.0, 1.0], [-phi, 0.0, -1.0], [-phi, 0.0, 1.0],
+        [-1.0, phi, 0.0],
+        [1.0, phi, 0.0],
+        [-1.0, -phi, 0.0],
+        [1.0, -phi, 0.0],
+        [0.0, -1.0, phi],
+        [0.0, 1.0, phi],
+        [0.0, -1.0, -phi],
+        [0.0, 1.0, -phi],
+        [phi, 0.0, -1.0],
+        [phi, 0.0, 1.0],
+        [-phi, 0.0, -1.0],
+        [-phi, 0.0, 1.0],
     ]
     .iter()
     .map(|v| geo_from_unit(*v))
@@ -297,11 +330,14 @@ fn pattern_search(start: GeoPoint, obs: &[Observation], has_initial: bool) -> Ge
 
 fn pattern_radii(has_initial: bool) -> &'static [f64] {
     if has_initial {
-        &[50000., 20000., 10000., 5000., 2000., 1000., 500., 200., 100., 50., 20., 10., 5., 2., 1.]
+        &[
+            50000., 20000., 10000., 5000., 2000., 1000., 500., 200., 100., 50., 20., 10., 5., 2.,
+            1.,
+        ]
     } else {
         &[
-            2000000., 1000000., 500000., 250000., 100000., 50000., 20000., 10000., 5000., 2000., 1000.,
-            500., 200., 100., 50., 20., 10., 5., 2., 1.,
+            2000000., 1000000., 500000., 250000., 100000., 50000., 20000., 10000., 5000., 2000.,
+            1000., 500., 200., 100., 50., 20., 10., 5., 2., 1.,
         ]
     }
 }
@@ -327,9 +363,13 @@ fn least_squares_refine(start: GeoPoint, obs: &[Observation]) -> GeoPoint {
             g1 += w * j1 * r[i];
             g2 += w * j2 * r[i];
         }
-        let Some((mut sx, mut sy)) =
-            solve_2x2(h11 + damping * h11.max(1.0), h12, h22 + damping * h22.max(1.0), -g1, -g2)
-        else {
+        let Some((mut sx, mut sy)) = solve_2x2(
+            h11 + damping * h11.max(1.0),
+            h12,
+            h22 + damping * h22.max(1.0),
+            -g1,
+            -g2,
+        ) else {
             break;
         };
         let mut n = sx.hypot(sy);
@@ -383,7 +423,10 @@ fn uncertainty_95(obs: &[Observation], point: GeoPoint, residual_rmse: f64) -> f
 }
 
 // ===== §10 solve_global_radar (assemble 5 → 7 → 8 → 9) =====
-pub fn solve_global_radar(obs: &[Observation], initial: Option<GeoPoint>) -> Option<GlobalRadarEstimate> {
+pub fn solve_global_radar(
+    obs: &[Observation],
+    initial: Option<GeoPoint>,
+) -> Option<GlobalRadarEstimate> {
     if obs.len() < 3 || obs.iter().any(|o| o.distance < 0.0) {
         return None;
     }
@@ -394,7 +437,11 @@ pub fn solve_global_radar(obs: &[Observation], initial: Option<GeoPoint>) -> Opt
     let p2 = least_squares_refine(p1, obs);
     let e = rmse(obs, p2);
     let u95 = uncertainty_95(obs, p2, e);
-    Some(GlobalRadarEstimate { point: p2, residual_rmse: e, uncertainty_95_meters: u95 })
+    Some(GlobalRadarEstimate {
+        point: p2,
+        residual_rmse: e,
+        uncertainty_95_meters: u95,
+    })
 }
 
 // ===== §11 driver helper: the standard sampling rings around an estimate =====
@@ -417,40 +464,88 @@ mod tests {
     fn haversine_matches_published_distances() {
         // Independent of the fake: guards the formula/radius (a bug here hides behind the self-
         // consistent fake but offsets a real, true-geodesic server).
-        let paris = GeoPoint { lat: 48.8566, lon: 2.3522 };
-        let tokyo = GeoPoint { lat: 35.6762, lon: 139.6503 };
+        let paris = GeoPoint {
+            lat: 48.8566,
+            lon: 2.3522,
+        };
+        let tokyo = GeoPoint {
+            lat: 35.6762,
+            lon: 139.6503,
+        };
         let d = haversine(paris, tokyo); // published great-circle ≈ 9713 km
-        assert!((d - 9_713_000.0).abs() < 40_000.0, "Paris-Tokyo ≈ 9713 km, got {:.0} m", d);
-        let one_deg = haversine(GeoPoint { lat: 0.0, lon: 0.0 }, GeoPoint { lat: 1.0, lon: 0.0 });
-        assert!((one_deg - 111_195.0).abs() < 300.0, "1° lat ≈ 111.19 km, got {:.1} m", one_deg);
+        assert!(
+            (d - 9_713_000.0).abs() < 40_000.0,
+            "Paris-Tokyo ≈ 9713 km, got {:.0} m",
+            d
+        );
+        let one_deg = haversine(
+            GeoPoint { lat: 0.0, lon: 0.0 },
+            GeoPoint { lat: 1.0, lon: 0.0 },
+        );
+        assert!(
+            (one_deg - 111_195.0).abs() < 300.0,
+            "1° lat ≈ 111.19 km, got {:.1} m",
+            one_deg
+        );
     }
 
     #[test]
     fn solve_global_reverses_a_hidden_target() {
-        let target = GeoPoint { lat: 48.8584, lon: 2.2945 }; // Eiffel — far from the old (25, 121.5)
+        let target = GeoPoint {
+            lat: 48.8584,
+            lon: 2.2945,
+        }; // Eiffel — far from the old (25, 121.5)
         let anchors = global_anchor_points(ANCHOR_COUNT);
-        let obs: Vec<Observation> =
-            anchors.iter().map(|&a| Observation { point: a, distance: haversine(a, target) }).collect();
+        let obs: Vec<Observation> = anchors
+            .iter()
+            .map(|&a| Observation {
+                point: a,
+                distance: haversine(a, target),
+            })
+            .collect();
         let est = solve_global_radar(&obs, None).expect("solved").point;
-        assert!(haversine(est, target) < 10.0, "global reverse <10 m, got {:.2}", haversine(est, target));
+        assert!(
+            haversine(est, target) < 10.0,
+            "global reverse <10 m, got {:.2}",
+            haversine(est, target)
+        );
 
         // Add near ring observations → the LM refine lands <1 m.
         let mut obs2 = obs.clone();
         for &radius in &[1000.0, 300.0, 100.0] {
             for k in 0..BEARING_COUNT {
                 let p = spherical_direct(est, 360.0 * k as f64 / BEARING_COUNT as f64, radius);
-                obs2.push(Observation { point: p, distance: haversine(p, target) });
+                obs2.push(Observation {
+                    point: p,
+                    distance: haversine(p, target),
+                });
             }
         }
         let est2 = solve_global_radar(&obs2, Some(est)).expect("refined").point;
-        assert!(haversine(est2, target) < 1.0, "LM refine <1 m, got {:.3}", haversine(est2, target));
+        assert!(
+            haversine(est2, target) < 1.0,
+            "LM refine <1 m, got {:.3}",
+            haversine(est2, target)
+        );
     }
 
     #[test]
     fn too_few_observations_is_none() {
         let obs = [
-            Observation { point: GeoPoint { lat: 25.0, lon: 121.0 }, distance: 100.0 },
-            Observation { point: GeoPoint { lat: 25.1, lon: 121.1 }, distance: 100.0 },
+            Observation {
+                point: GeoPoint {
+                    lat: 25.0,
+                    lon: 121.0,
+                },
+                distance: 100.0,
+            },
+            Observation {
+                point: GeoPoint {
+                    lat: 25.1,
+                    lon: 121.1,
+                },
+                distance: 100.0,
+            },
         ];
         assert!(solve_global_radar(&obs, None).is_none());
     }

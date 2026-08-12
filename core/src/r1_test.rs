@@ -20,7 +20,10 @@ fn classify_response_table() {
     assert_eq!(classify_response(401, ""), Fatal);
     assert_eq!(classify_response(403, ""), Fatal);
     assert_eq!(classify_response(302, ""), Fatal);
-    assert_eq!(classify_response(200, "<html><form>login</form></html>"), Fatal);
+    assert_eq!(
+        classify_response(200, "<html><form>login</form></html>"),
+        Fatal
+    );
     // Transient: throttled / server hiccup.
     assert_eq!(classify_response(429, ""), Transient);
     assert_eq!(classify_response(408, ""), Transient);
@@ -31,13 +34,22 @@ fn classify_response_table() {
     assert_eq!(classify_response(409, ""), Wrong);
     assert_eq!(classify_response(422, ""), Wrong);
     assert_eq!(classify_response(200, r#"{"success":false}"#), Wrong);
-    assert_eq!(classify_response(200, r#"{"message":"wrong number code"}"#), Wrong);
+    assert_eq!(
+        classify_response(200, r#"{"message":"wrong number code"}"#),
+        Wrong
+    );
     // Success requires a structured, source-specific acknowledgement.
     assert_eq!(classify_response(200, r#"{"success":true}"#), Success);
     assert_eq!(classify_response(200, r#"{"is_success":true}"#), Success);
-    assert_eq!(classify_response(200, r#"{"status":"on_call_fine"}"#), Success);
+    assert_eq!(
+        classify_response(200, r#"{"status":"on_call_fine"}"#),
+        Success
+    );
     // The REAL live accept body (2026-07): `{"id":…,"status":"on_call"}` — no success bool.
-    assert_eq!(classify_response(200, r#"{"id":925957,"status":"on_call"}"#), Success);
+    assert_eq!(
+        classify_response(200, r#"{"id":925957,"status":"on_call"}"#),
+        Success
+    );
     assert_eq!(classify_response(200, "just text no flag"), Wrong);
 }
 
@@ -50,10 +62,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(b).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -80,7 +100,9 @@ fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
 }
 fn signed(rollcall_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (r, a) = (rollcall_id.to_string(), account.to_string());
-    move |v| v["event"] == "SignedIn" && v["rollcall_id"] == r && v["account_id"].as_str() == Some(&a)
+    move |v| {
+        v["event"] == "SignedIn" && v["rollcall_id"] == r && v["account_id"].as_str() == Some(&a)
+    }
 }
 fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
@@ -88,7 +110,11 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
 fn account_id(label: &str) -> Option<String> {
     for ev in snapshot().iter().rev() {
         if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"].as_array()?.iter().find(|a| a["label"] == label) {
+            if let Some(a) = ev["accounts"]
+                .as_array()?
+                .iter()
+                .find(|a| a["label"] == label)
+            {
                 return a["id"].as_str().map(str::to_string);
             }
         }
@@ -98,7 +124,10 @@ fn account_id(label: &str) -> Option<String> {
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -125,7 +154,10 @@ struct Harness {
 impl Harness {
     fn new() -> Harness {
         events().lock().unwrap().clear();
-        Harness { h: crate::core_init(collect), id: 0 }
+        Harness {
+            h: crate::core_init(Some(collect)),
+            id: 0,
+        }
     }
     fn next(&mut self) -> u64 {
         self.id += 1;
@@ -138,7 +170,10 @@ impl Drop for Harness {
     }
 }
 fn data_dir(tag: &str) -> String {
-    std::env::temp_dir().join(format!("tron-r1-{tag}-{}", new_id())).to_string_lossy().replace('\\', "/")
+    std::env::temp_dir()
+        .join(format!("tron-r1-{tag}-{}", new_id()))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Boot one account, monitoring, online. Returns (harness, base, account_id).
@@ -147,22 +182,39 @@ fn boot(tag: &str) -> (Harness, String, String) {
     let mut hz = Harness::new();
     let dir = data_dir(tag);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2}}}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2}}}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let dave = account_id("dave").unwrap();
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     wait_for(reply_ok(i), 15);
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
     (hz, base, dave)
 }
 
@@ -171,8 +223,15 @@ fn number_brute_finds_code_via_success_flag() {
     let _g = SEQ.lock().unwrap();
     let (hz, base, dave) = boot("brute");
     // hide_code → the shared code is unreadable → brute-force; code 0007 lands in the first batch of 100.
-    post(&base, "/_test/open_rollcall", r#"{"id":"BRUTE","kind":"number","number_code":"0007","attendance_rate":100,"hide_code":true}"#);
-    assert!(wait_for(signed("BRUTE", &dave), 20).is_some(), "brute finds the code via the success flag");
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"BRUTE","kind":"number","number_code":"0007","attendance_rate":100,"hide_code":true}"#,
+    );
+    assert!(
+        wait_for(signed("BRUTE", &dave), 20).is_some(),
+        "brute finds the code via the success flag"
+    );
     drop(hz);
 }
 
@@ -182,12 +241,19 @@ fn number_fatal_aborts_the_round() {
     let (hz, base, dave) = boot("fatal");
     // A 403 on the answer endpoint (session invalid) triggers re-login + re-sign (R4.1 #2); a PERMANENT
     // 403 re-logins fine yet keeps failing → after MAX_RESIGN bounded retries it surfaces a sign_failed.
-    post(&base, "/_test/open_rollcall", r#"{"id":"FATAL","kind":"number","number_code":"1234","attendance_rate":100,"hide_code":true,"number_fatal":true}"#);
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"FATAL","kind":"number","number_code":"1234","attendance_rate":100,"hide_code":true,"number_fatal":true}"#,
+    );
     assert!(
         wait_for(|v| v["event"] == "Error" && v["code"] == "sign_failed", 15).is_some(),
         "fatal response surfaces a sign_failed Error after bounded re-login retries"
     );
-    assert!(none_for(signed("FATAL", &dave), 2), "fatal → never reported as signed");
+    assert!(
+        none_for(signed("FATAL", &dave), 2),
+        "fatal → never reported as signed"
+    );
     drop(hz);
 }
 
@@ -197,7 +263,14 @@ fn my_present_confirms_when_class_not_full() {
     let (hz, base, dave) = boot("myp");
     // attendance 40% → class NOT full (present≠total) and top-level status not fine → the ONLY way
     // recheck can confirm is the caller's own user_no entry (my_present). SignedIn proves it works.
-    post(&base, "/_test/open_rollcall", r#"{"id":"MYP","kind":"self_registration","attendance_rate":40}"#);
-    assert!(wait_for(signed("MYP", &dave), 15).is_some(), "recheck confirms the caller via my_present, not whole-class");
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"MYP","kind":"self_registration","attendance_rate":40}"#,
+    );
+    assert!(
+        wait_for(signed("MYP", &dave), 15).is_some(),
+        "recheck confirms the caller via my_present, not whole-class"
+    );
     drop(hz);
 }

@@ -15,7 +15,14 @@ fn vault_roundtrip_and_wrong_key() {
     let path = tmp("vault");
     let key = [7u8; 32];
     let mut v = VaultFile::create_with_key(&path, key).unwrap();
-    v.set("acc1", AccountSecret { password: "s3cret".into(), cookies: String::new() }).unwrap();
+    v.set(
+        "acc1",
+        AccountSecret {
+            password: "s3cret".into(),
+            cookies: String::new(),
+        },
+    )
+    .unwrap();
     drop(v);
 
     // correct device key → decrypts, secret intact
@@ -35,13 +42,31 @@ fn vault_never_reuses_a_nonce() {
     let path = tmp("nonce");
     let mut v = VaultFile::create_with_key(&path, [1u8; 32]).unwrap();
     // Writing the *same* data twice must still change the on-disk nonce (bytes 16..40).
-    v.set("a", AccountSecret { password: "x".into(), cookies: String::new() }).unwrap();
+    v.set(
+        "a",
+        AccountSecret {
+            password: "x".into(),
+            cookies: String::new(),
+        },
+    )
+    .unwrap();
     let first = std::fs::read(&path).unwrap();
-    v.set("a", AccountSecret { password: "x".into(), cookies: String::new() }).unwrap();
+    v.set(
+        "a",
+        AccountSecret {
+            password: "x".into(),
+            cookies: String::new(),
+        },
+    )
+    .unwrap();
     let second = std::fs::read(&path).unwrap();
 
     assert_eq!(&first[..16], &second[..16], "salt is fixed");
-    assert_ne!(&first[16..40], &second[16..40], "nonce MUST be fresh every write");
+    assert_ne!(
+        &first[16..40],
+        &second[16..40],
+        "nonce MUST be fresh every write"
+    );
     assert_ne!(first, second, "ciphertext differs under a fresh nonce");
 
     let _ = std::fs::remove_file(&path);
@@ -96,28 +121,54 @@ fn registry_resolves_key_alias_and_raw_url() {
     .unwrap();
 
     assert_eq!(reg.resolve("demo").unwrap(), "https://demo.example.edu");
-    assert_eq!(reg.resolve("DEMO-University").unwrap(), "https://demo.example.edu"); // ci alias
-    assert_eq!(reg.resolve("http://raw.host:8080").unwrap(), "http://raw.host:8080"); // raw url
+    assert_eq!(
+        reg.resolve("DEMO-University").unwrap(),
+        "https://demo.example.edu"
+    ); // ci alias
+    assert_eq!(
+        reg.resolve("http://raw.host:8080").unwrap(),
+        "http://raw.host:8080"
+    ); // raw url
     assert!(reg.resolve("unknown").is_none());
 
     let e = Endpoints::derive("https://demo.example.edu/");
-    assert_eq!(e.current_semester(), "https://demo.example.edu/api/current-semester-info");
+    assert_eq!(
+        e.current_semester(),
+        "https://demo.example.edu/api/current-semester-info"
+    );
 }
 
 #[test]
 fn factory_registry_seeds_tronclass_schools() {
     let reg = Registry::factory();
     // Seeded from v1 schools.toml — all list-or-none (school equality): a broad set, not a curated few.
-    assert!(reg.schools.len() >= 30, "expected the full TronClass school seed, got {}", reg.schools.len());
+    assert!(
+        reg.schools.len() >= 30,
+        "expected the full TronClass school seed, got {}",
+        reg.schools.len()
+    );
     assert_eq!(reg.default_key.as_deref(), Some("thu"));
     // Every seeded school is a usable https base_url with a key + label (no half-entries).
     for s in &reg.schools {
-        assert!(!s.key.is_empty() && !s.label.is_empty(), "school missing key/label: {s:?}");
-        assert!(s.base_url.starts_with("https://"), "non-https base_url: {}", s.base_url);
+        assert!(
+            !s.key.is_empty() && !s.label.is_empty(),
+            "school missing key/label: {s:?}"
+        );
+        assert!(
+            s.base_url.starts_with("https://"),
+            "non-https base_url: {}",
+            s.base_url
+        );
     }
     // Key and (ci) alias both resolve to the same base_url.
-    assert_eq!(reg.resolve("thu").as_deref(), Some("https://ilearn.thu.edu.tw"));
-    assert_eq!(reg.resolve("東海").as_deref(), Some("https://ilearn.thu.edu.tw"));
+    assert_eq!(
+        reg.resolve("thu").as_deref(),
+        Some("https://ilearn.thu.edu.tw")
+    );
+    assert_eq!(
+        reg.resolve("東海").as_deref(),
+        Some("https://ilearn.thu.edu.tw")
+    );
     assert!(reg.resolve("definitely-not-a-school").is_none());
 }
 
@@ -179,7 +230,10 @@ fn detect_login_kind_classifies_fixtures() {
             assert_eq!(form.action, "/do-login");
             assert_eq!(form.user_field, "user");
             assert_eq!(form.pass_field, "pass");
-            assert_eq!(form.fields, vec![("csrf".to_string(), "tok123".to_string())]);
+            assert_eq!(
+                form.fields,
+                vec![("csrf".to_string(), "tok123".to_string())]
+            );
         }
         other => panic!("expected PasswordForm, got {other:?}"),
     }
@@ -195,7 +249,11 @@ fn detect_login_kind_classifies_fixtures() {
           <button>Sign in</button>
         </form></body></html>"#;
     match detect_login_kind(captcha_page, "u") {
-        LoginKind::Captcha { form, image_url, captcha_field } => {
+        LoginKind::Captcha {
+            form,
+            image_url,
+            captcha_field,
+        } => {
             assert_eq!(form.pass_field, "password");
             assert_eq!(image_url, "/captcha.png");
             assert_eq!(captcha_field, "captcha");
@@ -210,8 +268,13 @@ fn detect_login_kind_classifies_fixtures() {
           <input type="text" name="username">
           <input type="password" name="password">
         </form></body></html>"#;
-    assert!(matches!(detect_login_kind(copy_only, "u"), LoginKind::PasswordForm(_)),
-        "captcha in copy without a captcha field must NOT be the captcha branch");
+    assert!(
+        matches!(
+            detect_login_kind(copy_only, "u"),
+            LoginKind::PasswordForm(_)
+        ),
+        "captcha in copy without a captcha field must NOT be the captcha branch"
+    );
 
     // R4-C: every named input is echoed on POST, not only type=hidden (some CAS/Keycloak themes render
     // the token as a visible input).
@@ -224,14 +287,24 @@ fn detect_login_kind_classifies_fixtures() {
     match detect_login_kind(visible_token, "u") {
         LoginKind::PasswordForm(form) => {
             assert_eq!(form.user_field, "username");
-            assert!(form.fields.contains(&("execution".to_string(), "e1s1".to_string())), "visible token echoed");
+            assert!(
+                form.fields
+                    .contains(&("execution".to_string(), "e1s1".to_string())),
+                "visible token echoed"
+            );
         }
         other => panic!("expected PasswordForm, got {other:?}"),
     }
 
     assert!(matches!(
-        detect_login_kind(r#"<html><meta name="saml"><body>redirecting to nidp</body>"#, "u"),
+        detect_login_kind(
+            r#"<html><meta name="saml"><body>redirecting to nidp</body>"#,
+            "u"
+        ),
         LoginKind::SsoRedirect
     ));
-    assert!(matches!(detect_login_kind(r#"<div id="app"></div>"#, "u"), LoginKind::EmailSpa));
+    assert!(matches!(
+        detect_login_kind(r#"<div id="app"></div>"#, "u"),
+        LoginKind::EmailSpa
+    ));
 }

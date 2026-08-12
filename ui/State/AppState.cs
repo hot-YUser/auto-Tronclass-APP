@@ -22,7 +22,19 @@ public sealed class AppState : ObservableObject
 
     public bool BootReady => _bootReady;
 
-    public async Task BootAsync()
+    readonly object _bootGate = new();
+    Task? _bootTask;
+
+    /// <summary>
+    /// single-flight:並發呼叫(OnAppearing 重試、Android FGS)共享同一次 boot,不會重入;
+    /// 失敗後下次呼叫自動重試。已成功 boot 過的 handle,NativeCore 不會重送 Init。
+    /// </summary>
+    public Task BootAsync()
+    {
+        lock (_bootGate) return _bootTask ??= BootCoreAsync();
+    }
+
+    async Task BootCoreAsync()
     {
         try
         {
@@ -38,6 +50,11 @@ public sealed class AppState : ObservableObject
             MonitorState = "idle";
             AddLog("error", $"初始化失敗：{error.Message}");
             Toast?.Invoke("error", $"初始化失敗：{error.Message}");
+        }
+        finally
+        {
+            // 結束後清掉快取:失敗可重試;成功則 NativeCore 端已快取完成 task,再呼叫不會重送 Init。
+            lock (_bootGate) _bootTask = null;
         }
     }
 
@@ -128,7 +145,9 @@ public sealed class AppState : ObservableObject
                 break;
 
             case "Caps" when e.TryGetProperty("caps", out var c):
-                Caps.BackgroundMonitoring = Bool(c, "background_monitoring");
+                // Windows 沒有背景執行能力(無 FGS、關窗即結束),core 宣稱的能力在 Windows 上不成立——
+                // 誠實改為僅前景,Home/Settings 據此呈現不可用,不假裝有 tray/背景監控。
+                Caps.BackgroundMonitoring = !OperatingSystem.IsWindows() && Bool(c, "background_monitoring");
                 Caps.SelfUpdate = Bool(c, "self_update");
                 Caps.QrTeacherAssist = Bool(c, "qr_teacher_assist");
                 Caps.OcrCaptcha = Bool(c, "ocr_captcha");
@@ -383,6 +402,13 @@ public sealed class AppState : ObservableObject
         }
         vm.RaiseProgress();
         vm.RaiseConflictState();   // 依剛建好的逐題旗標刷新閘門/警示
+        // 全部預期帳號已終端(準備失敗/活動已結束)時,這份測驗沒有可送出的內容,直接定案為完成——
+        // Hero 關閉與狀態文字都依同一述詞,不假裝還在審題。
+        if (vm.IsComplete)
+        {
+            vm.Status = "done";
+            vm.RemainingSecs = null;
+        }
         Raise(nameof(Quizzes)); // 讓列表的題數等衍生值刷新
         if (announce) HeroQuiz?.Invoke(vm);
     }
@@ -436,8 +462,8 @@ public sealed class AppState : ObservableObject
         if (accVm is null) return;
         accVm.SubmitResult = Str(e, "result") ?? "已送出";
         vm.RaiseProgress();
-        if (vm.ExpectedAccountIds.Count > 0 && vm.ExpectedAccountIds.All(id =>
-                vm.PerAccount.FirstOrDefault(account => account.AccountId == id)?.Submitted == true))
+        // 完成與否由共用述詞決定:全部預期帳號都已送出、準備失敗或活動已結束(見 QuizCompletion)。
+        if (vm.IsComplete)
         {
             vm.Status = "done";
             vm.RemainingSecs = null;
@@ -474,12 +500,36 @@ public sealed class AppState : ObservableObject
             Toast?.Invoke("error", $"無法啟動背景監控服務：{error.Message}");
             return;
         }
-        if (!OkReply(await Send("StartMonitoring")))
+        if (OkReply(await Send("StartMonitoring"))) return;
+        // 啟動失敗(含命令逾時)時 core 可能仍在 Starting:先送 StopMonitoring 並等待有界回覆,
+        // 再把 UI/FGS 設回 idle——不能靠猜 school 端 timeout 來判斷 core 到底有沒有啟動。
+        await RecoverAfterFailedStart();
+        MonitoringServiceLifetime.Stop();
+        MonitorState = "idle";
+    }
+
+    /// <summary>StartMonitoring 失敗後的有界復原:送一次 StopMonitoring。
+    /// core 若其實已開始監控(逾時但命令已生效),這一步會把它停掉,不留幽靈監控;
+    /// 若它已無回應,等待到界就放手,不放任 UI 卡在「啟動中」。</summary>
+    async Task RecoverAfterFailedStart()
+    {
+        var stop = _core.SendAsync("StopMonitoring");
+        // 活著的 core 對 StopMonitoring 是同步即時回覆;只有已失去回應的 core 才等不到。
+        // 到點後 stop task 仍由 NativeCore 自己的 300s safety net 收尾,這裡不阻擋 UI 回到 idle。
+        _ = stop.ContinueWith(static _ => { }, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+        try
         {
-            MonitoringServiceLifetime.Stop();
-            if (MonitorState == "starting") MonitorState = "idle";
+            var done = await Task.WhenAny(stop, Task.Delay(StopReplyBound));
+            if (done == stop) await stop;
+        }
+        catch (Exception error)
+        {
+            AddLog("error", $"啟動失敗後停止核心未獲回覆：{error.Message}");
         }
     }
+
+    static readonly TimeSpan StopReplyBound = TimeSpan.FromSeconds(20);
 
     public async Task StopMonitoring()
     {

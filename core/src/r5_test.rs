@@ -16,10 +16,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(b).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -43,7 +51,11 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
 fn account_id(label: &str) -> Option<String> {
     for ev in snapshot().iter().rev() {
         if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"].as_array()?.iter().find(|a| a["label"] == label) {
+            if let Some(a) = ev["accounts"]
+                .as_array()?
+                .iter()
+                .find(|a| a["label"] == label)
+            {
                 return a["id"].as_str().map(str::to_string);
             }
         }
@@ -53,7 +65,10 @@ fn account_id(label: &str) -> Option<String> {
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -73,7 +88,11 @@ fn post(base: &str, path: &str, body: &str) {
     http(base, &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body));
 }
 fn get_json(base: &str, path: &str) -> Value {
-    serde_json::from_str(&http(base, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))).unwrap_or(Value::Null)
+    serde_json::from_str(&http(
+        base,
+        &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    ))
+    .unwrap_or(Value::Null)
 }
 struct Harness {
     h: *mut std::ffi::c_void,
@@ -93,28 +112,56 @@ impl Drop for Harness {
 /// Boot one account monitoring, with LLM tools on/off.
 fn boot(tag: &str, base: &str, enable_tools: bool) -> (Harness, String) {
     events().lock().unwrap().clear();
-    let mut hz = Harness { h: crate::core_init(collect), id: 0 };
-    let dir = std::env::temp_dir().join(format!("tron-r5-{tag}-{}", new_id())).to_string_lossy().replace('\\', "/");
+    let mut hz = Harness {
+        h: crate::core_init(Some(collect)),
+        id: 0,
+    };
+    let dir = std::env::temp_dir()
+        .join(format!("tron-r5-{tag}-{}", new_id()))
+        .to_string_lossy()
+        .replace('\\', "/");
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
+    );
     wait_for(reply_ok(i), 10);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"max_answer_reask":1,"enable_llm_tools":{enable_tools},"llm_endpoint":"{base}/v1/chat/completions"}}}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"max_answer_reask":1,"enable_llm_tools":{enable_tools},"llm_endpoint":"{base}/v1/chat/completions"}}}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#));
+    send(
+        hz.h,
+        &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
+    );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#));
+    send(
+        hz.h,
+        &format!(
+            r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+        ),
+    );
     wait_for(reply_ok(i), 5);
     let dave = account_id("dave").unwrap();
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
     wait_for(reply_ok(i), 15);
-    wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10);
+    wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10,
+    );
     (hz, dave)
 }
 
@@ -130,9 +177,15 @@ fn handout_pdf_answer_flows_via_tool() {
     let (hz, _dave) = boot("pdf", &base, true);
     post(&base, "/_test/open_material", HANDOUT_MATERIAL);
     post(&base, "/_test/open_quiz", HANDOUT_QUIZ);
-    assert!(wait_for(submitted("EXH"), 30).is_some(), "handout question submits");
+    assert!(
+        wait_for(submitted("EXH"), 30).is_some(),
+        "handout question submits"
+    );
     let sub = get_json(&base, "/_test/last_submission");
-    assert_eq!(sub["subjects"][0]["answer"], "PHOTOSYNTHESIS42", "the PDF sentinel is the submitted answer, got {sub}");
+    assert_eq!(
+        sub["subjects"][0]["answer"], "PHOTOSYNTHESIS42",
+        "the PDF sentinel is the submitted answer, got {sub}"
+    );
     drop(hz);
 }
 
@@ -145,9 +198,15 @@ fn without_tools_handout_answer_is_not_the_sentinel() {
     let (hz, _dave) = boot("notool", &base, false);
     post(&base, "/_test/open_material", HANDOUT_MATERIAL);
     post(&base, "/_test/open_quiz", HANDOUT_QUIZ);
-    assert!(wait_for(submitted("EXH"), 30).is_some(), "still submits (its blind guess)");
+    assert!(
+        wait_for(submitted("EXH"), 30).is_some(),
+        "still submits (its blind guess)"
+    );
     let sub = get_json(&base, "/_test/last_submission");
-    assert_ne!(sub["subjects"][0]["answer"], "PHOTOSYNTHESIS42", "no tool → cannot know the PDF sentinel");
+    assert_ne!(
+        sub["subjects"][0]["answer"], "PHOTOSYNTHESIS42",
+        "no tool → cannot know the PDF sentinel"
+    );
     drop(hz);
 }
 
@@ -160,29 +219,53 @@ fn subject_image_is_inlined_as_base64_data_url() {
     let (hz, _dave) = boot("img", &base, true);
     let quiz = r#"{"activity_id":"IMG","course_id":"C1","source":"exam","subjects":[{"id":"s1","type":"short_answer","content":"What is shown? <img src=\"/_test/image.png\">"}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(submitted("IMG"), 30).is_some(), "image subject submits");
+    assert!(
+        wait_for(submitted("IMG"), 30).is_some(),
+        "image subject submits"
+    );
     let req = get_json(&base, "/_test/last_llm_request");
     let content = &req["messages"][1]["content"];
-    assert!(content.is_array(), "multimodal → parts-list content, got {content}");
-    let img = content.as_array().unwrap().iter().find(|p| p["type"] == "image_url").expect("an image part");
+    assert!(
+        content.is_array(),
+        "multimodal → parts-list content, got {content}"
+    );
+    let img = content
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["type"] == "image_url")
+        .expect("an image part");
     let url = img["image_url"]["url"].as_str().unwrap_or("");
-    assert!(url.starts_with("data:image/png;base64,"), "the image is inlined as a base64 data url, got {url}");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "the image is inlined as a base64 data url, got {url}"
+    );
     drop(hz);
 }
 
-/// Multimodal fetch-miss: an `<img>` that 404s → fall back to the raw (resolved) url, not a data url.
+/// Multimodal fetch-miss: a missing `<img>` is omitted. Its raw URL must never be handed to the
+/// external LLM provider, which could otherwise turn a failed local fetch into a second SSRF hop.
 #[test]
-fn image_fetch_miss_falls_back_to_raw_url() {
+fn image_fetch_miss_drops_the_raw_url() {
     let _g = SEQ.lock().unwrap();
     let base = start_fake();
     let (hz, _dave) = boot("imgmiss", &base, true);
     let quiz = r#"{"activity_id":"IMG2","course_id":"C1","source":"exam","subjects":[{"id":"s1","type":"short_answer","content":"See <img src=\"/_test/missing.png\">"}]}"#;
     post(&base, "/_test/open_quiz", quiz);
-    assert!(wait_for(submitted("IMG2"), 30).is_some(), "submits despite the missing image");
+    assert!(
+        wait_for(submitted("IMG2"), 30).is_some(),
+        "submits despite the missing image"
+    );
     let req = get_json(&base, "/_test/last_llm_request");
     let content = &req["messages"][1]["content"];
-    let img = content.as_array().and_then(|a| a.iter().find(|p| p["type"] == "image_url")).expect("an image part");
-    let url = img["image_url"]["url"].as_str().unwrap_or("");
-    assert!(url.ends_with("/_test/missing.png") && !url.starts_with("data:"), "fetch miss → raw url fallback, got {url}");
+    let parts = content.as_array().expect("multimodal parts");
+    assert!(
+        parts.iter().all(|part| part["type"] != "image_url"),
+        "a failed image fetch must not leave an image URL"
+    );
+    assert!(
+        !content.to_string().contains("/_test/missing.png"),
+        "the raw missing-image URL must not reach the LLM"
+    );
     drop(hz);
 }

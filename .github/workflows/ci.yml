@@ -23,7 +23,7 @@ jobs:
         run: cargo clippy --manifest-path core/Cargo.toml --locked --all-targets --all-features -- -D warnings
 
   windows:
-    name: Windows UI and contract checks
+    name: Windows checks and unsigned release dry-run
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,18 +37,27 @@ jobs:
       - name: Install MAUI Windows workload
         shell: pwsh
         run: dotnet workload install maui-windows --version 11.0.100-preview.6.26364.2
-      - name: Build Windows native core
-        shell: pwsh
-        run: ./tools/build-core.ps1 -Head windows
-      - name: Build Windows UI
-        shell: pwsh
-        run: dotnet build ui/Ui.csproj -f net11.0-windows10.0.19041.0 -c Release -p:TargetFrameworks=net11.0-windows10.0.19041.0
       - name: Run protocol contract check
         shell: pwsh
         run: dotnet run --project tools/checks/ProtocolContract.Check/ProtocolContract.Check.csproj -c Release
       - name: Run device-key check
         shell: pwsh
         run: dotnet run --project tools/checks/DeviceKey.Check/DeviceKey.Check.csproj -c Release
+      - name: Run UI settings check
+        shell: pwsh
+        run: dotnet run --project tools/checks/UiSettings.Check/UiSettings.Check.csproj -c Release
+      # Unsigned Windows release dry-run：走真實 release.ps1 路徑（cargo test/clippy、
+      # native marker、Release publish、版本驗證、隔離資料 smoke、zip、SHA256SUMS），
+      # 但跳過 Android 簽章與 Inno installer（私鑰只在發行機，永不進 CI）。
+      - name: Unsigned Windows release dry-run
+        shell: pwsh
+        run: ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipAndroid -SkipInstaller
+      - name: Upload release dry-run dist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-release-dry-run
+          path: dist/
+          if-no-files-found: error
 
   android:
     name: Android UI and native ABI build

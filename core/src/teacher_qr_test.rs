@@ -18,10 +18,18 @@ fn events() -> &'static Mutex<Vec<String>> {
 }
 extern "C" fn collect(ptr: *const u8, len: usize) {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    events().lock().unwrap().push(String::from_utf8_lossy(bytes).into_owned());
+    events()
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(bytes).into_owned());
 }
 fn snapshot() -> Vec<Value> {
-    events().lock().unwrap().iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+    events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect()
 }
 fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -50,13 +58,20 @@ fn account_id(label: &str) -> Option<String> {
 }
 fn signed(rollcall_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (account, rollcall_id) = (account.to_string(), rollcall_id.to_string());
-    move |v| v["event"] == "SignedIn" && v["rollcall_id"] == rollcall_id && v["account_id"].as_str() == Some(&account)
+    move |v| {
+        v["event"] == "SignedIn"
+            && v["rollcall_id"] == rollcall_id
+            && v["account_id"].as_str() == Some(&account)
+    }
 }
 
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (port, listener) = fake::bind_ephemeral().await;
             ptx.send(port).unwrap();
@@ -69,7 +84,9 @@ fn start_fake() -> String {
 /// Fire-and-forget POST to a fake's dev `_test` control endpoint (raw HTTP, no reqwest).
 fn post_test(base_url: &str, path: &str, body: &str) {
     let addr = base_url.trim_start_matches("http://");
-    let Ok(mut s) = std::net::TcpStream::connect(addr) else { return };
+    let Ok(mut s) = std::net::TcpStream::connect(addr) else {
+        return;
+    };
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -80,7 +97,11 @@ fn post_test(base_url: &str, path: &str, body: &str) {
 }
 
 fn open_qr(base_url: &str, id: &str) {
-    post_test(base_url, "/_test/open_rollcall", &format!(r#"{{"id":"{id}","kind":"qrcode","attendance_rate":100}}"#));
+    post_test(
+        base_url,
+        "/_test/open_rollcall",
+        &format!(r#"{{"id":"{id}","kind":"qrcode","attendance_rate":100}}"#),
+    );
 }
 
 #[test]
@@ -91,14 +112,18 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
     let data_dir = std::env::temp_dir().join(format!("tron-teacherqr-{}", new_id()));
     let data_dir = data_dir.to_string_lossy().replace('\\', "/");
 
-    let h = crate::core_init(collect);
+    let h = crate::core_init(Some(collect));
     let mut id = 0u64;
     let mut cmd = |body: String| {
         id += 1;
         let this = id;
         send(h, &format!(r#"{{"id":{this},{body}}}"#));
         assert!(
-            wait_for(move |v| v["event"] == "Reply" && v["id"] == this && v["ok"] == true, 15).is_some(),
+            wait_for(
+                move |v| v["event"] == "Reply" && v["id"] == this && v["ok"] == true,
+                15
+            )
+            .is_some(),
             "command {this} ok; events={:?}",
             snapshot()
         );
@@ -117,20 +142,35 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
     let student = account_id("student").expect("student account id");
 
     cmd(r#""cmd":"StartMonitoring""#.to_string());
-    assert!(wait_for(|v| v["event"] == "AccountStatus" && v["state"] == "online", 10).is_some());
+    assert!(wait_for(
+        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        10
+    )
+    .is_some());
 
     // --- Phase 1: happy cross-endpoint path ---
     // The teacher (base_a) sources the token; the student (base_b) signs on its OWN endpoint. A latent
     // bug would derive the student's endpoint from the teacher's base_url and this would never confirm.
     open_qr(&student_base, "QR-A");
     let ev = wait_for(signed("QR-A", &student), 25).expect("student signs QR-A across endpoints");
-    assert!(ev["method"].as_str().unwrap_or("").contains("qr"), "signed via qr teacher-assist");
+    assert!(
+        ev["method"].as_str().unwrap_or("").contains("qr"),
+        "signed via qr teacher-assist"
+    );
 
     // --- Phase 2: a session lost mid-flight is recovered on BOTH sides ---
     // teacher_base: the whole session expires (its create/fetch serve a login page until re-login).
     // student_base: only the student's sign PUT expires (its detect poll stays healthy).
-    post_test(&teacher_base, "/_test/expire", r#"{"expired":true,"mode":"login_page"}"#);
-    post_test(&student_base, "/_test/expire_signs", r#"{"enabled":true,"user":"student"}"#);
+    post_test(
+        &teacher_base,
+        "/_test/expire",
+        r#"{"expired":true,"mode":"login_page"}"#,
+    );
+    post_test(
+        &student_base,
+        "/_test/expire_signs",
+        r#"{"enabled":true,"user":"student"}"#,
+    );
     open_qr(&student_base, "QR-B");
     assert!(
         wait_for(signed("QR-B", &student), 25).is_some(),
@@ -139,8 +179,14 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
 
     // No secret ever crosses the seam (logs or events).
     let serialized = events().lock().unwrap().join("\n");
-    assert!(!serialized.contains("QRDATA-XYZ"), "QR data never appears in events/logs");
-    assert!(!serialized.contains("session=sk-"), "session cookies never appear in events/logs");
+    assert!(
+        !serialized.contains("QRDATA-XYZ"),
+        "QR data never appears in events/logs"
+    );
+    assert!(
+        !serialized.contains("session=sk-"),
+        "session cookies never appear in events/logs"
+    );
 
     unsafe { crate::core_free(h) };
 }
