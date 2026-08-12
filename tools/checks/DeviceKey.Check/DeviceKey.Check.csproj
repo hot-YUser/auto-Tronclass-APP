@@ -9,5 +9,8 @@
   <ItemGroup>
     <Compile Include="..\..\..\ui\Interop\DeviceKeyProvider.cs" Link="DeviceKeyProvider.cs" />
     <Compile Include="..\..\..\ui\Platforms\Windows\DeviceKeyProtector.cs" Link="DeviceKeyProtector.cs" />
+    <Compile Include="..\..\..\ui\Interop\ICore.cs" Link="ICore.cs" />
+    <Compile Include="..\..\..\ui\Interop\NativeCore.cs" Link="NativeCore.cs" />
+    <Compile Include="..\..\..\ui\Interop\NativeMethods.g.cs" Link="NativeMethods.g.cs" />
   </ItemGroup>
 </Project>

@@ -138,14 +138,29 @@ public sealed class HeroRollcallPage : ModalPageBase
             void H(object? _, PropertyChangedEventArgs a) { if (a.PropertyName == nameof(RollcallAccountVm.Signed)) BuildChips(); }
             p.PropertyChanged += H; accHandlers[p] = H;
         }
-        void OnAccounts(object? _, NotifyCollectionChangedEventArgs __) { foreach (var p in vm.Accounts) HookAcc(p); BuildChips(); }
+        void OnAccounts(object? _, NotifyCollectionChangedEventArgs __)
+        {
+            // 頁面開啟期間帳號可能被移除:先解除+移除已不存在的訂閱,不留 stale VM/事件到 OnDisappearing。
+            foreach (var gone in accHandlers.Keys.Where(p => !vm.Accounts.Contains(p)).ToList())
+            {
+                gone.PropertyChanged -= accHandlers[gone];
+                accHandlers.Remove(gone);
+            }
+            foreach (var p in vm.Accounts) HookAcc(p);
+            BuildChips();
+        }
         async void OnVm(object? _, PropertyChangedEventArgs a)
         {
             if (a.PropertyName is nameof(RollcallVm.RemainingSecs)
                 or nameof(RollcallVm.Holding) or nameof(RollcallVm.AttendanceRate)) { UpdateBig(); return; }
             if (a.PropertyName != nameof(RollcallVm.Status)) return;
-            if (vm.IsPending) await close(this);
-            else if (vm.IsDone) { ShowSuccess(); await Task.Delay(800); await close(this); }
+            // async void 邊界:例外不得逸出(比照 HeroQuizPage.CloseAfterShowing 的處理)。
+            try
+            {
+                if (vm.IsPending) await close(this);
+                else if (vm.IsDone) { ShowSuccess(); await Task.Delay(800); await close(this); }
+            }
+            catch { /* close 內部已 rollback+Notify */ }
         }
 
         _subscribe = () =>
@@ -161,8 +176,12 @@ public sealed class HeroRollcallPage : ModalPageBase
         };
         async Task CloseCompleted()
         {
-            await Task.Delay(800);
-            await close(this);
+            try
+            {
+                await Task.Delay(800);
+                await close(this);
+            }
+            catch { /* close 內部已 rollback+Notify(比照 HeroQuizPage.CloseAfterShowing) */ }
         }
         _unsubscribe = () =>
         {
@@ -233,8 +252,13 @@ public sealed class HeroQuizPage : ModalPageBase
         {
             if (a.PropertyName == nameof(QuizVm.RemainingSecs)) { UpdateBig(); return; }
             if (a.PropertyName != nameof(QuizVm.Status)) return;
-            if (vm.Status is "held" or "discarded") await close(this);
-            else if (vm.Status == "done") { ShowEnded(); await Task.Delay(800); await close(this); }
+            // async void 邊界:例外不得逸出(比照 CloseAfterShowing 的處理)。
+            try
+            {
+                if (vm.Status is "held" or "discarded") await close(this);
+                else if (vm.Status == "done") { ShowEnded(); await Task.Delay(800); await close(this); }
+            }
+            catch { /* close 內部已 rollback+Notify */ }
         }
         _subscribe = () =>
         {

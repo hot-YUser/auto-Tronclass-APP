@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -460,8 +461,11 @@ public sealed record AnswerWire
 
 public sealed class ReasoningVm : ObservableObject
 {
-    string _text = "";
-    public string Text => _text;
+    // StringBuilder 線性累積,消除未綁定累積期間的字串複製(長串流下 string concat 是 O(n²));
+    // 已綁定的畫面每次 Raise 仍會投影完整字串(binding 取 Text),投影頻率由 core 的
+    // chunk batching(1KiB/100ms)限制,不逐字元複製。
+    readonly StringBuilder _text = new();
+    public string Text => _text.ToString();
     public bool HasText => _text.Length > 0;
-    public void Append(string chunk) { _text += chunk; Raise(nameof(Text)); Raise(nameof(HasText)); }
+    public void Append(string chunk) { _text.Append(chunk); Raise(nameof(Text)); Raise(nameof(HasText)); }
 }

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Text;
 using System.Text.Json;
 using TronClass.Interop;
 
@@ -11,7 +12,9 @@ namespace Ui;
 public sealed class AppState : ObservableObject
 {
     readonly ICore _core;
-    readonly Dictionary<(string ActivityToken, string AccountId, string SubjectId), string> _pendingReasoning = [];
+    // Quiz 出現前的推理串流暫存:StringBuilder 線性累積,避免逐 chunk string concat 的 O(n²);
+    // 轉入 ReasoningVm 時才 ToString 一次;已綁定畫面的可見更新仍全量投影,頻率由 core batching 限制。
+    readonly Dictionary<(string ActivityToken, string AccountId, string SubjectId), StringBuilder> _pendingReasoning = [];
     bool _bootReady;
 
     public AppState(ICore core)
@@ -145,9 +148,8 @@ public sealed class AppState : ObservableObject
                 break;
 
             case "Caps" when e.TryGetProperty("caps", out var c):
-                // Windows 沒有背景執行能力(無 FGS、關窗即結束),core 宣稱的能力在 Windows 上不成立——
-                // 誠實改為僅前景,Home/Settings 據此呈現不可用,不假裝有 tray/背景監控。
-                Caps.BackgroundMonitoring = !OperatingSystem.IsWindows() && Bool(c, "background_monitoring");
+                // 能力以 core 為唯一真值來源(監控能力在 core 端已是 target-aware)。
+                Caps.BackgroundMonitoring = Bool(c, "background_monitoring");
                 Caps.SelfUpdate = Bool(c, "self_update");
                 Caps.QrTeacherAssist = Bool(c, "qr_teacher_assist");
                 Caps.OcrCaptcha = Bool(c, "ocr_captcha");
@@ -397,7 +399,7 @@ public sealed class AppState : ObservableObject
             var reasoningKey = (pending.Key.AccountId, pending.Key.SubjectId);
             if (!vm.Reasoning.TryGetValue(reasoningKey, out var reasoning))
                 vm.Reasoning[reasoningKey] = reasoning = new ReasoningVm();
-            reasoning.Append(pending.Value);
+            reasoning.Append(pending.Value.ToString());
             _pendingReasoning.Remove(pending.Key);
         }
         vm.RaiseProgress();
@@ -426,7 +428,9 @@ public sealed class AppState : ObservableObject
         if (FindQuiz(activityToken) is not { } vm)
         {
             var key = (activityToken, accountId, subjectId);
-            _pendingReasoning[key] = _pendingReasoning.GetValueOrDefault(key) + (Str(e, "text") ?? "");
+            var builder = _pendingReasoning.GetValueOrDefault(key);
+            if (builder is null) _pendingReasoning[key] = builder = new StringBuilder();
+            builder.Append(Str(e, "text") ?? "");
             return;
         }
         var reasoningKey = (accountId, subjectId);
@@ -516,7 +520,7 @@ public sealed class AppState : ObservableObject
         var stop = _core.SendAsync("StopMonitoring");
         // 活著的 core 對 StopMonitoring 是同步即時回覆;只有已失去回應的 core 才等不到。
         // 到點後 stop task 仍由 NativeCore 自己的 300s safety net 收尾,這裡不阻擋 UI 回到 idle。
-        _ = stop.ContinueWith(static _ => { }, CancellationToken.None,
+        _ = stop.ContinueWith(static t => _ = t.Exception, CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
         try
         {

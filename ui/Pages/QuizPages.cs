@@ -213,6 +213,7 @@ public sealed class QuizDetailPage : ContentPage
         _vm.PerAccount.CollectionChanged += OnPerAccountChanged;
         HookAccounts();
         BuildAccountChips();
+        RenderQuestions();
     }
 
     protected override void OnDisappearing()
@@ -222,14 +223,25 @@ public sealed class QuizDetailPage : ContentPage
         foreach (var acc in _accPc.Keys.ToList()) Unhook(acc);
     }
 
-    void OnPerAccountChanged(object? _, NotifyCollectionChangedEventArgs __) { HookAccounts(); BuildAccountChips(); }
+    void OnPerAccountChanged(object? _, NotifyCollectionChangedEventArgs __) { HookAccounts(); BuildAccountChips(); RenderQuestions(); }
 
     void HookAccounts()
     {
+        // 頁面開啟期間帳號集合可能收縮(登出/移除):先退訂已不存在的帳號,stale 事件不再重渲,
+        // 長命 QuizVm 也不被已消失的 VM 拖住(字典不同步的話,委派會留到 OnDisappearing)。
+        foreach (var gone in _accPc.Keys.Where(acc => !_vm.PerAccount.Contains(acc)).ToList())
+            Unhook(gone);
         foreach (var acc in _vm.PerAccount)
             if (!_accPc.ContainsKey(acc))
             {
-                void OnPc(object? _, PropertyChangedEventArgs e) { if (e.PropertyName == nameof(QuizAccountVm.Submitted)) BuildAccountChips(); }
+                void OnPc(object? _, PropertyChangedEventArgs e)
+                {
+                    if (e.PropertyName != nameof(QuizAccountVm.Submitted)) return;
+                    // 非選中帳號送出只重渲 chips(問題卡不受影響,手寫草稿不被打斷);
+                    // 選中帳號送出會更新 SubmitResult 橫幅,才需要連問題一起重渲。
+                    BuildAccountChips();
+                    if (acc == _selected) RenderQuestions();
+                }
                 void OnQ(object? _, NotifyCollectionChangedEventArgs __) { if (acc == _selected) RenderQuestions(); }
                 acc.PropertyChanged += OnPc;
                 acc.Questions.CollectionChanged += OnQ;
@@ -268,7 +280,6 @@ public sealed class QuizDetailPage : ContentPage
             });
             _accountChips.Children.Add(pill);
         }
-        RenderQuestions();
     }
 
     void RenderQuestions()
@@ -300,6 +311,7 @@ sealed class QuestionCard : ContentView
     readonly QuestionVm _q;
     readonly int _index;
     bool _expanded;
+    string? _draft; // 手寫草稿:TextChanged 持續更新,跨自身 Render 保留;離開 editable 才清
 
     public QuestionCard(AppState state, QuizVm quiz, string accountId, QuestionVm q, int index)
     {
@@ -329,6 +341,9 @@ sealed class QuestionCard : ContentView
     void Render()
     {
         var editable = _q.Conflict && _quiz.ActionsVisible;
+        // 離開可編輯(定案/送出/暫緩)即清草稿;仍在可編輯期間的重渲(Answer/Source/Conflict 或
+        // 同卡 property 更新)保留使用者輸入——只保存字串,不重用已掛過 parent 的 MAUI child。
+        if (!editable) _draft = null;
         var stack = new VerticalStackLayout { Spacing = 8 };
 
         var header = new Grid();
@@ -371,7 +386,8 @@ sealed class QuestionCard : ContentView
                 "vote" => "輸入選項字母，多選以逗號分隔",
                 _ => "或自行輸入最終答案",
             };
-            var manual = new Entry { Placeholder = placeholder };
+            var manual = new Entry { Placeholder = placeholder, Text = _draft ?? "" };
+            manual.TextChanged += (_, e) => _draft = e.NewTextValue;
             var confirmRow = new Grid { ColumnSpacing = 8 };
             confirmRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
             confirmRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));

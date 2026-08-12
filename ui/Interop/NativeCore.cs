@@ -40,6 +40,14 @@ public sealed class NativeCore : ICore, IDisposable
         var existing = Interlocked.CompareExchange(ref _self, this, null);
         if (existing is not null && !ReferenceEquals(existing, this))
             throw new InvalidOperationException("NativeCore 每個程序只能建立一個實例。");
+        // 已釋放的 static 生命週期不得復活:不擋的話,殘留 _initialized=1 會讓新實例 BootAsync
+        // 直接回已完成 task 而假成功。檢查放在 CompareExchange 之後,與 Dispose 併行也 fail-closed;
+        // 失敗時把自己從 _self 還原,不留下無效的靜態路由目標。
+        if (Volatile.Read(ref _disposed) == 1)
+        {
+            Interlocked.CompareExchange(ref _self, null, this);
+            throw new ObjectDisposedException(nameof(NativeCore));
+        }
     }
 
     /// <summary>
@@ -78,9 +86,15 @@ public sealed class NativeCore : ICore, IDisposable
     /// </summary>
     public Task BootAsync(string dataDir)
     {
+        // disposed 檢查優先:已釋放的實例(即使成功 boot 過、_initialized=1)不得假成功回已完成 task——
+        // 同物件路徑也要 fail-closed,以 faulted task 讓 caller 明確看到 ObjectDisposedException。
+        if (Volatile.Read(ref _disposed) == 1)
+            return Task.FromException(new ObjectDisposedException(nameof(NativeCore)));
         if (Volatile.Read(ref _initialized) == 1) return Task.CompletedTask;
         lock (BootGate)
         {
+            if (Volatile.Read(ref _disposed) == 1)
+                return Task.FromException(new ObjectDisposedException(nameof(NativeCore)));
             if (Volatile.Read(ref _initialized) == 1) return Task.CompletedTask;
             return _bootTask ??= BootCoreAsync(dataDir);
         }

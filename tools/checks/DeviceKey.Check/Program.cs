@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using TronClass.Interop;
 
 var root = Path.Combine(Path.GetTempPath(), $"autotronclass-device-key-check-{Guid.NewGuid():N}");
@@ -10,6 +11,7 @@ try
     CheckCorruptEnvelopeIsPreserved(Path.Combine(root, "corrupt-envelope"));
     CheckConflictingLegacyKeyIsPreserved(Path.Combine(root, "conflict"));
     CheckCorruptLegacyKeyIsPreserved(Path.Combine(root, "corrupt-legacy"));
+    CheckNativeCoreLifecycle();
     Console.WriteLine("DeviceKey.Check：全部通過");
 }
 finally
@@ -91,6 +93,52 @@ static void CheckCorruptLegacyKeyIsPreserved(string directory)
     ExpectFailure(() => DeviceKeyProvider.LoadOrCreate(directory));
     Assert(File.ReadAllBytes(legacyPath).SequenceEqual(evidence), "損毀明文 key 必須保留");
     Assert(!File.Exists(Path.Combine(directory, "device.key.os")), "損毀 key 不得建立新 envelope");
+}
+
+/// <summary>NativeCore 生命週期契約(免 native DLL):單一實例、dispose 後 fail-closed、命令/啟動不假成功。</summary>
+static void CheckNativeCoreLifecycle()
+{
+    var first = new NativeCore();
+    ExpectThrows<InvalidOperationException>(() => new NativeCore(), "同程序第二個實例必須拒絕");
+    first.Dispose();
+
+    // dispose 後新建一律失敗:不擋的話,殘留 _initialized=1 會讓新實例 BootAsync 假成功。
+    ExpectThrows<ObjectDisposedException>(() => new NativeCore(), "dispose 後新建必須 fail-closed");
+
+    // dispose 後命令以明確失敗回覆收尾(不懸住 caller、不碰 native)。
+    var reply = first.SendAsync("StopMonitoring").GetAwaiter().GetResult();
+    Assert(reply.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False,
+        "dispose 後 SendAsync 必須回失敗回覆");
+
+    // dispose 後啟動不得假成功:尚未 init 的 handle 必須丟 ObjectDisposedException(在碰 native 之前)。
+    var bootDir = Path.Combine(Path.GetTempPath(), $"autotronclass-nc-boot-{Guid.NewGuid():N}");
+    try
+    {
+        ExpectThrows<ObjectDisposedException>(() => first.BootAsync(bootDir).GetAwaiter().GetResult(),
+            "dispose 後 BootAsync 必須失敗,不得假成功");
+    }
+    finally
+    {
+        // disposed 立即 fault 時 bootDir 從未被建立(DeviceKeyProvider 沒被呼叫),只在存在時刪。
+        if (Directory.Exists(bootDir)) Directory.Delete(bootDir, recursive: true);
+    }
+}
+
+static void ExpectThrows<T>(Action action, string message) where T : Exception
+{
+    try
+    {
+        action();
+    }
+    catch (T)
+    {
+        return;
+    }
+    catch (Exception other)
+    {
+        throw new InvalidOperationException($"檢查失敗：{message}（實際例外 {other.GetType().Name}）");
+    }
+    throw new InvalidOperationException($"檢查失敗：{message}（未拋例外）");
 }
 
 static void ExpectFailure(Func<byte[]> action)
