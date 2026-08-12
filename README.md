@@ -68,7 +68,7 @@ Rust core（登入、持久化、監控、點名、測驗、LLM、redaction）
 
 ## 從原始碼建置與測試
 
-需求：PowerShell 7.4+（發版腳本 `#requires`）、Rust 1.97.1（root `rust-toolchain.toml` 固定，rustup 自動採用）、可用的 .NET SDK（目前專案 target .NET 11 preview；`tools/release.ps1` 開頭會 gate SDK 必須是 11.0.100-preview feature band）、Windows MAUI workload；Android 建置另需 Android SDK/NDK（只接受 major 27，`build-core.ps1` 解析 `source.properties` 檢查）、JDK 及對應 workload。工具鏈路徑可用環境變數指定，請勿把金鑰寫入腳本或提交。
+需求：PowerShell 7.4+（發版腳本 `#requires`）、Rust 1.97.1（root `rust-toolchain.toml` 固定，rustup 自動採用）、`cargo-ndk` 4.1.2（Android 建置用）、精確的 .NET SDK 11.0.100-preview.6.26359.118（`tools/release.ps1` 開頭 gate 精確版本）、MAUI workload：`maui-windows` 與 `maui-android` 都要裝（即使只建 Windows，multi-target restore 也需要 `maui-android`；`tools/release.ps1` 會驗證兩者 manifest 精確版本）；Android 建置另需 Android SDK/NDK（精確 27.2.12479018，`build-core.ps1` 解析 `source.properties` 檢查）、JDK 及對應 workload。Rust channel 以 `rust-toolchain.toml` 為唯一規範；其餘工具鏈 pins（.NET SDK、MAUI workload set/manifest、NDK、cargo-ndk）以 `tools/toolchain.json` 為單一規範，CI 與發版腳本都從它讀取，請勿在其他地方重複硬編。工具鏈路徑可用環境變數指定，請勿把金鑰寫入腳本或提交。
 
 ```powershell
 # Rust 核心單元/整合測試與 lint
@@ -91,7 +91,7 @@ dotnet build ui/Ui.csproj -f net11.0-android -c Debug
 ./tools/release.ps1 -Tag v2.0.0-alpha.XX -ValidateOnly
 ```
 
-`tools/release.ps1` 需要 Android 簽章資訊與私有 keystore 才能做完整 APK 發行；私鑰不在 Repository。若只做 Windows 開發驗證，可依腳本參數跳過 Android，但跳過的 head 不得被當成完整雙平台發行證據。`tools/checks/DeviceKey.Check` 是無第三方依賴的 Windows 裝置金鑰/遷移 runnable check；CI 與發版也會執行協定 contract check（`ProtocolContract.Check`）與設定頁未儲存編輯保護檢查（`UiSettings.Check`）。
+`tools/release.ps1` 需要 Android 簽章資訊與私有 keystore 才能做完整 APK 發行；私鑰不在 Repository。若只做 Windows 開發驗證，可依腳本參數跳過 Android，但跳過的 head 不得被當成完整雙平台發行證據。`tools/checks/DeviceKey.Check` 是無第三方依賴的 Windows 裝置金鑰／遷移與 NativeCore 生命週期 runnable check；CI 與發版也會執行協定 contract check（`ProtocolContract.Check`）與設定頁未儲存編輯保護檢查（`UiSettings.Check`）。
 
 發版閘：git 工作樹必須乾淨（尊重 .gitignore）、`-Tag` 必須是嚴格 SemVer（`v?M.m.p[-alpha|beta|rc.N]`）並由共享公式計算 DisplayVersion／Android versionCode／Windows 數值版本（不依賴 Ui.csproj 手動版本欄位）；預設不要求 git tag 已存在，`-RequireTaggedHead` 才驗證 tag 指向 HEAD。CI 的 Windows job 會以 `v0.0.0-alpha.0` 跑一次 unsigned release dry-run（簽章密鑰不進 CI）。
 

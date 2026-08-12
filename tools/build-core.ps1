@@ -15,6 +15,16 @@ $ErrorActionPreference = "Stop"
 $tools = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $tools
 $core = Join-Path $root "core"
+# 工具鏈單一真理：NDK／cargo-ndk 版本都來自 tools/toolchain.json，不在此硬編。
+$toolchainPath = Join-Path $tools "toolchain.json"
+if (-not (Test-Path -LiteralPath $toolchainPath -PathType Leaf)) {
+    throw "缺少工具鏈規範：$toolchainPath"
+}
+try { $toolchain = Get-Content -Raw -LiteralPath $toolchainPath | ConvertFrom-Json }
+catch { throw "tools/toolchain.json 不是有效 JSON：$toolchainPath" }
+if ([string]::IsNullOrWhiteSpace([string]$toolchain.androidNdk) -or [string]::IsNullOrWhiteSpace([string]$toolchain.cargoNdk)) {
+    throw "tools/toolchain.json 缺少 androidNdk/cargoNdk"
+}
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 if (Test-Path -LiteralPath $cargoBin -PathType Container) { $env:PATH = "$cargoBin;$env:PATH" }
 $cargo = Join-Path $cargoBin "cargo.exe"
@@ -74,7 +84,7 @@ function Write-BuildMarker {
         [Parameter(Mandatory)] [string]$HeadName,
         [Parameter(Mandatory)] [DateTime]$BuildStartedUtc,
         [Parameter(Mandatory)] [object[]]$Artifacts,
-        # Android head 專用：完整 NDK 版本（如 27.2.12479018）；release 端會重驗 major 27。
+        # Android head 專用：完整 NDK 版本（如 27.2.12479018）；release 端會重驗精確版本。
         [string]$NdkVersion
     )
 
@@ -101,22 +111,39 @@ function Write-BuildMarker {
 }
 
 function Resolve-AndroidNdk {
-    # Point cargo-ndk at an explicitly configured or newest installed NDK.
+    # 明確設定的 ANDROID_NDK_HOME 最高優先；未設定時收集所有常見 SDK 安裝位置，
+    # 全域找第一個精確 pin 版本的 ndk 目錄；都無精確版時退而取任一已安裝 NDK，
+    # 讓後續的精確版本檢查給出明確錯誤；完全沒有 NDK 才 not found。
     if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME)) {
         $sdkCandidates = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT)
-        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $sdkCandidates += (Join-Path $env:LOCALAPPDATA "Android\sdk") }
-        $sdk = $sdkCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath ([string]$_) -PathType Container) } | Select-Object -First 1
-        if ($sdk) {
-            $ndkBase = Join-Path ([string]$sdk) "ndk"
-            $ndk = Get-ChildItem -LiteralPath $ndkBase -Directory -ErrorAction SilentlyContinue |
-                Sort-Object Name -Descending | Select-Object -First 1
-            if ($ndk) { $env:ANDROID_NDK_HOME = $ndk.FullName }
+        foreach ($base in @($env:LOCALAPPDATA, ${env:ProgramFiles(x86)})) {
+            if (-not [string]::IsNullOrWhiteSpace($base)) {
+                $sdkCandidates += (Join-Path $base "Android\sdk")
+                $sdkCandidates += (Join-Path $base "Android\android-sdk")
+            }
         }
+        $sdks = @($sdkCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath ([string]$_) -PathType Container) })
+        $ndk = $null
+        foreach ($sdk in $sdks) {
+            $exactNdk = Join-Path (Join-Path ([string]$sdk) "ndk") $toolchain.androidNdk
+            if (Test-Path -LiteralPath $exactNdk -PathType Container) {
+                $ndk = Get-Item -LiteralPath $exactNdk
+                break
+            }
+        }
+        if (-not $ndk) {
+            foreach ($sdk in $sdks) {
+                $ndk = Get-ChildItem -LiteralPath (Join-Path ([string]$sdk) "ndk") -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | Select-Object -First 1
+                if ($ndk) { break }
+            }
+        }
+        if ($ndk) { $env:ANDROID_NDK_HOME = $ndk.FullName }
     }
     if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME) -or -not (Test-Path -LiteralPath $env:ANDROID_NDK_HOME -PathType Container)) {
         throw "找不到 Android NDK；請設定 ANDROID_NDK_HOME 或安裝 SDK 內的 NDK。"
     }
-    # 只接受 NDK major 27（現機與 CI runner 皆為 27.x）；完整版本寫入 marker 供 release 重驗。
+    # 精確版本由 tools/toolchain.json 固定（與 CI 相同）；完整版本寫入 marker 供 release 重驗。
     $propsPath = Join-Path $env:ANDROID_NDK_HOME "source.properties"
     if (-not (Test-Path -LiteralPath $propsPath -PathType Leaf)) {
         throw "NDK 缺少 source.properties：$propsPath（$env:ANDROID_NDK_HOME 不是標準 NDK 安裝）"
@@ -126,9 +153,8 @@ function Resolve-AndroidNdk {
         throw "NDK source.properties 缺少 Pkg.Revision：$propsPath"
     }
     $ndkVersion = $Matches[1]
-    $ndkMajor = [int](($ndkVersion -split '\.')[0])
-    if ($ndkMajor -ne 27) {
-        throw "只支援 NDK major 27（目前安裝：$ndkVersion）；請安裝 27.x 或調整 ANDROID_NDK_HOME。"
+    if ($ndkVersion -ne $toolchain.androidNdk) {
+        throw "需要 NDK $($toolchain.androidNdk)（tools/toolchain.json 固定）；目前安裝：$ndkVersion（$env:ANDROID_NDK_HOME）。請安裝精確版本或調整 ANDROID_NDK_HOME。"
     }
     return $ndkVersion
 }
@@ -161,8 +187,8 @@ else {
             }
         }
         $cargoNdkVersion = & $cargo ndk --version
-        if ($LASTEXITCODE -ne 0 -or $cargoNdkVersion -notmatch 'cargo-ndk 4\.1\.2') {
-            throw "cargo-ndk 必須是 4.1.2；目前：$cargoNdkVersion"
+        if ($LASTEXITCODE -ne 0 -or $cargoNdkVersion -notmatch ('cargo-ndk ' + [regex]::Escape($toolchain.cargoNdk))) {
+            throw "cargo-ndk 必須是 $($toolchain.cargoNdk)（tools/toolchain.json 固定）；目前：$cargoNdkVersion"
         }
         Invoke-Native -FilePath $cargo -Arguments @("ndk", "-t", "arm64-v8a", "-t", "x86_64", "-o", "jniLibs", "build", "--release", "--locked") -FailureMessage "Android 原生核心 cargo ndk 失敗"
         foreach ($output in $outputs) {

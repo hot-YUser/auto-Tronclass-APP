@@ -285,20 +285,71 @@ function Assert-PublishedNativeHash {
 }
 
 # ── 工具鏈 ──
+# 所有工具鏈 pins 以 tools/toolchain.json 為單一規範（與 CI 相同），此處不重複硬編。
+$toolchainPath = Join-Path $tools "toolchain.json"
+if (-not (Test-Path -LiteralPath $toolchainPath -PathType Leaf)) {
+    throw "缺少工具鏈規範：$toolchainPath"
+}
+try { $toolchain = Get-Content -Raw -LiteralPath $toolchainPath | ConvertFrom-Json }
+catch { throw "tools/toolchain.json 不是有效 JSON：$toolchainPath" }
+foreach ($field in "dotnetSdk", "mauiWorkloadSet", "mauiManifest", "androidNdk", "cargoNdk") {
+    if ([string]::IsNullOrWhiteSpace([string]$toolchain.$field)) {
+        throw "tools/toolchain.json 缺少 $field"
+    }
+}
+
 $dotnet = Join-Path $env:LOCALAPPDATA "Microsoft\dotnet\dotnet.exe"
 if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) { $dotnet = "dotnet" }
-$dotnetDir = Split-Path $dotnet -Parent
+$dotnetCommand = Get-Command $dotnet -ErrorAction SilentlyContinue
+if (-not $dotnetCommand -or [string]::IsNullOrWhiteSpace([string]$dotnetCommand.Source)) {
+    throw "找不到 dotnet 可執行檔（$dotnet）；請安裝 .NET SDK $($toolchain.dotnetSdk) 或將它加入 PATH。"
+}
+$dotnetDir = Split-Path ([string]$dotnetCommand.Source) -Parent
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$dotnetDir;$env:PATH"
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
 
-# ── .NET SDK 閘：發行必須使用與 CI 相同的 11.0.100 preview feature band。
-#    同 band 內的安全 roll-forward（11.0.100-preview.*）可接受；其他 SDK 一律拒絕，
-#    避免在錯誤 SDK 上產出無法與 CI 重現的發行物。
+# ── .NET SDK 閘：必須是 tools/toolchain.json 固定的精確 SDK（與 CI 相同）；
+#    其他 SDK（含同 band 的其他 preview build）一律拒絕，避免在無法與 CI 重現的 SDK 上產出。
 $dotnetActual = Get-ToolVersion -Name $dotnet
-if ($dotnetActual -notmatch '^11\.0\.100-preview\.') {
-    throw "發行需要 .NET SDK 11.0.100-preview（與 CI 相同的 feature band）；目前：$dotnetActual。請安裝 11.0.100-preview.6.26359.118 或同 band 的 preview 後重試。"
+if ($dotnetActual.Trim() -ne [string]$toolchain.dotnetSdk) {
+    throw "發行需要 .NET SDK $($toolchain.dotnetSdk)（tools/toolchain.json 固定，與 CI 相同）；目前：$dotnetActual。請安裝精確版本後重試。"
 }
 Write-Host ("  ✓ .NET SDK $dotnetActual") -ForegroundColor Green
+
+# ── MAUI workload 閘：即使 -SkipAndroid，multi-target restore 仍需 maui-windows 與
+#    maui-android 兩個 workload；manifest 必須精確等於 mauiManifest（安裝時用的
+#    mauiWorkloadSet 是另一欄位，兩者不得混比）。直接解析 dotnet workload list 的
+#    row（locale-independent），不做 sdk-manifests 檔案路徑假設。
+$workloadList = @(& $dotnet workload list)
+if ($LASTEXITCODE -ne 0) { throw "dotnet workload list 失敗（退出碼 $LASTEXITCODE）" }
+foreach ($workload in "maui-windows", "maui-android") {
+    $manifestToken = $null
+    foreach ($line in $workloadList) {
+        $m = [regex]::Match($line, ("^\s*" + [regex]::Escape($workload) + "\s+(?<manifest>[^\s/]+)/"))
+        if ($m.Success) { $manifestToken = $m.Groups['manifest'].Value; break }
+    }
+    if ([string]::IsNullOrWhiteSpace($manifestToken)) {
+        throw "缺少已安裝 workload：$workload（需 manifest $($toolchain.mauiManifest)；請執行：dotnet workload install $workload --version $($toolchain.mauiWorkloadSet)）"
+    }
+    if ($manifestToken -ne [string]$toolchain.mauiManifest) {
+        throw "workload $workload 的 manifest 不符：需要 $($toolchain.mauiManifest)（tools/toolchain.json 固定）；目前：$manifestToken。請執行：dotnet workload install $workload --version $($toolchain.mauiWorkloadSet)"
+    }
+}
+Write-Host ("  ✓ MAUI workload manifest $($toolchain.mauiManifest)（maui-windows + maui-android）") -ForegroundColor Green
+
+# ── Rust 閘：cargo 建置前確認工具鏈與 repo 設定一致。
+#    Rust channel 的規範來源是 root rust-toolchain.toml（rustup 自動採用）；
+#    tools/toolchain.json 不重複放 rust 欄位，避免雙源。
+$rustToolchainConfig = Get-Content -Raw -LiteralPath (Join-Path $root "rust-toolchain.toml")
+$rustChannel = [regex]::Match($rustToolchainConfig, '(?im)^\s*channel\s*=\s*"([^"]+)"').Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($rustChannel)) {
+    throw "root rust-toolchain.toml 缺少 channel；發行前請先修正。"
+}
+$rustcActual = Get-ToolVersion -Name "rustc"
+if ($rustcActual -notmatch ("^rustc " + [regex]::Escape($rustChannel) + "\s")) {
+    throw "發行需要 Rust $rustChannel（root rust-toolchain.toml 固定，rustup 自動採用）；目前：$rustcActual。請以 rustup 安裝後重試。"
+}
+Write-Host ("  ✓ Rust $rustcActual") -ForegroundColor Green
 
 if (-not $SkipAndroid) {
     $javaCandidates = @()
@@ -317,7 +368,10 @@ if (-not $SkipAndroid) {
     foreach ($value in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT)) {
         if (-not [string]::IsNullOrWhiteSpace($value)) { $sdkCandidates += $value }
     }
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $sdkCandidates += (Join-Path $env:LOCALAPPDATA "Android\sdk") }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $sdkCandidates += (Join-Path $env:LOCALAPPDATA "Android\sdk")
+        $sdkCandidates += (Join-Path $env:LOCALAPPDATA "Android\android-sdk")
+    }
     if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) { $sdkCandidates += (Join-Path ${env:ProgramFiles(x86)} "Android\android-sdk") }
     $env:ANDROID_HOME = Resolve-ExistingDirectory -Label "Android SDK" -Candidates $sdkCandidates
     $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
@@ -377,8 +431,8 @@ if (-not $SkipAndroid) {
     & $buildCore -Head android -BuildMarkerPath $androidMarkerPath
     if ($LASTEXITCODE -ne 0) { throw "Android 原生核心腳本失敗（退出碼 $LASTEXITCODE）" }
     $androidMarker = Read-NativeMarker -Path $androidMarkerPath -ExpectedHead "android"
-    if ([string]::IsNullOrWhiteSpace([string]$androidMarker.ndkVersion) -or "$($androidMarker.ndkVersion)" -notmatch '^27\.') {
-        throw "Android marker 缺少完整 NDK 版本（需 major 27）：$androidMarkerPath"
+    if ([string]$androidMarker.ndkVersion -ne [string]$toolchain.androidNdk) {
+        throw "Android marker NDK 版本不符：需要 $($toolchain.androidNdk)（tools/toolchain.json 固定）；marker 記錄：$($androidMarker.ndkVersion)"
     }
 }
 
