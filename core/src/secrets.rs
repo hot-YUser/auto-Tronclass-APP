@@ -265,6 +265,15 @@ impl VaultFile {
             .map(|secret| secret.password.clone())
             .filter(|key| !key.is_empty())
     }
+    /// Whether a non-empty LLM API key is stored — a locked vault is `false`, and no clone of the
+    /// key is made (callers that only need to know skip `get_llm_key`'s copy).
+    pub fn has_llm_key(&self) -> bool {
+        self.key.is_some()
+            && self
+                .data
+                .get(LLM_KEY_ID)
+                .is_some_and(|secret| !secret.password.is_empty())
+    }
 
     pub fn lock(&mut self) {
         if let Some(mut key) = self.key.take() {
@@ -489,6 +498,30 @@ mod tests {
             "vault parse error must not echo decrypted content: {error}"
         );
         assert_eq!(error, "vault data corrupt");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn has_llm_key_reports_presence_without_cloning_and_follows_lock() {
+        let dir =
+            std::env::temp_dir().join(format!("tron-vault-has-key-{}", crate::config::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [3u8; 32];
+        let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
+        assert!(!vault.has_llm_key(), "a fresh vault has no LLM key");
+        vault.set_llm_key("llm-key".into()).unwrap();
+        assert!(vault.has_llm_key());
+        vault.set_llm_key(String::new()).unwrap();
+        assert!(
+            !vault.has_llm_key(),
+            "an empty key is not a usable key (matches get_llm_key)"
+        );
+        vault.set_llm_key("again".into()).unwrap();
+        vault.lock();
+        assert!(
+            !vault.has_llm_key(),
+            "a locked vault must never report a key"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

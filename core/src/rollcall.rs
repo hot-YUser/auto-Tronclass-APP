@@ -97,13 +97,11 @@ fn my_present(v: &Value, user_no: &str) -> bool {
 }
 
 /// Whole-class attendance rate (percent) for the 15% gate — computed from the roster (rollcall.rs).
+/// The body is read with the shared bounded reader (an oversized Content-Length → None, never an
+/// unbounded `.json()` buffer).
 pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Option<f64> {
-    let v: Value = client
-        .get(ep.student_rollcalls(id))
-        .send()
-        .await
-        .ok()?
-        .json()
+    let resp = client.get(ep.student_rollcalls(id)).send().await.ok()?;
+    let v = crate::http::read_bounded_json(resp, crate::http::MAX_API_JSON, "rollcall roster")
         .await
         .ok()?;
     let (present, total) = roster_stats(&v);
@@ -112,12 +110,8 @@ pub async fn attendance_rate(client: &Client, ep: &Endpoints, id: &str) -> Optio
 
 /// Read the shared number code once from the roster. None → caller brute-forces.
 pub async fn read_number_code(client: &Client, ep: &Endpoints, id: &str) -> Option<String> {
-    let v: Value = client
-        .get(ep.student_rollcalls(id))
-        .send()
-        .await
-        .ok()?
-        .json()
+    let resp = client.get(ep.student_rollcalls(id)).send().await.ok()?;
+    let v = crate::http::read_bounded_json(resp, crate::http::MAX_API_JSON, "rollcall roster")
         .await
         .ok()?;
     number_code_from_payload(&v)
@@ -926,6 +920,69 @@ mod tests {
         assert_eq!(classify_response(400, "wrong code"), CodeResult::Wrong);
         assert_eq!(classify_response(403, ""), CodeResult::Fatal);
         assert_eq!(classify_response(429, ""), CodeResult::Transient);
+    }
+
+    /// A one-shot roster server: `headers` is spliced verbatim after the status line (for a lying
+    /// Content-Length), then `body`.
+    async fn roster_server(headers: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{headers}Connection: close\r\n\r\n{body}"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn oversized_roster_bodies_are_rejected_not_buffered() {
+        // A Content-Length far above the 32 MiB API cap: the shared bounded read must reject it
+        // UP FRONT — an unbounded `.json()` (the old code) would try to buffer the whole lie.
+        // Both roster readers keep their Option semantics (None on any failure).
+        let base = roster_server(
+            "Content-Length: 999999999\r\n",
+            "{\"number_code\":\"1234\"}",
+        )
+        .await;
+        assert_eq!(
+            attendance_rate(&Client::new(), &Endpoints::derive(&base), "1").await,
+            None
+        );
+        let base = roster_server(
+            "Content-Length: 999999999\r\n",
+            "{\"number_code\":\"1234\"}",
+        )
+        .await;
+        assert_eq!(
+            read_number_code(&Client::new(), &Endpoints::derive(&base), "1").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_roster_bodies_still_read_through_the_bounded_path() {
+        // The bounded read must not disturb the success path: a small roster yields the rate and
+        // the code exactly as before. `roster_server` serves ONE request, so each reader gets its
+        // own server.
+        let body = "{\"student_rollcalls\":[{\"user_no\":\"a\",\"rollcall_status\":\"on_call_fine\"},{\"user_no\":\"b\",\"rollcall_status\":\"absent\"}],\"number_code\":\"4321\"}";
+        let base = roster_server("", body).await;
+        assert_eq!(
+            attendance_rate(&Client::new(), &Endpoints::derive(&base), "1").await,
+            Some(50.0)
+        );
+        let base = roster_server("", body).await;
+        assert_eq!(
+            read_number_code(&Client::new(), &Endpoints::derive(&base), "1")
+                .await
+                .as_deref(),
+            Some("4321")
+        );
     }
 
     #[test]

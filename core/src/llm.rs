@@ -18,7 +18,14 @@ const READ_IDLE: Duration = Duration::from_secs(180);
 const MAX_LLM_BODY: usize = 64 * 1024 * 1024;
 /// Hard cap for accumulated streaming content (a runaway/broken stream must not fill memory; a
 /// truncated answer is worse than none, so overflow degrades to `None` → the subject is re-asked).
+/// Also caps the SSE line buffer (`pending`) and the total reasoning volume — no second, guessed cap.
 const MAX_STREAM_CONTENT: usize = 8 * 1024 * 1024;
+/// Reasoning chunks are batched: at most one `ReasoningChunk` event per 1 KiB of accumulated text or
+/// ~100 ms, whichever comes first — a per-delta emit storms the FFI/UI seam on long reasoning
+/// streams. Internal event batching only (the accumulated text order is never changed), NOT a
+/// product word cap.
+const REASONING_BATCH_BYTES: usize = 1024;
+const REASONING_BATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct LlmConfig {
     pub endpoint: String,
@@ -32,8 +39,10 @@ pub struct LlmConfig {
     pub max_tool_iterations: u32,
 }
 
-/// R5 tool-calling context: the authed account's `base_url` + the quiz's `course_id`, so the executor
-/// can fetch that course's materials on the SAME client used for the LLM call.
+/// R5 tool-calling context: the authed account's `base_url` + the quiz's `course_id`, used by the
+/// course-material executor. The executor runs on the account's authed `school` client — NEVER the
+/// cookie-less LLM client (school cookies must not reach the model endpoint; the two clients are
+/// kept strictly separate, see `answer_question`).
 pub struct ToolCtx<'a> {
     pub base_url: &'a str,
     pub course_id: &'a str,
@@ -220,6 +229,50 @@ pub async fn answer_question(
     }
 }
 
+/// Append `s` to `acc`, returning `false` (and appending nothing) when the result would exceed
+/// `cap`. Pure and cap-parameterized so the stream caps are unit-tested at the boundary without
+/// ever allocating `cap` bytes.
+fn push_capped(acc: &mut String, s: &str, cap: usize) -> bool {
+    if acc.len().saturating_add(s.len()) > cap {
+        return false;
+    }
+    acc.push_str(s);
+    true
+}
+
+/// Reasoning-chunk batching policy: coalesce per-delta `ReasoningChunk` events — emit once the
+/// pending batch reaches `batch_bytes` OR `batch_interval` has elapsed since the last emit. Pure
+/// (time is injected) so the boundary is unit-tested without sleeping.
+fn should_emit_reasoning(
+    pending_bytes: usize,
+    since_last_emit: std::time::Duration,
+    batch_bytes: usize,
+    batch_interval: std::time::Duration,
+) -> bool {
+    pending_bytes >= batch_bytes || since_last_emit >= batch_interval
+}
+
+/// Emit the accumulated reasoning batch as ONE `ReasoningChunk` (text order preserved) and clear
+/// it. Called on size/time thresholds during the stream and once more on `[DONE]`/EOF.
+fn flush_reasoning(
+    cb: EventCb,
+    pending: &mut String,
+    activity_token: &str,
+    account_id: &str,
+    subject_id: &str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    emit(
+        cb,
+        &json!({ "id": null, "event": "ReasoningChunk",
+                      "activity_token": activity_token, "account_id": account_id,
+                      "subject_id": subject_id, "text": pending.as_str() }),
+    );
+    pending.clear();
+}
+
 /// The R3b streaming path (no tools): SSE, reasoning streamed delta-by-delta as `ReasoningChunk`.
 #[allow(clippy::too_many_arguments)]
 async fn stream_answer(
@@ -248,15 +301,38 @@ async fn stream_answer(
     // Parse the SSE stream incrementally with Response::chunk() (no futures-stream dependency).
     let mut pending = String::new();
     let mut content = String::new();
+    // Reasoning deltas accumulate and are emitted COALESCED (size/time thresholds) so a long
+    // reasoning stream cannot storm the FFI/UI seam with one event per delta; the TOTAL reasoning
+    // volume is capped by the shared MAX_STREAM_CONTENT (overflow → None, like the answer text).
+    let mut reasoning_pending = String::new();
+    let mut reasoning_total = 0usize;
+    let mut last_reasoning_emit = std::time::Instant::now();
     // `[DONE]` must terminate the OUTER read loop: a compliant server closes the stream right after,
     // but a slow one may keep the connection open — breaking only the line loop would hang forever.
     'stream: loop {
         let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => break, // stream ended
+            Ok(Ok(None)) => {
+                // stream ended — flush the last reasoning batch, then finish
+                flush_reasoning(
+                    cb,
+                    &mut reasoning_pending,
+                    activity_token,
+                    account_id,
+                    subject_id,
+                );
+                break;
+            }
             _ => return None, // read-idle hit or transport failure → never answer from a partial stream
         };
-        pending.push_str(&String::from_utf8_lossy(&chunk));
+        // A newline-less line must not grow the SSE buffer without bound: the same shared cap.
+        if !push_capped(
+            &mut pending,
+            &String::from_utf8_lossy(&chunk),
+            MAX_STREAM_CONTENT,
+        ) {
+            return None;
+        }
         while let Some(nl) = pending.find('\n') {
             let line: String = pending.drain(..=nl).collect();
             let line = line.trim();
@@ -265,6 +341,13 @@ async fn stream_answer(
             };
             let data = data.trim();
             if data == "[DONE]" {
+                flush_reasoning(
+                    cb,
+                    &mut reasoning_pending,
+                    activity_token,
+                    account_id,
+                    subject_id,
+                );
                 break 'stream;
             }
             let Ok(v) = serde_json::from_str::<Value>(data) else {
@@ -272,16 +355,29 @@ async fn stream_answer(
             };
             let delta = &v["choices"][0]["delta"];
             if let Some(r) = reasoning_content(delta) {
-                emit(
-                    cb,
-                    &json!({ "id": null, "event": "ReasoningChunk",
-                                  "activity_token": activity_token, "account_id": account_id,
-                                  "subject_id": subject_id, "text": r }),
-                );
+                if reasoning_total.saturating_add(r.len()) > MAX_STREAM_CONTENT {
+                    return None; // runaway reasoning volume — degrade to None (subject re-asked)
+                }
+                reasoning_total += r.len();
+                reasoning_pending.push_str(r);
+                if should_emit_reasoning(
+                    reasoning_pending.len(),
+                    last_reasoning_emit.elapsed(),
+                    REASONING_BATCH_BYTES,
+                    REASONING_BATCH_INTERVAL,
+                ) {
+                    flush_reasoning(
+                        cb,
+                        &mut reasoning_pending,
+                        activity_token,
+                        account_id,
+                        subject_id,
+                    );
+                    last_reasoning_emit = std::time::Instant::now();
+                }
             }
             if let Some(c) = delta.get("content").and_then(Value::as_str) {
-                content.push_str(c);
-                if content.len() > MAX_STREAM_CONTENT {
+                if !push_capped(&mut content, c, MAX_STREAM_CONTENT) {
                     return None; // runaway stream — truncated content must never be submitted as an answer
                 }
             }
@@ -467,9 +563,10 @@ fn strip_think(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_question, build_client, build_request_body, stream_answer, strip_think, LlmConfig,
+        answer_question, build_client, build_request_body, push_capped, should_emit_reasoning,
+        stream_answer, strip_think, LlmConfig,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn config(endpoint: &str) -> LlmConfig {
         LlmConfig {
@@ -711,6 +808,239 @@ mod tests {
         assert_eq!(
             strip_think("the answer is <thinking>"),
             "the answer is <thinking>"
+        );
+    }
+
+    #[test]
+    fn push_capped_enforces_the_boundary_without_allocating_the_cap() {
+        // The stream caps are tested through this pure helper at a tiny cap — no 8 MiB allocation.
+        let mut acc = String::from("abc");
+        assert!(push_capped(&mut acc, "def", 6)); // exactly at the cap → accepted
+        assert_eq!(acc, "abcdef");
+        assert!(!push_capped(&mut acc, "x", 6)); // one over → rejected, nothing appended
+        assert_eq!(acc, "abcdef");
+        assert!(push_capped(&mut acc, "", 6)); // an empty append never fails
+        assert_eq!(acc, "abcdef");
+        let mut tiny = String::new();
+        assert!(!push_capped(&mut tiny, "hello", 4));
+        assert_eq!(tiny, "");
+    }
+
+    #[test]
+    fn reasoning_emit_policy_batches_on_size_or_interval() {
+        use std::time::Duration;
+        let interval = Duration::from_millis(100);
+        // Size threshold reached → emit even before the interval elapses.
+        assert!(should_emit_reasoning(1024, Duration::ZERO, 1024, interval));
+        assert!(should_emit_reasoning(1500, Duration::ZERO, 1024, interval));
+        // Interval elapsed → emit even for a small pending batch.
+        assert!(should_emit_reasoning(10, interval, 1024, interval));
+        // Neither → hold the batch.
+        assert!(!should_emit_reasoning(1023, Duration::ZERO, 1024, interval));
+        assert!(!should_emit_reasoning(
+            10,
+            Duration::from_millis(99),
+            1024,
+            interval
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_lines_spanning_chunks_are_assembled_before_parsing() {
+        // A server may split one SSE line across chunks with no newline: the buffer must assemble
+        // the line across chunk boundaries (its cap is the pure `push_capped` boundary above).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            // One logical event split into three newline-less chunks.
+            stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"B")
+                .await
+                .unwrap();
+            stream.write_all(b"\"}}]}\n").await.unwrap();
+            stream.write_all(b"\ndata: [DONE]\n").await.unwrap();
+        });
+        let client = build_client().unwrap();
+        let cfg = config(&format!("http://{address}/v1/chat/completions"));
+        let full = vec![
+            json!({"role": "system", "content": crate::llm::SYSTEM_PROMPT}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_answer(
+                &client,
+                &cfg,
+                full,
+                noop_cb,
+                "t",
+                "a",
+                "s",
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the stream must complete")
+        .expect("the assembled line must parse and yield an answer");
+        assert_eq!(answer, "B");
+    }
+
+    // Collects `ReasoningChunk` texts in emit order. `thread_local!` — `tokio::test` runs on a
+    // current-thread runtime, so the stream's emits and the test's assertions share this thread;
+    // separate locals keep the two tests fully isolated with zero locking.
+    thread_local! {
+        static RA_FLUSH: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        static RA_VOLUME: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    extern "C" fn collect_flush(ptr: *const u8, len: usize) {
+        let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
+        if let Ok(v) = serde_json::from_str::<Value>(s) {
+            if v["event"] == "ReasoningChunk" {
+                if let Some(t) = v["text"].as_str() {
+                    RA_FLUSH.with(|c| c.borrow_mut().push(t.to_string()));
+                }
+            }
+        }
+    }
+    extern "C" fn collect_volume(ptr: *const u8, len: usize) {
+        let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
+        if let Ok(v) = serde_json::from_str::<Value>(s) {
+            if v["event"] == "ReasoningChunk" {
+                if let Some(t) = v["text"].as_str() {
+                    RA_VOLUME.with(|c| c.borrow_mut().push(t.to_string()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_are_batched_and_flushed_in_order() {
+        // 2 × 200-byte reasoning deltas stay below the 1 KiB emit threshold: nothing is emitted
+        // during the stream, and the [DONE] flush emits ONE event with both texts in stream order.
+        RA_FLUSH.with(|c| c.borrow_mut().clear());
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let r1 = "x".repeat(200);
+        let r2 = "y".repeat(200);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{r1}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{r2}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"content\":\"B\"}}}}]}}\n\
+             \ndata: [DONE]\n"
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(payload.as_bytes()).await.unwrap();
+        });
+        let client = build_client().unwrap();
+        let cfg = config(&format!("http://{address}/v1/chat/completions"));
+        let full = vec![
+            json!({"role": "system", "content": crate::llm::SYSTEM_PROMPT}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_answer(
+                &client,
+                &cfg,
+                full,
+                collect_flush,
+                "t",
+                "a",
+                "s",
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("stream must complete")
+        .expect("answer must parse");
+        assert_eq!(answer, "B");
+        let emits = RA_FLUSH.with(|c| c.borrow().clone());
+        // Either ONE [DONE]-flush batch (fast machine) or at most TWO if the 100 ms interval split
+        // the deltas (slow machine) — the hard contract is stream order and the final flush.
+        assert!(
+            !emits.is_empty() && emits.len() <= 2,
+            "deltas must be coalesced, got {emits:?}"
+        );
+        assert_eq!(
+            emits.concat(),
+            format!("{r1}{r2}"),
+            "reasoning text order must be preserved"
+        );
+        assert!(
+            emits.last().unwrap().ends_with(&r2),
+            "the final flush must carry the last reasoning text"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_volume_over_the_batch_size_emits_mid_stream_in_order() {
+        // 3 × 500-byte deltas cross the 1 KiB threshold mid-stream: batches may split, but the
+        // concatenated emit order must equal the stream order (never reordered or dropped).
+        RA_VOLUME.with(|c| c.borrow_mut().clear());
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let parts = ["a".repeat(500), "b".repeat(500), "c".repeat(500)];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}]}}\n\
+             data: {{\"choices\":[{{\"delta\":{{\"content\":\"A\"}}}}]}}\n\
+             \ndata: [DONE]\n",
+            parts[0], parts[1], parts[2]
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(payload.as_bytes()).await.unwrap();
+        });
+        let client = build_client().unwrap();
+        let cfg = config(&format!("http://{address}/v1/chat/completions"));
+        let full = vec![
+            json!({"role": "system", "content": crate::llm::SYSTEM_PROMPT}),
+            json!({"role": "user", "content": "q"}),
+        ];
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_answer(
+                &client,
+                &cfg,
+                full,
+                collect_volume,
+                "t",
+                "a",
+                "s",
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("stream must complete")
+        .expect("answer must parse");
+        assert_eq!(answer, "A");
+        let emits = RA_VOLUME.with(|c| c.borrow().clone());
+        assert!(
+            !emits.is_empty(),
+            "the batch must be flushed before the answer"
+        );
+        assert_eq!(
+            emits.concat(),
+            format!("{}{}{}", parts[0], parts[1], parts[2]),
+            "reasoning must be emitted in stream order, never dropped"
         );
     }
 }

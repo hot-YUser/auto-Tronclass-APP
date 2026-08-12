@@ -69,12 +69,6 @@ fn operating_gate_open_and_closed() {
         "without the offset it is 00:00, outside"
     );
 
-    // v1 0=Sunday weekday import maps to internal 0=Monday..6=Sunday.
-    use crate::config::simple_weekday_to_internal;
-    assert_eq!(simple_weekday_to_internal(0), 6, "v1 Sunday → internal 6");
-    assert_eq!(simple_weekday_to_internal(1), 0, "v1 Monday → internal 0");
-    assert_eq!(simple_weekday_to_internal(6), 5, "v1 Saturday → internal 5");
-
     // A window that wraps past midnight.
     let overnight: Operating = serde_json::from_value(json!({
         "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "22:00", "end": "02:00" }] }]
@@ -222,6 +216,10 @@ fn none_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> bool {
 fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
     move |v| v["event"] == "Reply" && v["id"] == id
 }
+// boot 專用：回覆必須是 ok=true，失敗時由 .expect 以階段訊息立即停止。
+fn ok_reply(id: u64) -> impl Fn(&Value) -> bool {
+    move |v| v["event"] == "Reply" && v["id"] == id && v["ok"] == true
+}
 fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
@@ -306,7 +304,7 @@ fn settings_persist_over_the_seam() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    assert!(wait_for(reply_ok(i), 10).is_some());
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
 
     let i = hz.next();
     let patch = r#"{"llm_max_tokens":32000,"radar_strategy":["empty_answer","global_wgs84"],
@@ -318,7 +316,7 @@ fn settings_persist_over_the_seam() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{patch}}}"#),
     );
-    assert!(wait_for(reply_ok(i), 5).unwrap()["ok"] == true);
+    wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
 
     // Read the persisted config.json back and confirm every knob round-tripped.
     let cfg = crate::config::Config::load(&PathBuf::from(&dir).join("config.json")).unwrap();
@@ -349,13 +347,13 @@ fn captcha_login_challenge_and_submit() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    assert!(wait_for(reply_ok(i), 10).is_some());
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
 
     // Turn on the fake's captcha login page.
     post(
@@ -371,7 +369,7 @@ fn captcha_login_challenge_and_submit() {
             r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let dave = account_id("dave").unwrap();
 
     let login_id = hz.next();
@@ -423,13 +421,13 @@ fn captcha_wrong_answer_fails() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     post(
         &base,
         "/_test/captcha",
@@ -442,7 +440,7 @@ fn captcha_wrong_answer_fails() {
             r#"{{"id":{i},"cmd":"AddAccount","label":"e","school":"{base}","username":"e","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let eid = account_id("e").unwrap();
     let login_id = hz.next();
     send(
@@ -473,13 +471,13 @@ fn sso_login_routes_to_cookie_fallback() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     post(&base, "/_test/sso", r#"{"enabled":true}"#);
 
     let i = hz.next();
@@ -489,7 +487,7 @@ fn sso_login_routes_to_cookie_fallback() {
             r#"{{"id":{i},"cmd":"AddAccount","label":"carol","school":"{base}","username":"carol","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let carol = account_id("carol").unwrap();
 
     let login_id = hz.next();
@@ -536,28 +534,29 @@ fn schedule_closed_suppresses_monitoring() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
 
     // All seven weekdays enabled but with no windows → closed all the time, whatever today is.
     let days: Vec<String> = (0..7)
         .map(|w| format!(r#"{{"weekday":{w},"enabled":true,"windows":[]}}"#))
         .collect();
     let i = hz.next();
+    // poll_idle_secs=1：absence 窗口 5s ≥ 3× poll cadence；預設 5s 會使窗口與 cadence 相等而變飄。
     send(
         hz.h,
         &format!(
-            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"operating":{{"days":[{}]}}}}}}"#,
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"poll_idle_secs":1,"operating":{{"days":[{}]}}}}}}"#,
             days.join(",")
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
 
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
@@ -565,14 +564,15 @@ fn schedule_closed_suppresses_monitoring() {
             r#"{{"id":{i},"cmd":"AddAccount","label":"frank","school":"{base}","username":"frank","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(reply_ok(i), 15);
+    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
     wait_for(
         |v| v["event"] == "AccountStatus" && v["state"] == "online",
         10,
-    );
+    )
+    .expect("帳號未上線");
 
     // Open a rollcall — but the poller is gated closed, so it must never be detected.
     post(
@@ -605,7 +605,7 @@ fn vault_auto_unlocks_without_a_password() {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     assert!(
         wait_for(|v| v["event"] == "VaultState" && v["unlocked"] == true, 3).is_some(),
         "vault auto-unlocks at Init — no password step"
@@ -619,11 +619,7 @@ fn vault_auto_unlocks_without_a_password() {
             r#"{{"id":{i},"cmd":"AddAccount","label":"g","school":"http://x","username":"g","password":"secret"}}"#
         ),
     );
-    assert_eq!(
-        wait_for(reply_ok(i), 5).unwrap()["ok"],
-        true,
-        "AddAccount works with no unlock step"
-    );
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
 }
 
 /// Boot one account against a fresh fake and start monitoring with the anti-fake gate at `gate` %.
@@ -636,15 +632,16 @@ fn boot_monitoring(tag: &str, gate: f64) -> (Harness, String) {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
+    // poll_idle_secs=1：config_update 的 absence 窗口 3s ≥ 3× poll cadence；預設 5s 會小於窗口。
     send(
         hz.h,
         &format!(
-            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":1,"attendance_gate_percent":{gate}}}}}"#
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":1,"poll_idle_secs":1,"attendance_gate_percent":{gate}}}}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
@@ -652,14 +649,15 @@ fn boot_monitoring(tag: &str, gate: f64) -> (Harness, String) {
             r#"{{"id":{i},"cmd":"AddAccount","label":"eve","school":"{base}","username":"eve","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(reply_ok(i), 15);
+    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
     wait_for(
         |v| v["event"] == "AccountStatus" && v["state"] == "online",
         10,
-    );
+    )
+    .expect("帳號未上線");
     (hz, base)
 }
 

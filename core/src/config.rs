@@ -270,17 +270,6 @@ fn parse_hhmm(s: &str) -> Option<u32> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
-/// Map a v1-style 0=Sunday weekday to our internal 0=Monday..6=Sunday. Pure — apply at the boundary when
-/// ingesting a v1 schedule (no such import path exists yet; kept ready). ponytail: unwired until needed.
-#[allow(dead_code)] // wired only when a v1-config import path lands; exercised by slice4_test today
-pub fn simple_weekday_to_internal(v1_weekday: u8) -> u8 {
-    // v1: 0=Sun,1=Mon,..6=Sat → internal: {0:6, 1:0, 2:1, 3:2, 4:3, 5:4, 6:5}.
-    [6, 0, 1, 2, 3, 4, 5]
-        .get(v1_weekday as usize)
-        .copied()
-        .unwrap_or(0)
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]

@@ -634,8 +634,8 @@ pub async fn verify_session(client: &Client, endpoints: &Endpoints) -> bool {
     if !resp.status().is_success() {
         return false;
     }
-    if resp.url().path().contains("login") {
-        return false; // redirected back to a login page
+    if crate::http::response_url_is_login(resp.url()) {
+        return false; // redirected back to a login page (shared segment classifier, never a substring scan)
     }
     let body = match crate::http::read_bounded(resp, MAX_SESSION_JSON, "session check").await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -715,6 +715,68 @@ mod tests {
             form.fields
                 .contains(&("csrf".to_string(), "tok&1".to_string())),
             "hidden input echoed (unescaped)"
+        );
+    }
+
+    /// Serve exactly two sequential responses: `(status, location, body)` — the first may redirect
+    /// (reqwest follows), the second answers the followed URL.
+    async fn two_hop_server(
+        first: (u16, &'static str, &'static str),
+        second: (u16, &'static str, &'static str),
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, location, body) in [first, second] {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let loc = if location.is_empty() {
+                    String::new()
+                } else {
+                    format!("Location: {location}\r\n")
+                };
+                let reason = match status {
+                    302 => "Found",
+                    s if s >= 400 => "Error",
+                    _ => "OK",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{loc}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn verify_session_accepts_api_paths_that_merely_contain_login_substrings() {
+        // The old whole-path `contains("login")` check false-positived on ANY path containing the
+        // substring (e.g. /api/login-history) — a healthy authenticated 200 JSON was read as a dead
+        // session. The shared classifier is segment-based: such paths must verify OK.
+        let base = two_hop_server(
+            (302, "/api/login-history/current-semester-info", ""),
+            (200, "", "{\"id\":1}"),
+        )
+        .await;
+        assert!(
+            verify_session(&Client::new(), &Endpoints::derive(&base)).await,
+            "a path containing 'login' as a substring is a valid API path, not a login redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_session_rejects_a_real_login_redirect() {
+        // A genuine redirect to the login page stays a dead session through the shared classifier.
+        let base = two_hop_server((302, "/login", ""), (200, "", "{\"id\":1}")).await;
+        assert!(
+            !verify_session(&Client::new(), &Endpoints::derive(&base)).await,
+            "redirecting to /login must fail the session check even with a 200 JSON follow-up"
         );
     }
 

@@ -45,11 +45,16 @@ required-features = ["fakeserver"]
 
 # 信條：小巧＝一般情況的最高宗旨，只有「真衝突」才讓給速度/清晰。此核心 I/O-bound，
 # opt-z 對速度無實質衝突 → 選最小的 z。strip/lto 不犧牲速度也能縮小。
-# panic 必須是 unwind：FFI 三入口用 catch_unwind 攔截，不讓 panic 跨 C ABI（panic=abort 會讓
-# catch_unwind 失效、任何內部 panic 直接殺掉整個 MAUI 程序）。unwinding 表的代價由 strip/lto 抵銷。
+# panic 必須是 unwind。量測（Windows x64，同份程式碼）：unwind 5,385,728 B vs panic=abort
+# 3,716,608 B，unwind 約多 1.7 MB。選 unwind 的理由：(1) FFI 三入口用 catch_unwind 攔截，
+# 不讓 panic 跨 C ABI——abort 會讓 catch_unwind 失效、任何內部 panic 直接殺掉整個 MAUI 程序；
+# (2) hostile PDF 內容（course-material 工具）觸發的 panic 必須可攔截復原，而不是整機崩潰；
+# (3) async command 以單項 JoinSet observer 當 backstop，只有 unwind 才能把 panic 送到 observer
+# 轉成固定錯誤回覆。此量測是單次決策依據，刻意不做成 build gate——尺寸會隨程式碼演進漂移，
+# gate 只會逼出「改 panic 策略」以外的無意義調整。
 [profile.release]
 opt-level = "z"     # 最小；I/O-bound 核心 opt-z 對速度無實質衝突 → 小巧優先
 lto = true          # link-time optimization：速度與大小通常都更好
 codegen-units = 1   # 更佳最佳化、更小
 strip = true        # 去除符號
-panic = "unwind"    # FFI seam 的 catch_unwind 需要 unwinding（見上）
+panic = "unwind"    # FFI seam 的 catch_unwind + async panic observer 需要 unwinding（見上）

@@ -1,7 +1,10 @@
 //! The core state machine: owns the tokio runtime, the event callback, a long-lived heartbeat,
 //! and (after `Init`) the registry / config / vault behind one mutex. Commands lock, mutate,
-//! persist, and emit; the one async command (Login) snapshots what it needs, drops the lock,
-//! does the network round-trip, then re-locks to cache cookies. Secrets never enter an event.
+//! persist, and emit; the async commands (Login, StartMonitoring, ImportCookies) snapshot what
+//! they need, drop the lock, do the network round-trip, then re-lock to persist. Each async
+//! command runs in a single-task JoinSet observer so a panic becomes the fixed INTERNAL_ERROR
+//! reply instead of killing the runtime; StartMonitoring additionally wires a watchdog that tears
+//! a panicked RUNNING monitor down. Secrets never enter an event.
 
 use crate::config::{new_id, AccountMeta, Config, Operating, Settings};
 use crate::login::{self, LoginOutcome};
@@ -15,12 +18,13 @@ use reqwest::Client;
 use reqwest_cookie_store::CookieStoreMutex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 
 pub type EventCb = extern "C" fn(*const u8, usize);
 
@@ -162,10 +166,34 @@ fn recover_account_transaction(
     )))
 }
 
+/// Lazy journal recovery before an account mutation. A crash between `begin` and `complete` leaves
+/// a stale journal; resolving it FIRST means a leftover record can never wedge the next mutation.
+/// Success warns with the recovery message; failure returns the fixed error — the journal loader's
+/// own error can echo file content, so it must never cross the seam. The caller fails the mutation
+/// on `Err`; the vault must already be unlocked.
+fn recover_stale_journal(st: &mut CoreState, cb: EventCb) -> Result<(), String> {
+    match recover_account_transaction(&st.data_dir, &st.config, st.vault.as_mut().unwrap()) {
+        Ok(Some(message)) => {
+            emit(
+                cb,
+                &json!({ "id": null, "event": "LogLine", "level": "warn", "text": message }),
+            );
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(_) => Err("account transaction journal unreadable; recovery skipped".to_string()),
+    }
+}
+
 pub struct Core {
     rt: Runtime,
     cb: EventCb,
     state: Arc<Mutex<Option<CoreState>>>,
+    /// Per-core captcha answer window (tests only). Defaults to the production 180 s; ONLY the
+    /// timeout e2e shortens it on its own core, so other captcha tests (even in other modules,
+    /// running in parallel) are never affected. Production builds have no field — always 180 s.
+    #[cfg(test)]
+    captcha_answer_timeout: Duration,
 }
 
 /// All events cross the seam through the single audited redaction pass (docs 90 §4).
@@ -214,6 +242,8 @@ impl Core {
             rt,
             cb,
             state: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            captcha_answer_timeout: Duration::from_secs(180),
         }))
     }
 }
@@ -292,7 +322,131 @@ pub fn send(core: &Core, json_bytes: &[u8]) {
     }
 }
 
-/// Everything except Login is quick and runs inline under the state lock.
+/// Run one async command inside a single-task `JoinSet` so a panic is observed at the join point
+/// instead of vanishing silently: a bare spawned task's panic is captured by its JoinHandle, and
+/// dropping that handle without joining would quietly kill the command mid-flight, leaving the
+/// awaiting UI with no reply. `on_panic` runs the command's fixed INTERNAL_ERROR backstop. The
+/// returned outer handle keeps Start-task abort semantics: dropping/aborting it drops the JoinSet,
+/// which aborts the inner task and everything it spawned/awaited.
+fn spawn_observed<F>(
+    rt: &Runtime,
+    on_panic: impl FnOnce() + Send + 'static,
+    future: F,
+) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    rt.spawn(async move {
+        let mut set = JoinSet::new();
+        set.spawn(future);
+        // A single-task set joins exactly once — `if let`, not a loop, so the FnOnce backstop is
+        // provably called at most once.
+        if let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(()) => {}
+                // The panic payload is never echoed — the fixed INTERNAL_ERROR text is the only
+                // thing that may cross the seam.
+                Err(join_error) if join_error.is_panic() => on_panic(),
+                Err(_) => {} // cancelled (abort) — the aborting side owns the terminal path
+            }
+        }
+    })
+}
+
+/// Panic backstop for the Login task: drop any pending captcha entry and the single-flight marker,
+/// then complete the command with the fixed INTERNAL_ERROR (the payload is never echoed). The
+/// flight guard already cleared the marker on unwind; this also removes the stale captcha sender so
+/// a later SubmitCaptcha reports no pending challenge.
+fn recover_login_panic(
+    state: &Arc<Mutex<Option<CoreState>>>,
+    cb: EventCb,
+    id: u64,
+    account_id: &str,
+) {
+    {
+        let mut guard = lock_state(state);
+        if let Some(st) = guard.as_mut() {
+            st.pending_captcha.remove(account_id);
+            st.login_in_flight.remove(account_id);
+        }
+    }
+    emit(
+        cb,
+        &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
+                  "state": "login_failed", "error": INTERNAL_ERROR }),
+    );
+    emit(
+        cb,
+        &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": INTERNAL_ERROR }),
+    );
+}
+
+/// Panic backstop for the StartMonitoring task: only while the start is still pending (generation
+/// matches) drop it back to Idle and complete the command with the fixed INTERNAL_ERROR, so the
+/// UI never waits on a lost reply. If the start was already stopped (or already Running), the stop
+/// path owns the reply and nothing happens here.
+fn recover_start_monitoring_panic(
+    state: &Arc<Mutex<Option<CoreState>>>,
+    cb: EventCb,
+    generation: u64,
+    id: u64,
+) {
+    let mut guard = lock_state(state);
+    let Some(st) = guard.as_mut() else {
+        return;
+    };
+    if !st.monitor.is_starting(generation) {
+        return;
+    }
+    st.monitor = MonitorLifecycle::Idle;
+    drop(guard);
+    emit(
+        cb,
+        &json!({ "id": null, "event": "StateChanged", "state": "idle" }),
+    );
+    reply(cb, id, false, Some(INTERNAL_ERROR.to_string()));
+}
+
+/// Watch the monitor's panic channel. The monitor's TaskGroup pings it (`Some(())`) when one of its
+/// futures panicked; only a RUNNING monitor whose generation matches this start is torn down — a
+/// stale watchdog from an earlier start can never cancel a newer session. The handle is taken and
+/// the lock released BEFORE `stop()` (TaskGroup::cancel aborts tasks, whose drops may run
+/// callbacks). `None` (senders dropped by a normal stop) is a no-op.
+fn spawn_monitor_watchdog(
+    rt: &Runtime,
+    state: Arc<Mutex<Option<CoreState>>>,
+    cb: EventCb,
+    generation: u64,
+    mut panic_rx: UnboundedReceiver<()>,
+) {
+    rt.spawn(async move {
+        while let Some(()) = panic_rx.recv().await {
+            let mut guard = lock_state(&state);
+            let Some(st) = guard.as_mut() else {
+                continue;
+            };
+            let MonitorLifecycle::Running(running) = &st.monitor else {
+                continue;
+            };
+            if running.generation != generation {
+                continue;
+            }
+            let handle = match st.monitor.take_for_stop() {
+                StoppedMonitor::Running(handle) => handle,
+                _ => unreachable!("Running verified above"),
+            };
+            drop(guard);
+            handle.stop();
+            emit(
+                cb,
+                &json!({ "id": null, "event": "StateChanged", "state": "idle" }),
+            );
+        }
+    });
+}
+
+/// Everything except the async commands (Login, StartMonitoring, ImportCookies) is quick and runs
+/// inline under the state lock; those three are dispatched in `send` before this arm.
 fn handle_sync(core: &Core, cmd: Command) {
     let cb = core.cb;
     let id = cmd.id();
@@ -443,6 +597,9 @@ fn handle_sync(core: &Core, cmd: Command) {
             if st.monitor.is_active() {
                 return reply(cb, id, false, Some("stop monitoring first".into()));
             }
+            if let Err(error) = recover_stale_journal(st, cb) {
+                return reply(cb, id, false, Some(error));
+            }
             // Accept a registry key/alias or a raw base_url; store what the user gave verbatim.
             let account = AccountMeta {
                 id: new_id(),
@@ -524,6 +681,9 @@ fn handle_sync(core: &Core, cmd: Command) {
             }
             if st.monitor.is_active() {
                 return reply(cb, id, false, Some("stop monitoring first".into()));
+            }
+            if let Err(error) = recover_stale_journal(st, cb) {
+                return reply(cb, id, false, Some(error));
             }
             // Cancel any pending captcha challenge for this account: dropping the sender wakes the
             // awaiting login task with a closed channel, which it treats as a cancelled login (and
@@ -702,8 +862,18 @@ fn handle_sync(core: &Core, cmd: Command) {
             };
             match st.pending_captcha.remove(&account_id) {
                 Some(txc) => {
-                    let _ = txc.send(text); // wakes the awaiting login task
-                    reply(cb, id, true, None);
+                    if txc.send(text).is_ok() {
+                        reply(cb, id, true, None); // wakes the awaiting login task
+                    } else {
+                        // The awaiting login task is gone (panic/cancellation raced the submit): the
+                        // challenge is withdrawn, so the submit cannot succeed.
+                        reply(
+                            cb,
+                            id,
+                            false,
+                            Some("captcha challenge already withdrawn".into()),
+                        );
+                    }
                 }
                 None => reply(
                     cb,
@@ -849,33 +1019,64 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
     };
     let (base_url, username, password, cached_cookies) = snap;
 
-    core.rt.spawn(async move {
-        // RAII is the panic/abort backstop; explicit clears below keep terminal paths obvious.
+    // Snapshot the per-core captcha window before spawning (production is a fixed 180 s; only the
+    // timeout e2e shortens its own core's field, and a mid-flight change must not apply mid-login).
+    #[cfg(test)]
+    let captcha_answer_timeout = core.captcha_answer_timeout;
+    #[cfg(not(test))]
+    let captcha_answer_timeout = Duration::from_secs(180);
+
+    let on_panic = {
+        let state = state.clone();
+        let account_id = account_id.clone();
+        move || recover_login_panic(&state, cb, id, &account_id)
+    };
+    spawn_observed(&core.rt, on_panic, async move {
+        // The flight guard clears the single-flight marker on EVERY exit, including panic unwind;
+        // the explicit clears below keep the terminal paths obvious. The JoinSet observer turns a
+        // panic into the fixed INTERNAL_ERROR backstop instead of killing the runtime.
         let _flight_guard = LoginFlightGuard::new(state.clone(), account_id.clone());
-        emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id, "state": "logging_in" }));
-        emit(cb, &json!({ "id": null, "event": "LogLine", "level": "info",
-                          "text": format!("login → {base_url}") })); // base_url only, never creds
+        emit(
+            cb,
+            &json!({ "id": null, "event": "AccountStatus", "account_id": account_id, "state": "logging_in" }),
+        );
+        emit(
+            cb,
+            &json!({ "id": null, "event": "LogLine", "level": "info",
+                          "text": format!("login → {base_url}") }),
+        ); // base_url only, never creds
 
         let endpoints = Endpoints::derive(&base_url);
         let (client, jar) = match build_client(&cached_cookies) {
             Ok(pair) => pair,
             Err(error) => {
-                emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
-                                  "state": "login_failed", "error": error }));
-                emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": error }));
+                emit(
+                    cb,
+                    &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
+                                  "state": "login_failed", "error": error }),
+                );
+                emit(
+                    cb,
+                    &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": error }),
+                );
                 clear_login_in_flight(&state, &account_id);
                 return;
             }
         };
 
         // Restore path: a cached session that still verifies skips the password login entirely.
-        let result: Result<bool, String> = if !cached_cookies.is_empty() && login::verify_session(&client, &endpoints).await {
+        let result: Result<bool, String> = if !cached_cookies.is_empty()
+            && login::verify_session(&client, &endpoints).await
+        {
             Ok(true)
         } else {
             match login::login(&client, &endpoints, &username, &password).await {
                 LoginOutcome::Ok => Ok(false),
                 LoginOutcome::Failed(e) => Err(e),
-                LoginOutcome::NeedCaptcha { image_bytes, pending } => {
+                LoginOutcome::NeedCaptcha {
+                    image_bytes,
+                    pending,
+                } => {
                     // Register a one-shot for the answer, show the challenge (image is not a secret),
                     // and await a SubmitCaptcha command. Credentials stay inside `pending`, never emitted.
                     let (txc, rxc) = oneshot::channel::<String>();
@@ -885,12 +1086,21 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                             st.pending_captcha.insert(account_id.clone(), txc);
                         }
                     }
-                    emit(cb, &json!({ "id": null, "event": "CaptchaChallenge",
-                                      "account_id": account_id, "image_b64": login::encode_base64(&image_bytes) }));
-                    match tokio::time::timeout(Duration::from_secs(180), rxc).await {
-                        Ok(Ok(text)) => login::complete_captcha(&client, &endpoints, pending, &text).await.map(|_| false),
+                    emit(
+                        cb,
+                        &json!({ "id": null, "event": "CaptchaChallenge",
+                                      "account_id": account_id, "image_b64": login::encode_base64(&image_bytes) }),
+                    );
+                    match tokio::time::timeout(captcha_answer_timeout, rxc).await {
+                        Ok(Ok(text)) => {
+                            login::complete_captcha(&client, &endpoints, pending, &text)
+                                .await
+                                .map(|_| false)
+                        }
                         // DeleteAccount dropped the pending sender: the challenge is withdrawn.
-                        Ok(Err(_)) => Err("login cancelled because the account was deleted".to_string()),
+                        Ok(Err(_)) => {
+                            Err("login cancelled because the account was deleted".to_string())
+                        }
                         _ => {
                             // timeout → drop the stale pending entry
                             {
@@ -912,24 +1122,43 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                 // Re-lock to cache the refreshed cookies — but only while the account still exists
                 // (the existence check and the vault write happen under the same lock). A Delete
                 // committed mid-flight must not resurrect the deleted account's secret.
-                let outcome = persist_login_session(&state, &account_id, AccountSecret { password, cookies });
+                let outcome =
+                    persist_login_session(&state, &account_id, AccountSecret { password, cookies });
                 match outcome {
                     Ok(PersistOutcome::Saved) => {
-                        emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id, "state": "online" }));
-                        emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": true,
-                            "detail": if from_cache { "session restored from cache" } else { "logged in" } }));
+                        emit(
+                            cb,
+                            &json!({ "id": null, "event": "AccountStatus", "account_id": account_id, "state": "online" }),
+                        );
+                        emit(
+                            cb,
+                            &json!({ "id": id, "event": "LoginResult", "ok": true,
+                            "detail": if from_cache { "session restored from cache" } else { "logged in" } }),
+                        );
                     }
                     Ok(PersistOutcome::AccountGone) => {
-                        emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
-                                          "state": "login_failed", "error": "account was deleted during login" }));
-                        emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": false,
-                            "reason": "login succeeded but the account was deleted during login" }));
+                        emit(
+                            cb,
+                            &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
+                                          "state": "login_failed", "error": "account was deleted during login" }),
+                        );
+                        emit(
+                            cb,
+                            &json!({ "id": id, "event": "LoginResult", "ok": false,
+                            "reason": "login succeeded but the account was deleted during login" }),
+                        );
                     }
                     Err(error) => {
-                        emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
-                                          "state": "login_failed", "error": error }));
-                        emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": false,
-                            "reason": format!("login succeeded but session persistence failed: {error}") }));
+                        emit(
+                            cb,
+                            &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
+                                          "state": "login_failed", "error": error }),
+                        );
+                        emit(
+                            cb,
+                            &json!({ "id": id, "event": "LoginResult", "ok": false,
+                            "reason": format!("login succeeded but session persistence failed: {error}") }),
+                        );
                     }
                 }
                 clear_login_in_flight(&state, &account_id);
@@ -937,9 +1166,15 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
             Err(e) => {
                 // One report only: the correlated LoginResult(ok:false) already surfaces `reason` as a
                 // toast+log via AppState.Send's error path; a second id:null Error would double it.
-                emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
-                                  "state": "login_failed", "error": e }));
-                emit(cb, &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": e }));
+                emit(
+                    cb,
+                    &json!({ "id": null, "event": "AccountStatus", "account_id": account_id,
+                                  "state": "login_failed", "error": e }),
+                );
+                emit(
+                    cb,
+                    &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": e }),
+                );
                 clear_login_in_flight(&state, &account_id);
             }
         }
@@ -1045,16 +1280,46 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
     };
     let (accts, cfg, generation) = snap;
 
+    // The monitor's TaskGroup pings this channel when one of its futures panicked; the watchdog
+    // tears the RUNNING monitor down so the UI is never stuck in "monitoring" with a dead actor.
+    let (panic_tx, panic_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    spawn_monitor_watchdog(&core.rt, state.clone(), cb, generation, panic_rx);
+
     let task_state = state.clone();
-    let task = core.rt.spawn(async move {
+    let on_panic = {
+        let state = state.clone();
+        move || recover_start_monitoring_panic(&state, cb, generation, id)
+    };
+    let task = spawn_observed(&core.rt, on_panic, async move {
+        // Authenticate every account in PARALLEL (multi-account starts used to serialize one
+        // network round-trip after another). Per-account event order is not a contract — only the
+        // terminal Reply is. Cancelling the generation aborts every in-flight auth task.
+        let mut auth_set = JoinSet::new();
+        for (meta, base_url, password, cookies) in accts {
+            auth_set.spawn(async move {
+                let outcome = authed_client(&base_url, &meta.username, &password, &cookies).await;
+                // Wrap the password in its Secret inside the child so the plaintext string lives
+                // only there (zeroized on drop — including the failure path, where the returned
+                // Secret drops with the `Err` branch).
+                (
+                    meta,
+                    base_url,
+                    crate::secrets::Secret::new(password),
+                    outcome,
+                )
+            });
+        }
         let mut monitor_accounts = Vec::new();
         let mut refreshed: Vec<(String, String)> = Vec::new();
-        for (meta, base_url, password, cookies) in accts {
-            match authed_client(&base_url, &meta.username, &password, &cookies).await {
-                Ok((client, new_cookies)) => {
+        while let Some(joined) = auth_set.join_next().await {
+            match joined {
+                Ok((meta, base_url, secret, Ok((client, new_cookies)))) => {
                     // The account's own identity for per-account recheck (my_present) = its login username.
                     let user_no = login::user_no_from_username(&meta.username);
-                    emit(cb, &json!({ "id": null, "event": "AccountStatus", "account_id": meta.id, "state": "online" }));
+                    emit(
+                        cb,
+                        &json!({ "id": null, "event": "AccountStatus", "account_id": meta.id, "state": "online" }),
+                    );
                     refreshed.push((meta.id.clone(), new_cookies));
                     monitor_accounts.push(monitor::Account {
                         id: meta.id.clone(),
@@ -1065,13 +1330,28 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                         base_url,
                         client,
                         username: meta.username.clone(),
-                        password: crate::secrets::Secret::new(password),
+                        password: secret,
                     });
                 }
-                Err(e) => emit(cb, &json!({ "id": null, "event": "AccountStatus",
-                                            "account_id": meta.id, "state": "login_failed", "error": e })),
+                Ok((meta, _base_url, _secret, Err(e))) => emit(
+                    cb,
+                    &json!({ "id": null, "event": "AccountStatus",
+                                            "account_id": meta.id, "state": "login_failed", "error": e }),
+                ),
+                Err(joined) if joined.is_panic() => {
+                    // An auth task panicked: abort the rest and re-raise inside the observed task so
+                    // the command-level backstop (fixed INTERNAL_ERROR reply + Idle) handles the
+                    // whole start. The panic payload never crosses the seam.
+                    auth_set.abort_all();
+                    std::panic::resume_unwind(joined.into_panic());
+                }
+                Err(_) => {} // aborted with the generation — StopMonitoring owns the reply
             }
             if !monitor_start_is_current(&task_state, generation) {
+                // The start was stopped (StopMonitoring already replied "monitor start cancelled"
+                // and aborted us); abort the remaining auth tasks so no request loop outlives the
+                // cancelled start.
+                auth_set.abort_all();
                 return;
             }
         }
@@ -1086,27 +1366,39 @@ fn spawn_start_monitoring(core: &Core, id: u64) {
                     if let Some(mut sec) = v.get(aid) {
                         sec.cookies = ck.clone();
                         if let Err(error) = v.set(aid, sec) {
-                            emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                            emit(
+                                cb,
+                                &json!({ "id": null, "event": "Error", "severity": "error",
                                 "code": "session_persistence_failed",
-                                "message": format!("{aid}: {error}") }));
+                                "message": format!("{aid}: {error}") }),
+                            );
                         }
                     }
                 }
             }
             if monitor_accounts.is_empty() {
                 st.monitor = MonitorLifecycle::Idle;
-                emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn",
-                                  "code": "no_accounts_online", "message": "no account could authenticate" }));
-                emit(cb, &json!({ "id": null, "event": "StateChanged", "state": "idle" }));
+                emit(
+                    cb,
+                    &json!({ "id": null, "event": "Error", "severity": "warn",
+                                  "code": "no_accounts_online", "message": "no account could authenticate" }),
+                );
+                emit(
+                    cb,
+                    &json!({ "id": null, "event": "StateChanged", "state": "idle" }),
+                );
                 reply(cb, id, false, Some("no account could authenticate".into()));
             } else {
                 // Fail-fast heads-up: with a monitored account but no LLM key, auto-answer can't run —
                 // say so up front instead of only after a quiz spins out 300s later. Rollcall is fine.
                 if cfg.llm_key.as_deref().is_none_or(|k| k.trim().is_empty()) {
-                    emit(cb, &json!({ "id": null, "event": "Error", "severity": "warn", "code": "llm_key_missing",
-                        "message": "尚未設定 LLM 金鑰：自動答題需要金鑰（設定 → 儲存金鑰）；點名不受影響。" }));
+                    emit(
+                        cb,
+                        &json!({ "id": null, "event": "Error", "severity": "warn", "code": "llm_key_missing",
+                        "message": "尚未設定 LLM 金鑰：自動答題需要金鑰（設定 → 儲存金鑰）；點名不受影響。" }),
+                    );
                 }
-                let handle = monitor::start(cb, monitor_accounts, cfg); // start() only spawns; no await under lock
+                let handle = monitor::start(cb, monitor_accounts, cfg, panic_tx); // start() only spawns; no await under lock
                 st.monitor = MonitorLifecycle::Running(RunningMonitor { generation, handle });
                 reply(cb, id, true, None);
             }
@@ -1153,7 +1445,8 @@ fn spawn_import_cookies(core: &Core, id: u64, account_id: String, cookies_json: 
     };
     let (base_url, password) = snap;
 
-    core.rt.spawn(async move {
+    let on_panic = move || reply(cb, id, false, Some(INTERNAL_ERROR.to_string()));
+    spawn_observed(&core.rt, on_panic, async move {
         let endpoints = Endpoints::derive(&base_url);
         let (verified, client_error) = match build_client(&cookies_json) {
             Ok((client, _jar)) => (login::verify_session(&client, &endpoints).await, None),
@@ -1221,7 +1514,10 @@ fn caps_payload() -> Value {
     // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false. QR teacher-assist IS implemented
     // (monitor::spawn_qr_teacher_assist) — the build supports it; it just needs a teacher account added.
     json!({ "id": null, "event": "Caps", "caps": {
-        "background_monitoring": true,
+        // Background monitoring is only meaningful where the OS can keep the app alive while the
+        // UI is not foregrounded (Android). The Windows/Mac desktop build has no background host,
+        // so the capability is not advertised there — the UI must not offer a toggle it can't honor.
+        "background_monitoring": cfg!(target_os = "android"),
         // No updater exists in this repository; never advertise a capability the product cannot run.
         "self_update": false,
         "qr_teacher_assist": true,
@@ -1464,11 +1760,7 @@ fn warn_insecure_http(cb: EventCb, base_url: &str) {
 
 fn emit_settings(cb: EventCb, st: &CoreState) {
     let s = &st.config.settings;
-    let has_llm_key = st
-        .vault
-        .as_ref()
-        .and_then(|v| v.get_llm_key())
-        .is_some_and(|k| !k.trim().is_empty());
+    let has_llm_key = st.vault.as_ref().is_some_and(|v| v.has_llm_key());
     emit(
         cb,
         &json!({ "id": null, "event": "Settings", "settings": {
@@ -1532,6 +1824,7 @@ fn dump_cookies(jar: &CookieStoreMutex) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::OnceLock;
 
     static TEST_EVENTS: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
@@ -1563,7 +1856,11 @@ mod tests {
     fn caps_never_advertise_an_unimplemented_self_updater() {
         let caps = caps_payload();
         assert_eq!(caps["caps"]["self_update"], false);
-        assert_eq!(caps["caps"]["background_monitoring"], true);
+        assert_eq!(
+            caps["caps"]["background_monitoring"],
+            cfg!(target_os = "android"),
+            "background monitoring is only advertised where the OS keeps the app alive in background"
+        );
     }
 
     #[tokio::test]
@@ -1675,14 +1972,22 @@ mod tests {
 
     #[test]
     fn stopping_during_start_completes_pending_command() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new()));
-        events.lock().unwrap().clear();
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let mut lifecycle = MonitorLifecycle::Idle;
         lifecycle.begin_start(1, 501).unwrap();
 
         stop_monitor(&mut lifecycle, collect_event, "cancelled by test");
 
-        let events = events.lock().unwrap();
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(events.iter().any(|event| {
             event["event"] == "Reply"
                 && event["id"] == 501
@@ -1728,6 +2033,9 @@ mod tests {
 
     #[test]
     fn invalid_os_key_fails_init_instead_of_reporting_boot_success() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         const COMMAND_ID: u64 = 9_223_372_036_854_700_001;
         let dir = std::env::temp_dir().join(format!(
             "tron-invalid-os-key-init-{}",
@@ -1746,7 +2054,7 @@ mod tests {
         let events = TEST_EVENTS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(events.iter().any(|event| {
             event["event"] == "Reply"
                 && event["id"] == COMMAND_ID
@@ -1819,8 +2127,14 @@ mod tests {
 
     #[test]
     fn poisoned_state_lock_recovers_instead_of_wedging_the_core() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new()));
-        events.lock().unwrap().clear();
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let core = init(collect_event).unwrap();
 
         // A panic while holding the state lock poisons it exactly like a caught seam panic would.
@@ -1835,7 +2149,9 @@ mod tests {
             &core,
             format!(r#"{{"id":{ID},"cmd":"CreateVault"}}"#).as_bytes(),
         );
-        let events = events.lock().unwrap();
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reply = events
             .iter()
             .find(|e| e["event"] == "Reply" && e["id"] == ID)
@@ -1849,8 +2165,14 @@ mod tests {
 
     #[test]
     fn malformed_command_errors_never_echo_input_payloads() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new()));
-        events.lock().unwrap().clear();
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let core = init(collect_event).unwrap();
 
         // A numeric secret-shaped payload in a sensitive field: serde fails on `key`, and the seam
@@ -1859,7 +2181,9 @@ mod tests {
         // Truly malformed JSON without a recoverable id → uncorrelated Error event, still no echo.
         send(&core, br#"{"cmd":"SetLlmKey","key":987654321"#);
 
-        let events = events.lock().unwrap();
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reply = events
             .iter()
             .find(|e| e["event"] == "Reply" && e["id"] == 77)
@@ -1879,8 +2203,14 @@ mod tests {
 
     #[test]
     fn panic_reply_completes_command_with_fixed_error_and_never_echoes_input() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let events = TEST_EVENTS.get_or_init(|| Mutex::new(Vec::new()));
-        events.lock().unwrap().clear();
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let core = init(collect_event).unwrap();
 
         panic_reply(
@@ -1888,7 +2218,9 @@ mod tests {
             br#"{"id":88,"cmd":"SetLlmKey","key":"super-secret-llm-key"}"#,
         );
 
-        let events = events.lock().unwrap();
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reply = events
             .iter()
             .find(|e| e["event"] == "Reply" && e["id"] == 88)
@@ -1985,6 +2317,22 @@ mod tests {
         None
     }
 
+    fn none_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if events()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(&pred)
+            {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        true
+    }
+
     fn start_fake() -> String {
         let (ptx, prx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1999,6 +2347,21 @@ mod tests {
             });
         });
         format!("http://127.0.0.1:{}", prx.recv().unwrap())
+    }
+
+    fn post(base_url: &str, path: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect(base_url.trim_start_matches("http://")).unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        let _ = stream.read_to_string(&mut buf);
+        buf.rsplit("\r\n\r\n").next().unwrap_or("").to_string()
     }
 
     fn account_id_by_label(label: &str) -> Option<String> {
@@ -2284,6 +2647,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        // Real e2e against the fake server: the captcha challenge parks the Login task, and
+        // DeleteAccount must cancel it — no injected state, no sleeps. The LoginResult is the
+        // task's LAST event, so receiving it proves the completion (and any persist) is done.
+        let base = start_fake();
         let dir = data_dir("captcha-cancel");
         let core = init(collect_event).unwrap();
         send(
@@ -2296,10 +2663,17 @@ mod tests {
             r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#.as_bytes(),
         );
         assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
+        post(
+            &base,
+            "/_test/captcha",
+            r#"{"required":true,"expected":"A1B2"}"#,
+        );
         send(
             &core,
-            r#"{"id":3,"cmd":"AddAccount","label":"dave","school":"thu","username":"dave","password":"secret"}"#
-                .as_bytes(),
+            format!(
+                r#"{{"id":3,"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+            )
+            .as_bytes(),
         );
         assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 3, 5).is_some());
         assert!(wait_for(
@@ -2314,47 +2688,68 @@ mod tests {
         .is_some());
         let acc = account_id_by_label("dave").expect("account id");
 
-        // Inject exactly the state owned by an in-flight captcha login. This keeps the lifecycle
-        // contract deterministic and independent of network scheduling on loaded CI runners.
-        let (captcha_tx, captcha_rx) = oneshot::channel::<String>();
-        {
-            let mut guard = lock_state(&core.state);
-            let state = guard.as_mut().expect("initialized state");
-            state.pending_captcha.insert(acc.clone(), captcha_tx);
-            state.login_in_flight.insert(acc.clone());
-        }
-
         send(
             &core,
             format!(r#"{{"id":4,"cmd":"Login","account_id":"{acc}"}}"#).as_bytes(),
         );
+        assert!(
+            wait_for(
+                |v| v["event"] == "CaptchaChallenge" && v["account_id"] == acc,
+                10
+            )
+            .is_some(),
+            "login blocks on the captcha challenge"
+        );
+        send(
+            &core,
+            format!(r#"{{"id":5,"cmd":"Login","account_id":"{acc}"}}"#).as_bytes(),
+        );
         let rejected = wait_for(
-            |v| v["event"] == "Reply" && v["id"] == 4 && v["ok"] == false,
+            |v| v["event"] == "Reply" && v["id"] == 5 && v["ok"] == false,
             5,
         )
         .expect("second login rejected");
-        assert!(rejected["error"]
-            .as_str()
-            .unwrap()
-            .contains("already in progress"));
+        assert!(
+            rejected["error"]
+                .as_str()
+                .unwrap()
+                .contains("already in progress"),
+            "second login must be single-flight rejected"
+        );
 
+        // Delete cancels the pending captcha: the awaiting login task wakes and reports honestly.
         send(
             &core,
-            format!(r#"{{"id":5,"cmd":"DeleteAccount","account_id":"{acc}"}}"#).as_bytes(),
+            format!(r#"{{"id":6,"cmd":"DeleteAccount","account_id":"{acc}"}}"#).as_bytes(),
         );
         assert!(wait_for(
-            |v| v["event"] == "Reply" && v["id"] == 5 && v["ok"] == true,
+            |v| v["event"] == "Reply" && v["id"] == 6 && v["ok"] == true,
             5
         )
         .is_some());
+        let cancelled = wait_for(|v| v["event"] == "LoginResult" && v["id"] == 4, 10)
+            .expect("cancelled login result");
+        assert_eq!(cancelled["ok"], false);
         assert!(
-            matches!(
-                core.rt.block_on(async move {
-                    tokio::time::timeout(Duration::from_secs(1), captcha_rx).await
-                }),
-                Ok(Err(_))
-            ),
-            "DeleteAccount must drop the pending captcha sender"
+            cancelled["reason"].as_str().unwrap().contains("cancelled"),
+            "the deleted-account login must report cancellation: {}",
+            cancelled["reason"]
+        );
+
+        // The stale async completion must not have written anything back: the vault has no entry
+        // (LoginResult was the task's terminal event, so no straggler write can still land).
+        let key = crate::secrets::load_or_create_device_key(
+            &std::path::Path::new(&dir).join("device.key"),
+        )
+        .unwrap();
+        let vault = crate::secrets::VaultFile::unlock_with_key(
+            &std::path::Path::new(&dir).join("vault.bin"),
+            key,
+        )
+        .unwrap();
+        assert!(
+            vault.get(&acc).is_none(),
+            "deleted account's secret must not be resurrected"
         );
         {
             let guard = lock_state(&core.state);
@@ -2365,7 +2760,6 @@ mod tests {
                 .accounts
                 .iter()
                 .any(|account| account.id == acc));
-            assert!(state.vault.as_ref().expect("vault").get(&acc).is_none());
         }
     }
 
@@ -2606,5 +3000,616 @@ mod tests {
             5
         )
         .is_some());
+    }
+
+    // ===================== async panic backstop / monitor watchdog =====================
+
+    #[test]
+    fn async_panic_observer_turns_panic_into_backstop_and_ignores_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // A panicking task triggers the backstop exactly once.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        let handle = spawn_observed(
+            &rt,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+            async { panic!("deliberate test panic") },
+        );
+        rt.block_on(handle).unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // A successful task does not trigger the backstop.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        let handle = spawn_observed(
+            &rt,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+            async {},
+        );
+        rt.block_on(handle).unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+        // An aborted task (StopMonitoring's abort path) does NOT count as a panic — the aborting
+        // side owns the terminal reply.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        let handle = spawn_observed(
+            &rt,
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+            async { tokio::time::sleep(Duration::from_secs(3600)).await },
+        );
+        // `sleep` must be constructed INSIDE the block_on future: building it outside would run
+        // before the runtime context is entered (no reactor yet) and panic.
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await }); // let the inner task start
+        handle.abort();
+        let joined = rt.block_on(handle);
+        assert!(joined.is_err(), "aborting the observer cancels it");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "abort is not a panic");
+    }
+
+    #[test]
+    fn login_panic_backstop_clears_pending_and_completes_with_fixed_error() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let dir = data_dir("panic-login");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(PathBuf::from(&dir), Config::default(), None);
+        let (captcha_tx, _rx) = oneshot::channel::<String>();
+        {
+            let mut guard = lock_state(&state);
+            let st = guard.as_mut().unwrap();
+            st.pending_captcha.insert("acc".into(), captcha_tx);
+            st.login_in_flight.insert("acc".into());
+        }
+
+        recover_login_panic(&state, collect_event, 77, "acc");
+
+        {
+            let guard = lock_state(&state);
+            let st = guard.as_ref().unwrap();
+            assert!(
+                st.pending_captcha.is_empty(),
+                "panic backstop must drop the stale captcha sender"
+            );
+            assert!(st.login_in_flight.is_empty());
+        }
+        let events = events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = events
+            .iter()
+            .find(|e| e["event"] == "LoginResult" && e["id"] == 77)
+            .expect("fixed LoginResult completes the awaiting command");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["reason"], INTERNAL_ERROR);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "AccountStatus" && e["state"] == "login_failed"),
+            "panic still reports the per-account status"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["event"] == "LoginResult" && e["id"] == 77)
+                .count(),
+            1,
+            "exactly one terminal event for the command"
+        );
+    }
+
+    #[test]
+    fn start_panic_backstop_idles_only_the_matching_generation() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let dir = data_dir("panic-start");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(PathBuf::from(&dir), Config::default(), None);
+
+        // Starting generation 5 → the backstop drops it to Idle with the fixed reply + idle event.
+        {
+            let mut guard = lock_state(&state);
+            guard.as_mut().unwrap().monitor.begin_start(5, 501).unwrap();
+        }
+        recover_start_monitoring_panic(&state, collect_event, 5, 501);
+        {
+            let guard = lock_state(&state);
+            assert!(
+                matches!(guard.as_ref().unwrap().monitor, MonitorLifecycle::Idle),
+                "a panicked start must leave the monitor Idle so it can be restarted"
+            );
+        }
+        {
+            // Scoped so the guard never shadows the `events()` helper for later assertions.
+            let events = events()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                events.iter().any(|e| {
+                    e["event"] == "Reply"
+                        && e["id"] == 501
+                        && e["ok"] == false
+                        && e["error"] == INTERNAL_ERROR
+                }),
+                "the start command completes with the fixed INTERNAL_ERROR"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e["event"] == "Reply" && e["id"] == 501)
+                    .count(),
+                1,
+                "exactly one reply for the command"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["event"] == "StateChanged" && e["state"] == "idle"),
+                "the UI must leave the starting state"
+            );
+        }
+
+        // A RUNNING monitor is not touched by the start backstop (the watchdog owns that path).
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut guard = lock_state(&state);
+            guard.as_mut().unwrap().monitor = MonitorLifecycle::Running(RunningMonitor {
+                generation: 6,
+                handle: monitor::MonitorHandle::new(tx),
+            });
+        }
+        recover_start_monitoring_panic(&state, collect_event, 6, 601);
+        {
+            let guard = lock_state(&state);
+            assert!(
+                matches!(
+                    guard.as_ref().unwrap().monitor,
+                    MonitorLifecycle::Running(_)
+                ),
+                "a start backstop must never cancel a running monitor"
+            );
+        }
+
+        // A stale generation (StopMonitoring already replied and took over) stays untouched.
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        {
+            let mut guard = lock_state(&state);
+            guard.as_mut().unwrap().monitor = MonitorLifecycle::Idle;
+            guard.as_mut().unwrap().monitor.begin_start(7, 701).unwrap();
+        }
+        recover_start_monitoring_panic(&state, collect_event, 5, 501);
+        {
+            let guard = lock_state(&state);
+            assert!(
+                guard.as_ref().unwrap().monitor.is_starting(7),
+                "a stale panic must not cancel the newer start"
+            );
+        }
+        let events = events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            events.iter().all(|e| e["event"] != "Reply"),
+            "a stale generation must not produce a reply"
+        );
+    }
+
+    #[test]
+    fn monitor_panic_watchdog_tears_down_only_the_matching_running_generation() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = data_dir("watchdog");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(PathBuf::from(&dir), Config::default(), None);
+        let (panic_tx, panic_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut guard = lock_state(&state);
+            guard.as_mut().unwrap().monitor = MonitorLifecycle::Running(RunningMonitor {
+                generation: 7,
+                handle: monitor::MonitorHandle::new(tx),
+            });
+        }
+        spawn_monitor_watchdog(&rt, state.clone(), collect_event, 7, panic_rx);
+
+        // A panic ping for the matching generation tears the monitor down (Idle + idle event).
+        panic_tx.send(()).unwrap();
+        assert!(
+            wait_for(|v| v["event"] == "StateChanged" && v["state"] == "idle", 5).is_some(),
+            "the watchdog must emit idle after a monitor panic"
+        );
+        {
+            let guard = lock_state(&state);
+            assert!(
+                matches!(guard.as_ref().unwrap().monitor, MonitorLifecycle::Idle),
+                "the panicked monitor must be taken down to Idle"
+            );
+        }
+
+        // A second ping is a no-op: already Idle, no duplicate events.
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        panic_tx.send(()).unwrap();
+        assert!(
+            none_for(|v| v["event"] == "StateChanged" && v["state"] == "idle", 1),
+            "a ping after teardown must not emit anything"
+        );
+    }
+
+    #[test]
+    fn monitor_panic_watchdog_ignores_stale_generation_and_sender_close() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = data_dir("watchdog-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(PathBuf::from(&dir), Config::default(), None);
+        let (panic_tx, panic_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut guard = lock_state(&state);
+            guard.as_mut().unwrap().monitor = MonitorLifecycle::Running(RunningMonitor {
+                generation: 9,
+                handle: monitor::MonitorHandle::new(tx),
+            });
+        }
+        // Watchdog from an OLDER start (generation 8): its ping must not cancel generation 9.
+        spawn_monitor_watchdog(&rt, state.clone(), collect_event, 8, panic_rx);
+        panic_tx.send(()).unwrap();
+        assert!(
+            none_for(|v| v["event"] == "StateChanged" && v["state"] == "idle", 1),
+            "a stale watchdog must never cancel a newer session"
+        );
+        {
+            let guard = lock_state(&state);
+            assert!(
+                matches!(
+                    guard.as_ref().unwrap().monitor,
+                    MonitorLifecycle::Running(_)
+                ),
+                "a stale watchdog must never cancel a newer session"
+            );
+        }
+
+        // Normal close: all senders dropped (a plain stop drops the handle) → the watchdog exits
+        // without touching the running monitor.
+        drop(panic_tx);
+        assert!(
+            none_for(|v| v["event"] == "StateChanged" && v["state"] == "idle", 1),
+            "channel close (normal stop) must be a no-op"
+        );
+        {
+            let guard = lock_state(&state);
+            assert!(
+                matches!(
+                    guard.as_ref().unwrap().monitor,
+                    MonitorLifecycle::Running(_)
+                ),
+                "channel close must not tear down a running monitor"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_a_start_aborts_its_observed_task_and_child() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct TrackDrop(Arc<AtomicBool>);
+        impl Drop for TrackDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut lifecycle = MonitorLifecycle::Idle;
+        lifecycle.begin_start(1, 501).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let track = TrackDrop(dropped.clone());
+        let task = spawn_observed(&rt, || {}, async move {
+            let _track = track; // held by the child future; drop proves the abort reached it
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(20)).await }); // child starts and holds _track
+        lifecycle.attach_start_task(1, task);
+        stop_monitor(&mut lifecycle, collect_event, "cancelled");
+        assert!(matches!(lifecycle, MonitorLifecycle::Idle));
+
+        // The abort propagated into the child: the tracked value must drop promptly (no 3600s linger).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "aborting the start task must abort its child"
+            );
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        }
+    }
+
+    #[test]
+    fn submit_captcha_to_a_dead_sender_fails_instead_of_succeeding() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let dir = data_dir("dead-captcha");
+        let core = init(collect_event).unwrap();
+        send(
+            &core,
+            format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
+        // A challenge whose awaiting login task is already gone (the receiver side was dropped):
+        // the entry still exists (the panic backstop raced the submit), but the send must fail.
+        let (dead_tx, rx) = oneshot::channel::<String>();
+        drop(rx); // `_rx` would stay alive to end of scope — drop it NOW so the sender is dead
+        {
+            let mut guard = lock_state(&core.state);
+            guard
+                .as_mut()
+                .unwrap()
+                .pending_captcha
+                .insert("acc".into(), dead_tx);
+        }
+        send(
+            &core,
+            r#"{"id":2,"cmd":"SubmitCaptcha","account_id":"acc","text":"A1B2"}"#.as_bytes(),
+        );
+        let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).expect("submit reply");
+        assert_eq!(reply["ok"], false, "a dead challenge cannot be submitted");
+        assert!(
+            reply["error"].as_str().unwrap().contains("withdrawn"),
+            "error: {}",
+            reply["error"]
+        );
+    }
+
+    #[test]
+    fn account_mutations_recover_a_stale_journal_before_mutating() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let dir = data_dir("stale-journal");
+        let core = init(collect_event).unwrap();
+        send(
+            &core,
+            format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
+        send(
+            &core,
+            r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#.as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
+        send(
+            &core,
+            r#"{"id":3,"cmd":"AddAccount","label":"dave","school":"thu","username":"dave","password":"secret"}"#
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 3 && v["ok"] == true,
+            5
+        )
+        .is_some());
+
+        // Simulate a crash between begin and complete: a stale journal is now on disk.
+        AccountJournal::begin(Path::new(&dir), AccountMutation::Add, "dave").unwrap();
+
+        // AddAccount recovers it first: warn LogLine, and the mutation is NOT blocked.
+        send(
+            &core,
+            r#"{"id":4,"cmd":"AddAccount","label":"eve","school":"thu","username":"eve","password":"secret"}"#
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 4 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        {
+            // Scoped so the guard never shadows the `events()` helper for later assertions.
+            let events = events()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                events.iter().any(|e| {
+                    e["event"] == "LogLine"
+                        && e["level"] == "warn"
+                        && e["text"].as_str().is_some_and(|t| t.contains("已恢復"))
+                }),
+                "a recovered stale journal warns"
+            );
+        }
+
+        // A CORRUPT journal fails the mutation with the FIXED error (no file content echoed).
+        std::fs::write(
+            Path::new(&dir).join("account-transaction.json"),
+            b"NOT-JSON-CONTENT-SECRET",
+        )
+        .unwrap();
+        send(
+            &core,
+            r#"{"id":5,"cmd":"AddAccount","label":"frank","school":"thu","username":"frank","password":"secret"}"#
+                .as_bytes(),
+        );
+        let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == 5, 5)
+            .expect("mutation must fail on a corrupt journal");
+        assert_eq!(reply["ok"], false);
+        assert_eq!(
+            reply["error"],
+            "account transaction journal unreadable; recovery skipped"
+        );
+        assert!(
+            !events()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|e| e.to_string().contains("NOT-JSON-CONTENT-SECRET")),
+            "the fixed error must never echo journal file content"
+        );
+    }
+
+    #[test]
+    fn captcha_timeout_reports_failure_and_allows_relogin() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let base = start_fake();
+        let dir = data_dir("captcha-timeout");
+        // This core alone shortens its captcha answer window — every other core (and every other
+        // module's e2e running in parallel) keeps the production 180 s.
+        let mut core = init(collect_event).unwrap();
+        core.captcha_answer_timeout = Duration::from_millis(200);
+        send(
+            &core,
+            format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
+        send(
+            &core,
+            r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#.as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
+        post(
+            &base,
+            "/_test/captcha",
+            r#"{"required":true,"expected":"A1B2"}"#,
+        );
+        send(
+            &core,
+            format!(
+                r#"{{"id":3,"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
+            )
+            .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 3 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        let acc = account_id_by_label("dave").expect("account id");
+
+        // Park on the challenge and let the (test-shortened) answer window elapse.
+        send(
+            &core,
+            format!(r#"{{"id":4,"cmd":"Login","account_id":"{acc}"}}"#).as_bytes(),
+        );
+        assert!(
+            wait_for(
+                |v| v["event"] == "CaptchaChallenge" && v["account_id"] == acc,
+                10
+            )
+            .is_some(),
+            "login blocks on the captcha challenge"
+        );
+        let timed_out = wait_for(|v| v["event"] == "LoginResult" && v["id"] == 4, 15)
+            .expect("timeout must produce a terminal LoginResult");
+        assert_eq!(timed_out["ok"], false);
+        assert!(
+            timed_out["reason"].as_str().unwrap().contains("timed out"),
+            "reason: {}",
+            timed_out["reason"]
+        );
+
+        // The single-flight marker and stale pending entry were released: the SAME account can
+        // log in again immediately, and answering the fresh challenge succeeds. Clear first so the
+        // awaited CaptchaChallenge provably belongs to the NEW attempt, not the timed-out one.
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        send(
+            &core,
+            format!(r#"{{"id":5,"cmd":"Login","account_id":"{acc}"}}"#).as_bytes(),
+        );
+        assert!(
+            wait_for(
+                |v| v["event"] == "CaptchaChallenge" && v["account_id"] == acc,
+                10
+            )
+            .is_some(),
+            "after a timeout the account must be able to log in again"
+        );
+        send(
+            &core,
+            format!(r#"{{"id":6,"cmd":"SubmitCaptcha","account_id":"{acc}","text":"A1B2"}}"#)
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 6 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        let ok =
+            wait_for(|v| v["event"] == "LoginResult" && v["id"] == 5, 10).expect("relogin result");
+        assert_eq!(ok["ok"], true, "relogin with the fresh answer succeeds");
     }
 }

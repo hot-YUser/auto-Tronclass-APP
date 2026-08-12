@@ -558,14 +558,13 @@ pub async fn submit_exam(
         }) // skip un-answered (never blank)
         .collect();
     let body = exam_body(instance_id, &entries);
-    let v = http::json_checked(
+    // Shared mutation policy: non-2xx, a login-redirect URL, a non-object body, and an explicit
+    // business error all fail here — one policy for every mutating submit (no per-call drift).
+    let v = http::mutation_checked(
         client.post(ep.exam_submissions(activity_id)).json(&body),
         "submit exam",
     )
     .await?;
-    if http::explicit_business_error_value(&v) {
-        return Err("submit exam: server rejected the request".to_string());
-    }
     // submission_id comes back as an INTEGER (e.g. 681504) — reading it as_str gave "" and disabled the
     // resubmit-for-correct pass; accept int OR string, with the v1 `id` fallback (confirmed live 2026-07).
     let sid = json_id_string(v.get("submission_id").or_else(|| v.get("id")));
@@ -995,6 +994,84 @@ mod tests {
         assert!(
             result.is_err(),
             "a success response without submission_id is not a valid submit receipt"
+        );
+    }
+
+    /// A two-hop server: first a redirect to `location`, then `body` at the followed URL.
+    async fn redirect_then_server(location: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn submit_exam_rejects_a_login_redirect() {
+        // Shared mutation policy: a redirect to the login page must fail with the session marker —
+        // never a success receipt built from a login-page follow-up.
+        let base = redirect_then_server("/login", r#"{"submission_id":1}"#).await;
+        let answers = std::collections::HashMap::new();
+        let err = submit_exam(
+            &Client::new(),
+            &Endpoints::derive(&base),
+            "exam-1",
+            "instance-1",
+            &answers,
+            &[],
+        )
+        .await
+        .expect_err("a login-redirecting submit must not be reported as success");
+        assert!(
+            err.contains("session redirected to login"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_exam_rejects_an_oversized_receipt() {
+        // A lying Content-Length (far above the 8 MiB mutation cap): the shared bounded read must
+        // fail before buffering — an unbounded `.json()` would try to materialise the whole lie.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n{\"submission_id\":1}";
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let answers = std::collections::HashMap::new();
+        let err = submit_exam(
+            &Client::new(),
+            &Endpoints::derive(&format!("http://{address}")),
+            "exam-1",
+            "instance-1",
+            &answers,
+            &[],
+        )
+        .await
+        .expect_err("an oversized receipt must not be buffered");
+        assert!(
+            err.contains("response too large"),
+            "unexpected error: {err}"
         );
     }
 

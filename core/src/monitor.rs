@@ -9,6 +9,8 @@
 //! freeze the others' countdowns. Every spawned helper is TRACKED: `MonitorHandle::stop` cancels the
 //! whole group, so StopMonitoring never leaves a detached brute-force / sign / QR / quiz job running
 //! against the tenant (the one sanctioned exception is the abort-safe teacher-QR cleanup, bounded).
+//! A helper panic is contained by its `TaskGroup` wrapper: one fixed `core_panicked` event + one
+//! `panic_tx` ping reach the engine watchdog, which recovers the monitor lifecycle.
 
 use crate::answer::{self, Source};
 use crate::llm::LlmConfig;
@@ -86,27 +88,72 @@ const RELOGIN_MAX_DELAY_SECS: u64 = 300;
 /// sign (incl. the 0000–9999 brute-force round), re-login, QR teacher-assist, quiz prepare/submit —
 /// is registered here, so `MonitorHandle::stop` (StopMonitoring) aborts ALL of them: no detached
 /// request loop may outlive the session. A spawn racing an in-progress stop is aborted immediately.
+///
+/// Panic containment: each helper runs inside a single-task `JoinSet` wrapper. A helper panic is
+/// observed exactly once — one fixed `core_panicked` Error event plus one `panic_tx` ping for the
+/// engine watchdog. Aborting the wrapper (a stop, a handle drop, or the startup guard) drops the
+/// JoinSet, which aborts the helper — normal cancellation is silent. `panic_tx` is cloned per
+/// spawn; when the last sender drops (stop + handle drop) the channel closes and the engine treats
+/// `None` as no-op. NOTE: stopping a live monitor is the CALLER's job (`MonitorHandle::stop` /
+/// `MonitorHandle::drop` — the actor ↔ group cycle means the group's own `Drop` cannot run while
+/// the actor lives); `TaskGroup::drop` is only the last-resort teardown once the cycle is broken.
 pub struct TaskGroup {
     cancelled: Arc<AtomicBool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+    cb: EventCb,
+    panic_tx: UnboundedSender<()>,
 }
 
 impl TaskGroup {
-    pub fn new() -> Self {
+    pub fn new(cb: EventCb, panic_tx: UnboundedSender<()>) -> Self {
         TaskGroup {
             cancelled: Arc::new(AtomicBool::new(false)),
             tasks: StdMutex::new(Vec::new()),
+            cb,
+            panic_tx,
         }
     }
     /// Register a spawned task. If the group is already cancelled (a spawn racing stop), the task is
     /// aborted immediately instead of being tracked. The cancelled-check and the registration share
     /// the tasks lock with `cancel`, so a spawn can never slip past an in-progress stop un-aborted.
+    ///
+    /// The tracked handle is a thin observer: the real helper runs inside a single-task `JoinSet`,
+    /// so aborting the wrapper (group cancel / drop) aborts the helper at its next await point
+    /// (dropping a `JoinSet` aborts its tasks), and a helper panic surfaces as ONE `core_panicked`
+    /// event + ONE `panic_tx` ping. A wrapper cancellation is a stop, not a panic — it emits
+    /// nothing.
     pub fn spawn<F>(&self, future: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let handle = tokio::spawn(future);
-        let mut tasks = self.tasks.lock().unwrap();
+        let cb = self.cb;
+        let panic_tx = self.panic_tx.clone();
+        let handle = tokio::spawn(async move {
+            let mut set = JoinSet::new();
+            set.spawn(future);
+            match set.join_next().await {
+                Some(Ok(())) => {}
+                Some(Err(error)) if error.is_panic() => {
+                    // Fixed message on purpose: the JoinError payload must never cross the FFI
+                    // seam (a panic payload may embed secrets); the code alone identifies the event.
+                    let _ = error;
+                    emit(
+                        cb,
+                        &json!({ "id": null, "event": "Error", "severity": "error",
+                                      "code": "core_panicked",
+                                      "message": "monitor task failed internally" }),
+                    );
+                    let _ = panic_tx.send(());
+                }
+                // The wrapper itself was cancelled (group cancel/drop) — normal cancellation, never
+                // a panic report.
+                Some(Err(_)) | None => {}
+            }
+        });
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Completed JoinHandles retain their output allocation until dropped. Opportunistically
         // prune them on every registration so long monitoring sessions stay bounded.
         tasks.retain(|task| !task.is_finished());
@@ -119,7 +166,12 @@ impl TaskGroup {
 
     /// Cancel every tracked task and mark the group cancelled (later spawns abort immediately).
     pub fn cancel(&self) {
-        let mut tasks = self.tasks.lock().unwrap();
+        // Poison-tolerant: a lock poisoned by a past panic must not permanently brick the monitor
+        // (spawn/cancel never hold the lock across a panic, so the guard state is still consistent).
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.cancelled.store(true, Ordering::Release);
         let pending = std::mem::take(&mut *tasks);
         for handle in pending {
@@ -128,9 +180,25 @@ impl TaskGroup {
     }
 }
 
-impl Default for TaskGroup {
-    fn default() -> Self {
-        Self::new()
+impl Drop for TaskGroup {
+    fn drop(&mut self) {
+        // Last-resort teardown once the actor ↔ group cycle is broken (every task completed or was
+        // aborted): abort anything still tracked so a bare JoinHandle drop can never leave a
+        // detached task. Live-monitor stopping is the handle's job (MonitorHandle::stop/drop) —
+        // this is NOT the guarantee for a normal stop. Deliberately does NOT call `cancel`: Drop
+        // must not re-enter the tasks lock on an unwind path (a re-entrant lock would
+        // deadlock/poison). With the last Arc gone no other thread can be inside spawn/cancel, so
+        // the poisoned-lock recovery is purely defensive.
+        self.cancelled.store(true, Ordering::Release);
+        let pending = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for handle in pending {
+            handle.abort();
+        }
     }
 }
 
@@ -268,9 +336,13 @@ impl MonitorHandle {
     /// A handle with no tasks yet (the engine's lifecycle tests construct one directly).
     #[cfg(test)]
     pub(crate) fn new(tx: UnboundedSender<MonitorMsg>) -> Self {
+        // Dummy panic channel: the receiver is intentionally dropped, so a (never-expected) panic
+        // ping simply no-ops — the engine's real watchdog is only wired up through `start`.
+        extern "C" fn noop(_: *const u8, _: usize) {}
+        let (panic_tx, _panic_rx) = unbounded_channel();
         MonitorHandle {
             tx,
-            group: Arc::new(TaskGroup::new()),
+            group: Arc::new(TaskGroup::new(noop, panic_tx)),
         }
     }
 
@@ -280,6 +352,18 @@ impl MonitorHandle {
     /// aborts immediately inside `TaskGroup::spawn`.
     pub fn stop(&self) {
         let _ = self.tx.send(MonitorMsg::Stop);
+        self.group.cancel();
+    }
+}
+
+impl Drop for MonitorHandle {
+    fn drop(&mut self) {
+        // A dropped handle must never leave the monitor running: the actor ↔ group cycle (the actor
+        // future holds a group clone, and the group's tasks hold the actor wrapper) means the group's
+        // own Drop cannot run while the actor lives — cancel is the only stop. This covers every
+        // path that discards the handle without `stop()` (a re-Init replacing CoreState, teardown,
+        // error unwinds). Calling `cancel` twice (stop() then drop) is idempotent: the second pass
+        // finds the task list already taken. No callback/`idle` is emitted from Drop on purpose.
         self.group.cancel();
     }
 }
@@ -418,8 +502,43 @@ fn spawn_relogin(
     });
 }
 
-/// Spawn the actor + one poller per account on the current tokio runtime.
-pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> MonitorHandle {
+/// Stack guard closing the `start`-unwind hole: the actor future holds its own `group` clone (and
+/// `group.tasks` holds the actor's wrapper), so while the actor is spawned the group's own `Drop`
+/// CANNOT run — a panic between the actor spawn and the handle return would leave every helper
+/// detached. This guard cancels the group unconditionally on unwind while armed, and is disarmed
+/// only after the `MonitorHandle` is fully assembled — from then on `MonitorHandle::drop`'s cancel
+/// owns the stop guarantee (with `TaskGroup::drop` as the last-resort teardown once the cycle is
+/// broken).
+struct StartupGuard(Arc<TaskGroup>, bool);
+
+impl StartupGuard {
+    fn new(group: Arc<TaskGroup>) -> Self {
+        StartupGuard(group, true)
+    }
+
+    /// The monitor is fully assembled: the guard must no longer cancel on drop.
+    fn disarm(&mut self) {
+        self.1 = false;
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.cancel();
+        }
+    }
+}
+
+/// Spawn the actor + one poller per account on the current tokio runtime. `panic_tx` is the engine
+/// watchdog's channel: every helper panic pings it once (with a fixed `core_panicked` event), and
+/// closing the channel (a normal stop drops the group and handle) tells the watchdog to no-op.
+pub fn start(
+    cb: EventCb,
+    accounts: Vec<Account>,
+    cfg: MonitorConfig,
+    panic_tx: UnboundedSender<()>,
+) -> MonitorHandle {
     let (tx, rx) = unbounded_channel();
     let map: HashMap<String, Arc<Account>> = accounts
         .into_iter()
@@ -430,7 +549,10 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
     // actor owns the sender and republishes on every settings change (no stop/start needed).
     let (tune_tx, tune_rx) = watch::channel(cfg.tuning());
 
-    let group = Arc::new(TaskGroup::new());
+    let group = Arc::new(TaskGroup::new(cb, panic_tx));
+    // Armed until the handle below is fully built: any unwind here must cancel the group, because
+    // the actor's own `group` clone keeps the group alive past this frame (TaskGroup::drop can't run).
+    let mut startup = StartupGuard::new(group.clone());
     // A teacher account is only a QR data source (dispatch_signs uses it via the actor's `map`), never a
     // monitored student — so it gets no poller. Polling it as a student would waste a request loop and
     // could enrol it as a spurious rollcall participant.
@@ -443,6 +565,7 @@ pub fn start(cb: EventCb, accounts: Vec<Account>, cfg: MonitorConfig) -> Monitor
         cb,
         &json!({ "id": null, "event": "StateChanged", "state": "monitoring" }),
     );
+    startup.disarm();
     MonitorHandle { tx, group }
 }
 
@@ -1081,7 +1204,7 @@ async fn actor(
                 let Some(msg) = maybe else { break };
                 match msg {
                     MonitorMsg::Stop => break,
-                    MonitorMsg::Detected(d) => on_detected(&mut activities, &accounts, &self_tx, &group, cb, d),
+                    MonitorMsg::Detected(d) => on_detected(&mut activities, &accounts, &self_tx, &group, cb, &cfg, d),
                     MonitorMsg::GateResult { key, rate } => on_gate(&mut activities, &accounts, &self_tx, &group, cb, &cfg, key, rate),
                     MonitorMsg::CodeRead { key, code } => {
                         // A manual override may be waiting on this code (below-gate number: gate held before
@@ -1106,7 +1229,7 @@ async fn actor(
                         command_reply(cb, command_id, result);
                     }
                     MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
-                        on_quiz_detected(&mut quizzes, &accounts, &self_tx, &cfg, cb, base_url, source, course, course_id, activity_id, account_id, stem),
+                        on_quiz_detected(&mut quizzes, base_url, source, course, course_id, activity_id, account_id, stem),
                     MonitorMsg::QuizPrepared { key, attempts } =>
                         on_quiz_prepared(&mut quizzes, &cfg, cb, key, attempts),
                     MonitorMsg::QuizPrepareGone { key, account_id, generation } =>
@@ -1164,7 +1287,7 @@ async fn actor(
                         if ok {
                             relogin_backoff.remove(&account_id); // success resets the backoff
                             // Only on a SUCCESSFUL re-login do we re-sign the rollcalls this account lost.
-                            redispatch_signs(&mut activities, &accounts, &self_tx, &group, &cfg, &account_id);
+                            redispatch_signs(&mut activities, &accounts, &self_tx, &group, &cfg, cb, &account_id);
                         } else {
                             // One clear Error exactly when the bounded backoff gives up on this account;
                             // further AuthLost signals are dropped (relogin_due → GivenUp).
@@ -1200,6 +1323,7 @@ fn on_detected(
     tx: &UnboundedSender<MonitorMsg>,
     group: &TaskGroup,
     cb: EventCb,
+    cfg: &MonitorConfig,
     d: Detected,
 ) {
     let key = (
@@ -1207,34 +1331,67 @@ fn on_detected(
         d.kind.as_str().to_string(),
         d.rollcall_id.clone(),
     );
-    let entry = activities.entry(key.clone()).or_insert_with(|| Activity {
-        activity_token: crate::config::new_id(),
-        kind: d.kind,
-        course: d.course.clone(),
-        participants: HashSet::new(),
-        attendance_rate: None,
-        number_code: None,
-        code_requested: false,
-        gate_pending: true,
-        gate_in_flight: false,
-        gate_next_check: None,
-        countdown_deadline: None,
-        acted: false,
-        sign_pending: false,
-        signed: HashSet::new(),
-        sign_failed: HashSet::new(),
-        needs_resign: HashSet::new(),
-        resign_attempts: HashMap::new(),
-    });
-    let is_new_participant = entry.participants.insert(d.account_id.clone());
+    let is_new_participant = {
+        let entry = activities.entry(key.clone()).or_insert_with(|| Activity {
+            activity_token: crate::config::new_id(),
+            kind: d.kind,
+            course: d.course.clone(),
+            participants: HashSet::new(),
+            attendance_rate: None,
+            number_code: None,
+            code_requested: false,
+            gate_pending: true,
+            gate_in_flight: false,
+            gate_next_check: None,
+            countdown_deadline: None,
+            acted: false,
+            sign_pending: false,
+            signed: HashSet::new(),
+            sign_failed: HashSet::new(),
+            needs_resign: HashSet::new(),
+            resign_attempts: HashMap::new(),
+        });
+        let is_new = entry.participants.insert(d.account_id.clone());
+        if is_new {
+            emit_rollcall_detected(cb, &d.rollcall_id, &d.base_url, entry);
+        }
+        is_new
+    };
     if is_new_participant {
-        emit_rollcall_detected(cb, &d.rollcall_id, &d.base_url, entry);
-        // Kick a gate check the first time this activity is seen (one in flight max; a held activity
-        // keeps its own cadence — a late participant does not burst an extra request).
-        if gate_check_due(entry, Instant::now())
-            && spawn_gate_check(accounts, tx, group, &key, &d.account_id)
+        // A participant detected AFTER the activity was already dispatched still needs ITS OWN sign —
+        // dispatch ONLY that account (a full re-dispatch would re-sign every participant; `signed` is
+        // the guard, so an already-signed late account is never re-dispatched).
+        if activities
+            .get(&key)
+            .is_some_and(|a| a.acted && !a.signed.contains(&d.account_id))
         {
-            entry.gate_in_flight = true;
+            // QR without a teacher cannot dispatch anything (dispatch_signs_for would reset the
+            // activity to un-acted and re-open a full re-dispatch window) — keep the activity acted
+            // and leave the late participant for a later AuthRestored / manual path.
+            let qr_without_teacher = activities
+                .get(&key)
+                .is_some_and(|a| a.kind == RollcallKind::Qr)
+                && !accounts.values().any(|account| account.is_teacher);
+            if !qr_without_teacher {
+                dispatch_signs_for(
+                    activities,
+                    accounts,
+                    tx,
+                    group,
+                    cfg,
+                    cb,
+                    &key,
+                    vec![d.account_id],
+                );
+            }
+        } else if let Some(entry) = activities.get_mut(&key) {
+            // Kick a gate check the first time this activity is seen (one in flight max; a held
+            // activity keeps its own cadence — a late participant does not burst an extra request).
+            if gate_check_due(entry, Instant::now())
+                && spawn_gate_check(accounts, tx, group, &key, &d.account_id)
+            {
+                entry.gate_in_flight = true;
+            }
         }
     }
 }
@@ -1599,12 +1756,17 @@ fn on_sign_result(
 
 /// After a re-login (R4.1 #2), re-dispatch a sign for ONLY the accounts that lost their session mid-sign
 /// on each activity — guarded by `signed` so an already-signed account is never re-signed (no double-sign).
+/// A QR activity is never handed to the generic `spawn_sign` (it answers "unsupported here"): its
+/// restore responsibility stays in the teacher-assist flow (`dispatch_signs_for`), which re-sources
+/// the rotating token for the recovered account. Without a teacher there is nothing to dispatch, so
+/// the account stays pending (`needs_resign`) for a later restore instead of producing a fake error.
 fn redispatch_signs(
     activities: &mut HashMap<ActivityKey, Activity>,
     accounts: &HashMap<String, Arc<Account>>,
     tx: &UnboundedSender<MonitorMsg>,
     group: &TaskGroup,
     cfg: &MonitorConfig,
+    cb: EventCb,
     account_id: &str,
 ) {
     let Some(acc) = accounts.get(account_id).cloned() else {
@@ -1616,8 +1778,21 @@ fn redispatch_signs(
         cooldown_ms: cfg.number_cooldown_ms,
         max_cooldowns: cfg.number_max_cooldowns,
     };
+    let has_teacher = accounts.values().any(|account| account.is_teacher);
+    let mut qr_keys: Vec<ActivityKey> = Vec::new();
     for (key, a) in activities.iter_mut() {
-        if a.needs_resign.remove(account_id) && !a.signed.contains(account_id) {
+        if a.signed.contains(account_id) || !a.needs_resign.contains(account_id) {
+            continue;
+        }
+        if a.kind == RollcallKind::Qr {
+            if has_teacher {
+                a.needs_resign.remove(account_id);
+                qr_keys.push(key.clone());
+            }
+            // No teacher → nothing dispatchable; the account STAYS pending (needs_resign) so a later
+            // restore can still retry — never the unsupported generic sign.
+        } else {
+            a.needs_resign.remove(account_id);
             spawn_sign(
                 acc.clone(),
                 a.kind,
@@ -1630,6 +1805,18 @@ fn redispatch_signs(
                 group,
             );
         }
+    }
+    for key in qr_keys {
+        dispatch_signs_for(
+            activities,
+            accounts,
+            tx,
+            group,
+            cfg,
+            cb,
+            &key,
+            vec![account_id.to_string()],
+        );
     }
 }
 
@@ -2145,10 +2332,6 @@ struct PriorAnswers {
 #[allow(clippy::too_many_arguments)]
 fn on_quiz_detected(
     quizzes: &mut HashMap<ActivityKey, QuizActivity>,
-    accounts: &HashMap<String, Arc<Account>>,
-    tx: &UnboundedSender<MonitorMsg>,
-    cfg: &MonitorConfig,
-    cb: EventCb,
     base_url: String,
     source: String,
     course: String,
@@ -2177,7 +2360,6 @@ fn on_quiz_detected(
         // A late participant invalidates a running countdown until its own paper and conflicts are known.
         q.countdown_deadline = None;
     }
-    let _ = (accounts, tx, cfg, cb);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2510,15 +2692,25 @@ fn on_quiz_tick(
                 rearm_quiz_countdown(q, cfg);
                 continue;
             }
-            let participants: Vec<Arc<Account>> = due_ids
-                .iter()
-                .map(|account_id| {
-                    accounts
-                        .get(account_id)
-                        .expect("filtered account exists")
-                        .clone()
-                })
-                .collect();
+            let mut participants: Vec<Arc<Account>> = Vec::new();
+            for account_id in &due_ids {
+                let Some(account) = accounts.get(account_id) else {
+                    // Fail closed (defensive — the retain above already filtered): a participant
+                    // missing from the session must never panic the actor. Report the same terminal
+                    // state as the pre-filter and skip the account.
+                    if let Some(attempt) = q.attempts.get_mut(account_id) {
+                        attempt.state = AttemptState::Failed;
+                    }
+                    emit(
+                        cb,
+                        &json!({ "id": null, "event": "Error", "severity": "error",
+                        "code": "quiz_account_unavailable", "activity_token": q.activity_token,
+                        "account_id": account_id, "message": "測驗帳號已不在監控工作階段中" }),
+                    );
+                    continue;
+                };
+                participants.push(account.clone());
+            }
             let priors: HashMap<String, PriorAnswers> = due_ids
                 .iter()
                 .filter_map(|account_id| {
@@ -2644,7 +2836,11 @@ fn dispatch_quiz_submits(
             .get(account_id)
             .cloned()
             .ok_or_else(|| format!("quiz account {account_id} is unavailable"))?;
-        let attempt = q.attempts.get(account_id).expect("ready attempt exists");
+        let Some(attempt) = q.attempts.get(account_id) else {
+            // Fail closed (defensive — ready_ids came from the same map): a vanished attempt must
+            // not be submitted from stale state, nor wedged into Submitting below.
+            continue;
+        };
         let mut answers = attempt.generated_answers.clone();
         for (subject_id, answer) in &attempt.overrides {
             answers.insert(subject_id.clone(), answer.clone());
@@ -2658,10 +2854,9 @@ fn dispatch_quiz_submits(
         ));
     }
     for account_id in ready_ids {
-        q.attempts
-            .get_mut(&account_id)
-            .expect("ready attempt exists")
-            .state = AttemptState::Submitting;
+        if let Some(attempt) = q.attempts.get_mut(&account_id) {
+            attempt.state = AttemptState::Submitting;
+        }
     }
     for (account, instance_id, subjects, answers, submitted_subjects) in jobs {
         spawn_quiz_submit(
@@ -3557,6 +3752,21 @@ mod tests {
 
     extern "C" fn noop_cb(_: *const u8, _: usize) {}
 
+    // Capture every event emitted through the seam on THIS test thread (each #[tokio::test] runs
+    // its own current-thread runtime on its own thread, so the thread-local never cross-talks).
+    thread_local! {
+        static EVENTS: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    extern "C" fn record_cb(ptr: *const u8, len: usize) {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+            EVENTS.with(|events| events.borrow_mut().push(v));
+        }
+    }
+    fn take_events() -> Vec<Value> {
+        EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+
     fn cfg_countdown(secs: u64) -> MonitorConfig {
         MonitorConfig {
             countdown_secs: secs,
@@ -3706,16 +3916,9 @@ mod tests {
             .conflicts
             .clear();
         quizzes.get_mut(&key).unwrap().countdown_deadline = Some(Instant::now());
-        let accounts: HashMap<String, Arc<Account>> = HashMap::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let cfg = cfg_countdown(15);
 
         on_quiz_detected(
             &mut quizzes,
-            &accounts,
-            &tx,
-            &cfg,
-            noop_cb,
             "http://x".to_string(),
             "exam".to_string(),
             String::new(),
@@ -4159,7 +4362,8 @@ mod tests {
     fn qr_without_teacher_stays_unacted_and_manual_retry_explains_recovery() {
         let cfg = cfg_countdown(15);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let group = TaskGroup::new();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
         let accounts: HashMap<String, Arc<Account>> = HashMap::new();
         let key = (
             "http://x".to_string(),
@@ -4193,7 +4397,8 @@ mod tests {
     fn held_gate_rechecks_on_bounded_cadence_with_at_most_one_inflight() {
         let cfg = cfg_countdown(15);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let group = TaskGroup::new();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
         let accounts: HashMap<String, Arc<Account>> = HashMap::new();
         let mut activities = HashMap::new();
         let t0 = Instant::now();
@@ -4206,6 +4411,7 @@ mod tests {
             &tx,
             &group,
             noop_cb,
+            &cfg,
             detected_for("acc1", "rc1"),
         );
         let key = (
@@ -4298,7 +4504,8 @@ mod tests {
     fn stale_gate_result_after_defer_never_rearms_the_countdown() {
         let cfg = cfg_countdown(15);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let group = TaskGroup::new();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
         let accounts: HashMap<String, Arc<Account>> = HashMap::new();
         let mut activities = HashMap::new();
         on_detected(
@@ -4307,6 +4514,7 @@ mod tests {
             &tx,
             &group,
             noop_cb,
+            &cfg,
             detected_for("acc1", "rc1"),
         );
         let key = (
@@ -4345,7 +4553,8 @@ mod tests {
     fn passing_gate_arms_the_countdown_exactly_once() {
         let cfg = cfg_countdown(15);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let group = TaskGroup::new();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
         let accounts: HashMap<String, Arc<Account>> = HashMap::new();
         let mut activities = HashMap::new();
         on_detected(
@@ -4354,6 +4563,7 @@ mod tests {
             &tx,
             &group,
             noop_cb,
+            &cfg,
             detected_for("acc1", "rc1"),
         );
         let key = (
@@ -4442,7 +4652,8 @@ mod tests {
     fn sign_now_after_dispatch_retries_only_bounded_failed_accounts() {
         let cfg = cfg_countdown(15);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let group = TaskGroup::new();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
         let accounts: HashMap<String, Arc<Account>> = HashMap::new();
         let mut activities = HashMap::new();
         let key = (
@@ -4533,7 +4744,8 @@ mod tests {
         let key: ActivityKey = (base_url, "quiz:exam".to_string(), "act1".to_string());
         let mut generations = HashMap::new();
         generations.insert("acc1".to_string(), 1_u64);
-        let group = TaskGroup::new();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
         spawn_quiz_prepare(
             vec![account],
             Source::Exam,
@@ -4595,6 +4807,413 @@ mod tests {
                 Ok(Some(_))
             ),
             "no follow-up message — the attempt is handed back to the actor's deadline path"
+        );
+    }
+
+    // --- TaskGroup panic containment / cancellation (deterministic; no network) ---
+
+    #[tokio::test]
+    async fn task_group_panic_reports_core_panicked_once_and_pings() {
+        let (panic_tx, mut panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(record_cb, panic_tx);
+        group.spawn(async { panic!("boom: helper died") });
+
+        tokio::time::timeout(Duration::from_secs(5), panic_rx.recv())
+            .await
+            .expect("a panicking helper must ping the watchdog")
+            .expect("a ping must arrive");
+
+        let events = take_events();
+        assert_eq!(events.len(), 1, "exactly one panic event: {events:?}");
+        assert_eq!(events[0]["event"].as_str(), Some("Error"));
+        assert_eq!(events[0]["code"].as_str(), Some("core_panicked"));
+
+        // One helper, one panic, one ping — never a duplicate report.
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200), panic_rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "a single helper panic must ping exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_group_normal_completion_and_cancel_report_no_panic() {
+        let (panic_tx, mut panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(record_cb, panic_tx);
+
+        // Normal completion → no ping, no event.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        group.spawn(async move {
+            let _ = done_tx.send(());
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("the helper must complete");
+
+        // Cancel → the child is aborted and nothing is reported (cancellation is not a panic).
+        let started = Arc::new(AtomicBool::new(false));
+        let ran_after_cancel = Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (s, r) = (started.clone(), ran_after_cancel.clone());
+        group.spawn(async move {
+            s.store(true, Ordering::SeqCst);
+            let _ = start_tx.send(());
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                r.store(true, Ordering::SeqCst);
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), start_rx)
+            .await
+            .expect("the looping helper must start");
+        group.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !ran_after_cancel.load(Ordering::SeqCst),
+            "cancel must abort the helper at its next await point"
+        );
+        assert!(
+            take_events().is_empty(),
+            "normal completion and cancellation must not emit core_panicked"
+        );
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200), panic_rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "normal completion and cancellation must not ping the watchdog"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_group_drop_aborts_children() {
+        // `start` may unwind after some pollers were spawned but before the handle is returned; the
+        // group's final Arc drop must abort every tracked child — no detached tasks may survive it.
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
+        let started = Arc::new(AtomicBool::new(false));
+        let ran_after_drop = Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (s, r) = (started.clone(), ran_after_drop.clone());
+        group.spawn(async move {
+            s.store(true, Ordering::SeqCst);
+            let _ = start_tx.send(());
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                r.store(true, Ordering::SeqCst);
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), start_rx)
+            .await
+            .expect("the child must start");
+        assert!(started.load(Ordering::SeqCst));
+
+        drop(group); // last Arc → TaskGroup::drop
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !ran_after_drop.load(Ordering::SeqCst),
+            "the child must not run after the group drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_group_spawn_after_cancel_aborts_immediately() {
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        group.cancel();
+        let started = Arc::new(AtomicBool::new(false));
+        let s = started.clone();
+        group.spawn(async move {
+            s.store(true, Ordering::SeqCst);
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "a spawn racing a completed stop must never run"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_guard_armed_cancels_children_even_with_live_strong_clone() {
+        // The start-unwind hole: the actor future holds its own group clone (and the group's tasks
+        // hold the actor wrapper — a cycle), so the group's OWN Drop cannot run while that clone
+        // lives. The armed guard must cancel the group directly, aborting every child anyway.
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
+        let strong = group.clone(); // the actor-style reference that outlives `start`'s frame
+        let started = Arc::new(AtomicBool::new(false));
+        let ran_after_drop = Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (s, r) = (started.clone(), ran_after_drop.clone());
+        group.spawn(async move {
+            s.store(true, Ordering::SeqCst);
+            let _ = start_tx.send(());
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                r.store(true, Ordering::SeqCst);
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), start_rx)
+            .await
+            .expect("the child must start");
+        assert!(started.load(Ordering::SeqCst));
+
+        let guard = StartupGuard::new(group); // armed, as if start unwound before returning
+        drop(guard);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !ran_after_drop.load(Ordering::SeqCst),
+            "an armed guard must abort every child even while a strong clone keeps the group alive"
+        );
+        drop(strong);
+    }
+
+    #[tokio::test]
+    async fn startup_guard_disarmed_does_not_cancel() {
+        // The normal start path disarms the guard just before returning the handle; dropping it
+        // must be a no-op, otherwise every successful start would cancel its own monitor. The child
+        // only starts AFTER the guard is dropped, so any stray cancel would abort it before it runs.
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
+        let mut guard = StartupGuard::new(group.clone());
+        let alive = Arc::new(AtomicBool::new(false));
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let a = alive.clone();
+        group.spawn(async move {
+            let _ = go_rx.await;
+            a.store(true, Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        guard.disarm();
+        drop(guard);
+        let _ = go_tx.send(());
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            alive.load(Ordering::SeqCst),
+            "a disarmed guard must not cancel the group"
+        );
+        // The child would still be looping — clean it up like a real stop would.
+        group.cancel();
+    }
+
+    // --- late participant / QR restore (state machines; no network) ---
+
+    fn account_at(id: &str, is_teacher: bool) -> Arc<Account> {
+        Arc::new(Account {
+            id: id.to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher,
+            course_id: None,
+            base_url: "http://127.0.0.1:1".to_string(), // port 1: connection refused → fails fast
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn late_participant_after_acted_is_dispatched_alone_not_full_redispatch() {
+        let cfg = cfg_countdown(15);
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        accounts.insert("acc1".to_string(), account_at("acc1", false));
+        accounts.insert("acc2".to_string(), account_at("acc2", false));
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "number".to_string(),
+            "rc1".to_string(),
+        );
+        let mut activity = gate_activity(&["acc1"]);
+        activity.acted = true; // already dispatched
+        activity.signed.insert("acc1".to_string());
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+
+        // acc2 detects the SAME already-acted rollcall after the dispatch.
+        on_detected(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            noop_cb,
+            &cfg,
+            Detected {
+                account_id: "acc2".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                rollcall_id: "rc1".to_string(),
+                kind: RollcallKind::Number,
+                course: String::new(),
+            },
+        );
+
+        // Exactly ONE dispatch: acc2's own sign (the unreachable host fails it fast). acc1, already
+        // signed, must never be re-signed — a full re-dispatch would have produced two messages.
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the late participant's sign must be dispatched")
+            .expect("a message must arrive");
+        match message {
+            MonitorMsg::SignResult {
+                key: got_key,
+                account_id,
+                ..
+            } => {
+                assert_eq!(got_key, key);
+                assert_eq!(account_id, "acc2");
+            }
+            _ => panic!("expected a SignResult for the late participant"),
+        }
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "no second dispatch — an already-signed account must never be re-signed"
+        );
+        let a = &activities[&key];
+        assert!(a.acted, "the activity stays acted");
+        assert!(a.signed.contains("acc1"));
+        assert!(a.participants.contains("acc2"));
+    }
+
+    #[tokio::test]
+    async fn redispatch_qr_routes_through_teacher_assist_never_unsupported_spawn() {
+        let cfg = cfg_countdown(15);
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        accounts.insert("acc1".to_string(), account_at("acc1", false));
+        accounts.insert("teacher1".to_string(), account_at("teacher1", true));
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activity = gate_activity(&["acc1"]);
+        activity.kind = RollcallKind::Qr;
+        activity.acted = true;
+        activity.needs_resign.insert("acc1".to_string());
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+
+        redispatch_signs(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            "acc1",
+        );
+
+        // The teacher-assist flow owns the restore: it tries (and fails) against the unreachable
+        // host and reports a REAL qr error — never spawn_sign's generic "unsupported here".
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a teacher-assist result must arrive")
+            .expect("a message must arrive");
+        match message {
+            MonitorMsg::SignResult {
+                account_id,
+                result: Err(error),
+                ..
+            } => {
+                assert_eq!(account_id, "acc1");
+                assert!(
+                    error.contains("qr:"),
+                    "expected a real teacher-assist error, got: {error}"
+                );
+                assert!(
+                    !error.contains("unsupported"),
+                    "the generic spawn_sign path must never run for QR: {error}"
+                );
+            }
+            _ => panic!("expected a failed teacher-assist SignResult"),
+        }
+        assert!(
+            !activities[&key].needs_resign.contains("acc1"),
+            "the recovered account left the pending set"
+        );
+    }
+
+    #[test]
+    fn redispatch_qr_without_teacher_stays_pending_and_never_fake_dispatches() {
+        let cfg = cfg_countdown(15);
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activity = gate_activity(&["acc1"]);
+        activity.kind = RollcallKind::Qr;
+        activity.acted = true;
+        activity.needs_resign.insert("acc1".to_string());
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+
+        redispatch_signs(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            "acc1",
+        );
+
+        // 0 偽派發: no teacher → nothing dispatchable — no SignResult (not even an "unsupported"
+        // one) may be produced, and the account stays pending for a later restore.
+        assert!(activities[&key].needs_resign.contains("acc1"));
+        assert!(
+            rx.try_recv().is_err(),
+            "no message may be produced without a teacher"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_handle_drop_cancels_group_children() {
+        // A discarded handle (re-Init replacing CoreState, teardown, error unwinds) must stop the
+        // monitor: the actor ↔ group cycle keeps the group alive, so only the handle's Drop (or an
+        // explicit stop) can abort the tracked tasks.
+        let (tx, _rx) = unbounded_channel();
+        let handle = MonitorHandle::new(tx);
+        let started = Arc::new(AtomicBool::new(false));
+        let ran_after_drop = Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (s, r) = (started.clone(), ran_after_drop.clone());
+        handle.group.spawn(async move {
+            s.store(true, Ordering::SeqCst);
+            let _ = start_tx.send(());
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                r.store(true, Ordering::SeqCst);
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(5), start_rx)
+            .await
+            .expect("the child must start");
+        assert!(started.load(Ordering::SeqCst));
+
+        drop(handle);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !ran_after_drop.load(Ordering::SeqCst),
+            "dropping the handle must cancel every tracked child"
         );
     }
 }

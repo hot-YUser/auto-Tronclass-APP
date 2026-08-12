@@ -422,44 +422,65 @@ fn is_letter_list(reply: &str) -> bool {
             && t.chars().all(|c| c.is_ascii_alphabetic()))
 }
 
-/// The isolated letter following the LAST "answer"-phrase mention ("answer is", "answer:", "answer",
-/// "答案") — an explicit statement usually names the intended choice. Returns only letters that were
-/// isolated in the reply.
-fn phrase_letter(reply: &str, letters: &[String]) -> Option<String> {
-    let lower = reply.to_lowercase();
+/// The first VALID option letter following the LAST "answer"-phrase mention — a standalone
+/// ASCII-case-insensitive `answer` or the CJK `答案` — an explicit statement usually names the
+/// intended choice. Scanned directly on the ORIGINAL string (never on a lowercased copy, whose
+/// byte offsets could shift with case-fold expansion like `İ` → panic on slicing): `answer` is found
+/// by case-insensitive byte windows with non-ASCII-alphanumeric neighbours, `答案` by
+/// `rmatch_indices`, and the LATER end byte of the two wins. Only a token of exactly ONE ASCII
+/// letter after it is a candidate ("is"/"choice" are multi-letter words and must never leak their
+/// letters; CJK chars are non-ASCII and naturally separate a glued statement "答案是C" → "C").
+/// Returns only a letter that maps to a real option (a marker naming an impossible label falls
+/// through to the other strategies); `None` when there is no marker or no valid letter after it.
+fn phrase_letter(reply: &str, options: &[Value]) -> Option<String> {
+    let bytes = reply.as_bytes();
     let mut last: Option<usize> = None;
-    for marker in ["answer is", "answer:", "answer", "答案"] {
-        let mut from = 0;
-        while let Some(pos) = lower[from..].find(marker) {
-            let end = from + pos + marker.len();
-            last = Some(end);
-            from = end;
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if bytes[i..i + 6].eq_ignore_ascii_case(b"answer") {
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let next_ok = i + 6 >= bytes.len() || !bytes[i + 6].is_ascii_alphanumeric();
+            if prev_ok && next_ok {
+                last = Some(i + 6);
+            }
+            i += 6;
+        } else {
+            i += 1;
         }
     }
+    if let Some((pos, _)) = reply.rmatch_indices("答案").next() {
+        let end = pos + "答案".len();
+        last = Some(last.map_or(end, |earlier| earlier.max(end)));
+    }
     let after = last?;
-    let bytes = reply.as_bytes();
-    let mut i = after;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_uppercase() {
-            let prev_ok = i == 0 || !(bytes[i - 1] as char).is_alphabetic();
-            let next_ok = i + 1 >= bytes.len() || !(bytes[i + 1] as char).is_alphabetic();
-            if prev_ok && next_ok {
-                let s = c.to_string();
-                if letters.contains(&s) {
-                    return Some(s);
-                }
+    let mut token = String::new();
+    for c in reply[after..].chars() {
+        if c.is_ascii_alphabetic() {
+            token.push(c);
+            continue;
+        }
+        if token.len() == 1 {
+            let letter = token.to_ascii_uppercase();
+            if label_to_index(&letter).is_some_and(|idx| options.get(idx).is_some()) {
+                return Some(letter);
             }
         }
-        i += 1;
+        token.clear();
+    }
+    if token.len() == 1 {
+        let letter = token.to_ascii_uppercase();
+        if label_to_index(&letter).is_some_and(|idx| options.get(idx).is_some()) {
+            return Some(letter);
+        }
     }
     None
 }
 
-/// For a single-choice reply, reduce several isolated letters to one: an explicit "answer"-phrase
-/// letter wins; else a bare letter list keeps its FIRST valid label ("A, C"); else prose keeps the
-/// LAST valid label (the final statement usually carries the answer — an earlier article letter must
-/// not win).
+/// For a single-choice reply, reduce several isolated letters to one: a bare letter list keeps its
+/// FIRST valid label ("A, C"); prose keeps the LAST valid label (the final statement usually carries
+/// the answer — an earlier article letter must not win). The explicit "answer"-phrase case is
+/// decided BEFORE this by `parse_choice_reply` — a CJK-glued letter ("答案是C") is not isolated at
+/// all, so it never reaches this function.
 fn disambiguate_single_letters(
     mut letters: Vec<String>,
     reply: &str,
@@ -469,11 +490,6 @@ fn disambiguate_single_letters(
         return letters;
     }
     let valid = |l: &String| label_to_index(l).is_some_and(|idx| options.get(idx).is_some());
-    if let Some(letter) = phrase_letter(reply, &letters) {
-        if valid(&letter) {
-            return vec![letter];
-        }
-    }
     if is_letter_list(reply) {
         if let Some(first) = letters.iter().find(|l| valid(l)) {
             return vec![first.clone()];
@@ -487,6 +503,19 @@ fn disambiguate_single_letters(
 
 /// Parse an LLM reply into option IDs for a choice/matching subject. `single` keeps only the first.
 pub fn parse_choice_reply(reply: &str, options: &[Value], single: bool) -> Vec<String> {
+    // An explicit last "answer"/"答案" statement wins FIRST: it names the intended choice even when
+    // CJK text glues the letter to the marker ("答案是C", "A。但答案是C") — there the letter is not
+    // isolated, so the letter strategies below would miss it (or keep an earlier article letter).
+    if single {
+        if let Some(letter) = phrase_letter(reply, options) {
+            if let Some(id) = label_to_index(&letter)
+                .and_then(|idx| options.get(idx))
+                .map(option_id)
+            {
+                return vec![id];
+            }
+        }
+    }
     let mut letters = isolated_letters(reply);
     if letters.is_empty() {
         letters = compact_letters(reply);
@@ -745,6 +774,66 @@ mod tests {
             parse_choice_reply("A careful reading suggests B.", o, false),
             ids(vec![s("o1"), s("o2")])
         );
+    }
+
+    #[test]
+    fn single_choice_picks_the_letter_glued_to_the_last_answer_marker() {
+        // 錯選事故 regression: a CJK statement GLUES the letter to the marker, so it is never
+        // isolated — the old byte-scan + isolation requirement missed "答案是C" entirely (empty
+        // answer → subject skipped) and kept an earlier article letter in "A。但答案是C" (→ A).
+        // Both must select C, char-safe across the multi-byte CJK text.
+        let opts = json!([{"id":"o1","content":"cat"},{"id":"o2","content":"dog"},{"id":"o3","content":"fish"}]);
+        let o = opts.as_array().unwrap();
+        let s = |a: &str| a.to_string();
+        assert_eq!(parse_choice_reply("答案是C", o, true), ids(vec![s("o3")]));
+        assert_eq!(
+            parse_choice_reply("A。但答案是C", o, true),
+            ids(vec![s("o3")])
+        );
+        // The LAST marker wins, and the English phrase path is unchanged (isolated or not).
+        assert_eq!(
+            parse_choice_reply("答案 B，答案是C", o, true),
+            ids(vec![s("o3")])
+        );
+        // Mixed languages: the LATER marker's end byte wins — the CJK marker at the front must not
+        // override the later English "answer".
+        assert_eq!(
+            parse_choice_reply("答案 B, but the answer is C", o, true),
+            ids(vec![s("o3")])
+        );
+        // A case-fold-expanding prefix (İ lowercases to more bytes) must not panic the marker scan —
+        // offsets come from the ORIGINAL string, never a lowercased copy.
+        assert_eq!(
+            parse_choice_reply("İ 前綴，答案是C", o, true),
+            ids(vec![s("o3")])
+        );
+        // A marker letter that is not a real option falls through to the last valid label.
+        assert_eq!(
+            parse_choice_reply("答案是Z，其实A", o, true),
+            ids(vec![s("o1")])
+        );
+        // Multi-letter English words after the marker must not leak their letters: with 9 options
+        // (I valid), "answer is C" must pick C, never the I inside "is".
+        let wide = json!([
+            {"id":"o1","content":"cat"},{"id":"o2","content":"dog"},{"id":"o3","content":"fish"},
+            {"id":"o4","content":"owl"},{"id":"o5","content":"bee"},{"id":"o6","content":"ant"},
+            {"id":"o7","content":"cow"},{"id":"o8","content":"pig"},{"id":"o9","content":"fox"}
+        ]);
+        let w = wide.as_array().unwrap();
+        assert_eq!(
+            parse_choice_reply("answer is C", w, true),
+            ids(vec![s("o3")])
+        );
+        assert_eq!(
+            parse_choice_reply("my choice is C", w, true),
+            ids(vec![s("o3")])
+        );
+        // A glued letter must not break compact/multi/content matching.
+        assert_eq!(
+            parse_choice_reply("AC", o, false),
+            ids(vec![s("o1"), s("o3")])
+        );
+        assert_eq!(parse_choice_reply("dog", o, true), ids(vec![s("o2")]));
     }
 
     #[test]

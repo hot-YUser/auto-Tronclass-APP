@@ -163,10 +163,11 @@ async fn response_body(
     let resp = resp.map_err(|_| QrError::new(FailureKind::Transient, operation))?;
     let status = resp.status().as_u16();
     let url = resp.url().clone();
-    let body = resp
-        .text()
-        .await
-        .map_err(|_| QrError::new(FailureKind::Transient, operation))?;
+    let body =
+        match crate::http::read_bounded(resp, crate::http::MAX_MUTATION_BODY, operation).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => return Err(QrError::new(FailureKind::Transient, operation)),
+        };
     classify_http_response(status, &url, &body).map_err(|kind| QrError::new(kind, operation))?;
     Ok(body)
 }
@@ -275,6 +276,28 @@ mod tests {
         assert_eq!(payload["duration"], 0);
         assert_eq!(payload["student_rollcalls"], json!([]));
         assert!(!payload["title"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_fail_transient_not_buffered() {
+        // A lying Content-Length (far above the 8 MiB mutation cap): every teacher response must
+        // fail with the read-failure kind (Transient) instead of buffering the whole lie — the
+        // same bounded-read policy as every other response.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n{\"courses\":[]}";
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let ep = Endpoints::derive(&format!("http://{address}"));
+        let err = resolve_course_id(&Client::new(), &ep, None)
+            .await
+            .expect_err("an oversized body must not be buffered");
+        assert_eq!(err.kind, FailureKind::Transient);
     }
 
     #[test]
