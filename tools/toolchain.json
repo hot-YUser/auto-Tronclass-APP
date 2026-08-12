@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "dotnetSdk": "11.0.100-preview.6.26359.118",
-  "mauiWorkloadSet": "11.0.100-preview.6.26364.2",
-  "mauiManifest": "11.0.0-preview.6.26360.8",
+  "dotnetSdk": "11.0.100-preview.7.26381.103",
+  "mauiWorkloadSet": "11.0.100-preview.7.26410.2",
+  "mauiManifest": "11.0.0-preview.7.26406.9",
   "androidNdk": "27.2.12479018",
   "cargoNdk": "4.1.2"
 }

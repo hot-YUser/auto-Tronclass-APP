@@ -298,23 +298,44 @@ foreach ($field in "dotnetSdk", "mauiWorkloadSet", "mauiManifest", "androidNdk",
     }
 }
 
-$dotnet = Join-Path $env:LOCALAPPDATA "Microsoft\dotnet\dotnet.exe"
-if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) { $dotnet = "dotnet" }
-$dotnetCommand = Get-Command $dotnet -ErrorAction SilentlyContinue
-if (-not $dotnetCommand -or [string]::IsNullOrWhiteSpace([string]$dotnetCommand.Source)) {
-    throw "找不到 dotnet 可執行檔（$dotnet）；請安裝 .NET SDK $($toolchain.dotnetSdk) 或將它加入 PATH。"
+$dotnetCandidates = [System.Collections.Generic.List[string]]::new()
+$pathDotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+if ($pathDotnet -and -not [string]::IsNullOrWhiteSpace([string]$pathDotnet.Source)) {
+    $dotnetCandidates.Add([string]$pathDotnet.Source)
 }
-$dotnetDir = Split-Path ([string]$dotnetCommand.Source) -Parent
+foreach ($candidate in @(
+    (Join-Path $env:ProgramFiles "dotnet\dotnet.exe"),
+    (Join-Path $env:LOCALAPPDATA "Microsoft\dotnet\dotnet.exe")
+)) {
+    if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and -not $dotnetCandidates.Contains($candidate)) {
+        $dotnetCandidates.Add($candidate)
+    }
+}
+
+# 一台發行機可能同時有 VS/系統與 user-local SDK。依規範版本選 host，而非固定偏好某個
+# 安裝根目錄，否則較舊的 user-local host 會遮蔽 PATH 上已安裝的正確 SDK。
+$dotnet = $null
+$dotnetActual = $null
+$dotnetSeen = [System.Collections.Generic.List[string]]::new()
+foreach ($candidate in $dotnetCandidates) {
+    $actual = (& $candidate --version 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$actual)) { continue }
+    $actual = ([string]$actual).Trim()
+    $dotnetSeen.Add("$candidate => $actual")
+    if ($actual -eq [string]$toolchain.dotnetSdk) {
+        $dotnet = $candidate
+        $dotnetActual = $actual
+        break
+    }
+}
+if (-not $dotnet) {
+    $found = if ($dotnetSeen.Count -eq 0) { "未找到可用 dotnet host" } else { $dotnetSeen -join "；" }
+    throw "發行需要 .NET SDK $($toolchain.dotnetSdk)（tools/toolchain.json 固定，與 CI 相同）；$found。請安裝精確版本後重試。"
+}
+$dotnetDir = Split-Path $dotnet -Parent
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$dotnetDir;$env:PATH"
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
-
-# ── .NET SDK 閘：必須是 tools/toolchain.json 固定的精確 SDK（與 CI 相同）；
-#    其他 SDK（含同 band 的其他 preview build）一律拒絕，避免在無法與 CI 重現的 SDK 上產出。
-$dotnetActual = Get-ToolVersion -Name $dotnet
-if ($dotnetActual.Trim() -ne [string]$toolchain.dotnetSdk) {
-    throw "發行需要 .NET SDK $($toolchain.dotnetSdk)（tools/toolchain.json 固定，與 CI 相同）；目前：$dotnetActual。請安裝精確版本後重試。"
-}
-Write-Host ("  ✓ .NET SDK $dotnetActual") -ForegroundColor Green
+Write-Host ("  ✓ .NET SDK $dotnetActual ($dotnet)") -ForegroundColor Green
 
 # ── MAUI workload 閘：即使 -SkipAndroid，multi-target restore 仍需 maui-windows 與
 #    maui-android 兩個 workload；manifest 必須精確等於 mauiManifest（安裝時用的

@@ -68,7 +68,7 @@ Rust core（登入、持久化、監控、點名、測驗、LLM、redaction）
 
 ## 從原始碼建置與測試
 
-需求：PowerShell 7.4+（發版腳本 `#requires`）、Rust 1.97.1（root `rust-toolchain.toml` 固定，rustup 自動採用）、`cargo-ndk` 4.1.2（Android 建置用）、精確的 .NET SDK 11.0.100-preview.6.26359.118（`tools/release.ps1` 開頭 gate 精確版本）、MAUI workload：`maui-windows` 與 `maui-android` 都要裝（即使只建 Windows，multi-target restore 也需要 `maui-android`；`tools/release.ps1` 會驗證兩者 manifest 精確版本）；Android 建置另需 Android SDK/NDK（精確 27.2.12479018，`build-core.ps1` 解析 `source.properties` 檢查）、JDK 及對應 workload。Rust channel 以 `rust-toolchain.toml` 為唯一規範；其餘工具鏈 pins（.NET SDK、MAUI workload set/manifest、NDK、cargo-ndk）以 `tools/toolchain.json` 為單一規範，CI 與發版腳本都從它讀取，請勿在其他地方重複硬編。工具鏈路徑可用環境變數指定，請勿把金鑰寫入腳本或提交。
+需求：PowerShell 7.4+（發版腳本 `#requires`）、Rust 1.97.1（root `rust-toolchain.toml` 固定，rustup 自動採用）、`cargo-ndk` 4.1.2（Android 建置用）、精確的 .NET SDK 11.0.100-preview.7.26381.103（`tools/release.ps1` 開頭 gate 精確版本）、MAUI workload：`maui-windows` 與 `maui-android` 都要裝（即使只建 Windows，multi-target restore 也需要 `maui-android`；`tools/release.ps1` 會驗證兩者 manifest 精確版本）；Android 建置另需 Android SDK/NDK（精確 27.2.12479018，`build-core.ps1` 解析 `source.properties` 檢查）、JDK 及對應 workload。Rust channel 以 `rust-toolchain.toml` 為唯一規範；其餘工具鏈 pins（.NET SDK、MAUI workload set/manifest、NDK、cargo-ndk）以 `tools/toolchain.json` 為單一規範，CI 與發版腳本都從它讀取，請勿在其他地方重複硬編。工具鏈路徑可用環境變數指定，請勿把金鑰寫入腳本或提交。
 
 ```powershell
 # Rust 核心單元/整合測試與 lint
