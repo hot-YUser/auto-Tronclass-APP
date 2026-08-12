@@ -45,6 +45,10 @@ fn none_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> bool {
 fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
     move |v| v["event"] == "Reply" && v["id"] == id
 }
+// boot 專用：回覆必須是 ok=true，失敗時由 .expect 以階段訊息立即停止。
+fn ok_reply(id: u64) -> impl Fn(&Value) -> bool {
+    move |v| v["event"] == "Reply" && v["id"] == id && v["ok"] == true
+}
 fn send(handle: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(handle, json.as_ptr(), json.len()) };
 }
@@ -136,22 +140,22 @@ fn slice2_multi_account_monitoring_and_four_types() {
         h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{data_dir}"}}"#),
     );
-    assert!(wait_for(reply_ok(i), 10).is_some(), "Init");
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = next();
+    // poll_idle_secs=1：absence 窗口（3–4s）需 ≥3× poll cadence 才有時間裕度。
     send(
         h,
-        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2}}}}"#),
+        &format!(
+            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"poll_idle_secs":1}}}}"#
+        ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = next();
     send(
         h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    assert!(
-        wait_for(reply_ok(i), 5).unwrap()["ok"] == true,
-        "CreateVault"
-    );
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
 
     // Four accounts: alice/bob on A (students), a teacher on A (for QR), carol on B.
     for (label, base, extra) in [
@@ -167,10 +171,7 @@ fn slice2_multi_account_monitoring_and_four_types() {
                 r#"{{"id":{i},"cmd":"AddAccount","label":"{label}","school":"{base}","username":"{label}","password":"secret"{extra}}}"#
             ),
         );
-        assert!(
-            wait_for(reply_ok(i), 5).unwrap()["ok"] == true,
-            "AddAccount {label}"
-        );
+        wait_for(ok_reply(i), 5).unwrap_or_else(|| panic!("AddAccount {label} 未回覆 ok"));
     }
     let alice = account_id("alice").unwrap();
     let bob = account_id("bob").unwrap();
@@ -178,13 +179,13 @@ fn slice2_multi_account_monitoring_and_four_types() {
 
     let i = next();
     send(h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    assert!(wait_for(reply_ok(i), 15).is_some(), "StartMonitoring");
+    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
     // all four should authenticate
-    assert!(wait_for(
+    wait_for(
         |v| v["event"] == "AccountStatus" && v["state"] == "online",
-        10
+        10,
     )
-    .is_some());
+    .expect("帳號未上線");
 
     // --- number rollcall on A, visible to alice+bob → both sign, merged into one activity ---
     open_rollcall(

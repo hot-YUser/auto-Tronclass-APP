@@ -39,8 +39,9 @@ fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
     }
     None
 }
-fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
-    move |v| v["event"] == "Reply" && v["id"] == id
+// boot 專用：回覆必須是 ok=true，失敗時由 .expect 以階段訊息立即停止。
+fn ok_reply(id: u64) -> impl Fn(&Value) -> bool {
+    move |v| v["event"] == "Reply" && v["id"] == id && v["ok"] == true
 }
 fn submitted(quiz_id: &str) -> impl Fn(&Value) -> bool + '_ {
     move |v| v["event"] == "QuizSubmitted" && v["quiz_id"] == quiz_id
@@ -125,7 +126,7 @@ fn boot(tag: &str, base: &str, enable_tools: bool) -> (Harness, String) {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
@@ -133,19 +134,19 @@ fn boot(tag: &str, base: &str, enable_tools: bool) -> (Harness, String) {
             r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"max_answer_reask":1,"enable_llm_tools":{enable_tools},"llm_endpoint":"{base}/v1/chat/completions"}}}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("SetLlmKey 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
@@ -153,15 +154,16 @@ fn boot(tag: &str, base: &str, enable_tools: bool) -> (Harness, String) {
             r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let dave = account_id("dave").unwrap();
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(reply_ok(i), 15);
+    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
     wait_for(
         |v| v["event"] == "AccountStatus" && v["state"] == "online",
         10,
-    );
+    )
+    .expect("帳號未上線");
     (hz, dave)
 }
 

@@ -42,8 +42,9 @@ fn wait_for<F: Fn(&Value) -> bool>(pred: F, secs: u64) -> Option<Value> {
 fn any(pred: impl Fn(&Value) -> bool) -> bool {
     snapshot().iter().any(pred)
 }
-fn reply_ok(id: u64) -> impl Fn(&Value) -> bool {
-    move |v| v["event"] == "Reply" && v["id"] == id
+// boot 專用：回覆必須是 ok=true，失敗時由 .expect 以階段訊息立即停止。
+fn ok_reply(id: u64) -> impl Fn(&Value) -> bool {
+    move |v| v["event"] == "Reply" && v["id"] == id && v["ok"] == true
 }
 fn submitted(quiz_id: &str) -> impl Fn(&Value) -> bool + '_ {
     move |v| v["event"] == "QuizSubmitted" && v["quiz_id"] == quiz_id
@@ -121,7 +122,7 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
-    wait_for(reply_ok(i), 10);
+    wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
@@ -129,19 +130,19 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
             r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"prepare_retry_budget_secs":{budget},"max_answer_reask":{reask},"llm_endpoint":"{base}/v1/chat/completions"}}}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("SetLlmKey 未回覆 ok");
     let i = hz.next();
     send(
         hz.h,
@@ -149,15 +150,16 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
             r#"{{"id":{i},"cmd":"AddAccount","label":"dave","school":"{base}","username":"dave","password":"secret"}}"#
         ),
     );
-    wait_for(reply_ok(i), 5);
+    wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let dave = account_id("dave").unwrap();
     let i = hz.next();
     send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(reply_ok(i), 15);
+    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
     wait_for(
         |v| v["event"] == "AccountStatus" && v["state"] == "online",
         10,
-    );
+    )
+    .expect("帳號未上線");
     (hz, dave)
 }
 
@@ -448,32 +450,40 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         .join(format!("tron-r4-ds-{}", new_id()))
         .to_string_lossy()
         .replace('\\', "/");
-    let step = |hz: &mut Harness, cmd: String| {
+    let step = |hz: &mut Harness, cmd: &str, stage: &str| {
         let i = hz.next();
-        send(hz.h, &cmd);
-        wait_for(reply_ok(i), 10);
+        send(hz.h, cmd);
+        wait_for(ok_reply(i), 10).unwrap_or_else(|| panic!("boot 失敗：{stage} 未回覆 ok"));
     };
     // inline boot of TWO accounts (usernames aa/bb → user_no aa/bb; the fake expires only bb's signs).
     step(
         &mut hz,
-        format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#),
-    );
-    step(&mut hz, r#"{"id":2,"cmd":"UpdateConfig","patch":{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"prepare_retry_budget_secs":30}}"#.to_string());
-    step(
-        &mut hz,
-        r#"{"id":3,"cmd":"CreateVault","master_password":"pw"}"#.to_string(),
+        &format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#),
+        "Init",
     );
     step(
         &mut hz,
-        format!(
+        r#"{"id":2,"cmd":"UpdateConfig","patch":{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"prepare_retry_budget_secs":30}}"#,
+        "UpdateConfig",
+    );
+    step(
+        &mut hz,
+        r#"{"id":3,"cmd":"CreateVault","master_password":"pw"}"#,
+        "CreateVault",
+    );
+    step(
+        &mut hz,
+        &format!(
             r#"{{"id":4,"cmd":"AddAccount","label":"acctA","school":"{base}","username":"aa","password":"secret"}}"#
         ),
+        "AddAccount(acctA)",
     );
     step(
         &mut hz,
-        format!(
+        &format!(
             r#"{{"id":5,"cmd":"AddAccount","label":"acctB","school":"{base}","username":"bb","password":"secret"}}"#
         ),
+        "AddAccount(acctB)",
     );
     let a = account_id("acctA").unwrap();
     let b = account_id("acctB").unwrap();
@@ -482,7 +492,11 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         "/_test/expire_signs",
         r#"{"enabled":true,"user":"bb"}"#,
     ); // only B's signs expire
-    step(&mut hz, r#"{"id":6,"cmd":"StartMonitoring"}"#.to_string());
+    step(
+        &mut hz,
+        r#"{"id":6,"cmd":"StartMonitoring"}"#,
+        "StartMonitoring",
+    );
     post(
         &base,
         "/_test/open_rollcall",

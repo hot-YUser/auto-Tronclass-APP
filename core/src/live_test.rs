@@ -1,13 +1,14 @@
 //! Live real-server integration tests — the ultimate ground truth (docs 90; the fake is offline & self-authored).
 //! Every test is `#[ignore]`: they hit a REAL TronClass tenant + real LLM and only run when explicitly asked
-//! with credentials in the environment. NEVER hardcode secrets here — the v1 runner script
-//! (`scripts/_v2_live.py`) reads them from `config.conf` and exports them, so this file is safe in the repo.
+//! with credentials in the environment. NEVER hardcode secrets here — 憑證一律由執行者以下方 TRON_* 環境變數
+//! 提供（本 repo 不含 v1 的 scripts/_v2_*.py 輔助腳本；seed 與 cleanup 需以教師帳號手動進行，見各 phase 註解）。
 //!
+//! 執行方式：先設定下方 TRON_* 環境變數，再執行
 //!   cargo test --lib live_ -- --ignored --nocapture --test-threads=1
 //!
 //! Env: TRON_BASE_URL, TRON_USER, TRON_PASS, TRON_TEACHER_USER, TRON_TEACHER_PASS,
 //!      TRON_LLM_KEY, TRON_LLM_ENDPOINT, TRON_LLM_MODEL, TRON_COURSE(=55379),
-//!      and per-phase: TRON_EXAM_ID, TRON_ROLLCALL_ID.
+//!      and per-phase: TRON_EXAM_ID, TRON_ROLLCALL_ID, TRON_NUMBER_CODE.
 
 use crate::answer::{self, Source};
 use crate::llm::{self, EventCb, LlmConfig};
@@ -18,7 +19,11 @@ use reqwest::Client;
 use std::collections::HashMap;
 
 fn env(k: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| panic!("env {k} not set — run via scripts/_v2_live.py"))
+    std::env::var(k).unwrap_or_else(|_| {
+        panic!(
+            "env {k} not set — 請先設定 TRON_* 環境變數，再執行 cargo test --lib live_ -- --ignored --nocapture --test-threads=1"
+        )
+    })
 }
 
 extern "C" fn noop_cb(_: *const u8, _: usize) {}
@@ -166,7 +171,8 @@ async fn live_school_probe() {
 
 // ---- Phase 6: full monitor pipeline via the engine FFI (poll → detect → gate → sign → SignedIn) ----
 // Drives the REAL engine (Init/AddAccount/StartMonitoring) against a teacher-seeded RADAR rollcall
-// (radar signs with an empty body — no brute force). Seed + cleanup: scripts/_v2_rollcall_live.py.
+// (radar signs with an empty body — no brute force). 需先以 TRON_TEACHER_* 帳號在 TRON_BASE_URL 手動開啟
+// 一筆 radar rollcall（本 repo 不含 seed/cleanup 腳本），本測試以 TRON_USER/TRON_PASS 執行簽到。
 
 static MON_EVENTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
 fn mon_events() -> &'static std::sync::Mutex<Vec<String>> {
@@ -199,6 +205,10 @@ fn mon_wait<F: Fn(&serde_json::Value) -> bool>(pred: F, secs: u64) -> Option<ser
     }
     None
 }
+// boot 專用：回覆必須是 ok=true，失敗時由 .expect 以階段訊息立即停止。
+fn mon_reply_ok(id: u64) -> impl Fn(&serde_json::Value) -> bool {
+    move |v| v["event"] == "Reply" && v["id"] == id && v["ok"] == true
+}
 
 #[test]
 // plain #[test]: the engine FFI owns its OWN runtime — a #[tokio::test] nests runtimes → abort.
@@ -215,31 +225,32 @@ fn live_monitor_pipeline() {
         .replace('\\', "/");
 
     mon_send(h, &serde_json::json!({"id":1,"cmd":"Init","data_dir":dir}));
-    mon_wait(|v| v["event"] == "Reply" && v["id"] == 1, 10);
+    mon_wait(mon_reply_ok(1), 10).expect("Init 未回覆 ok");
     // 1-student course → 0% present before signing, so drop the 15% gate; short countdown.
     mon_send(
         h,
         &serde_json::json!({"id":2,"cmd":"UpdateConfig","patch":{"attendance_gate_percent":0.0,"countdown_secs":2}}),
     );
-    mon_wait(|v| v["event"] == "Reply" && v["id"] == 2, 5);
+    mon_wait(mon_reply_ok(2), 5).expect("UpdateConfig 未回覆 ok");
     mon_send(
         h,
         &serde_json::json!({"id":3,"cmd":"CreateVault","master_password":"pw"}),
     );
-    mon_wait(|v| v["event"] == "Reply" && v["id"] == 3, 5);
+    mon_wait(mon_reply_ok(3), 5).expect("CreateVault 未回覆 ok");
     mon_send(
         h,
         &serde_json::json!({"id":4,"cmd":"AddAccount","label":"stu","school":base,"username":user,"password":pass}),
     );
-    mon_wait(|v| v["event"] == "Reply" && v["id"] == 4, 5);
+    mon_wait(mon_reply_ok(4), 5).expect("AddAccount 未回覆 ok");
     mon_send(h, &serde_json::json!({"id":5,"cmd":"StartMonitoring"}));
-    mon_wait(|v| v["event"] == "Reply" && v["id"] == 5, 15);
+    mon_wait(mon_reply_ok(5), 15).expect("StartMonitoring 未回覆 ok");
 
     let online = mon_wait(
         |v| v["event"] == "AccountStatus" && v["state"] == "online",
         25,
-    );
-    println!("account online: {}", online.is_some());
+    )
+    .expect("帳號未上線");
+    println!("account online: {online:?}");
     let signed = mon_wait(|v| v["event"] == "SignedIn", 45);
     println!("SignedIn event: {signed:?}");
     unsafe { crate::core_free(h) };
@@ -250,7 +261,8 @@ fn live_monitor_pipeline() {
 }
 
 // ---- Phase 4: auto-answer parity (needs a teacher-seeded live exam on 55379) ----
-// Seed + cleanup are driven by scripts/_v2_exam_live.py (teacher creates a 6-question known-answer exam).
+// 需先以 TRON_TEACHER_* 帳號在 TRON_COURSE（預設 55379）手動建立 6 題已知答案的考試，並把考試 id
+// 設為 TRON_EXAM_ID（本 repo 不含 seed/cleanup 腳本）。
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -321,7 +333,8 @@ async fn live_exam_answer() {
     println!("submitted sid={sid:?} retake={retake}");
     assert!(!sid.is_empty(), "empty submission_id");
 
-    // Score check: the review GET carries the graded score — proves the submit BODIES scored, not just 2xx'd.
+    // 成績觀察（僅列印、不斷言）：review GET 若帶評分欄位就印出來——欄位名與出現時序因租戶而異，
+    // 無法在此保證；submit 本身已有 sid 斷言。
     if let Ok(r) = client
         .get(ep.exam_submission_review(&exam, &sid))
         .send()
@@ -343,7 +356,8 @@ async fn live_exam_answer() {
 }
 
 // ---- Phase 5: rollcall parity (needs a teacher-seeded live rollcall on 55379) ----
-// Seed + cleanup are driven by scripts/_v2_rollcall_live.py (teacher account); this test only signs.
+// 需先以 TRON_TEACHER_* 帳號手動開啟一筆 rollcall（number 類型需記下 TRON_NUMBER_CODE），
+// 並把 rollcall id 設為 TRON_ROLLCALL_ID；本測試只負責簽到（本 repo 不含 seed/cleanup 腳本）。
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -462,6 +476,7 @@ async fn live_exam_submit_contract() {
     .expect("submit_exam rejected — string ids (id-type) regressed?");
     println!("guess submit OK sid={sid:?} retake={retake}");
     assert!(!sid.is_empty(), "empty submission_id");
+    // 與種子考試耦合：此斷言依賴種子考試允許重交（未用盡 submit_times）；換考試種子需同步確認。
     assert!(retake, "exam should allow retake");
 
     // Replay the review's leaked correct answers (announce_answer=immediate) → full marks. Validates the
@@ -489,6 +504,8 @@ async fn live_exam_submit_contract() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
+    // 與種子考試耦合：60.0 = 種子 6 題的滿分（每題 10 分）；若種子題數/配分改變，此斷言須隨之調整，
+    // 不放寬：重放 review 洩漏答案後應達滿分。
     println!("exam_score after resubmit_correct = {score:?}  (max = 60.0)");
     assert_eq!(
         score,
