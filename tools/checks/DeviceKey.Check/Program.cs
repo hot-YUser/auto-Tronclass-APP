@@ -106,7 +106,7 @@ static void CheckNativeCoreLifecycle()
     ExpectThrows<ObjectDisposedException>(() => new NativeCore(), "dispose 後新建必須 fail-closed");
 
     // dispose 後命令以明確失敗回覆收尾(不懸住 caller、不碰 native)。
-    var reply = first.SendAsync("StopMonitoring").GetAwaiter().GetResult();
+    var reply = first.SendAsync("StopAllMonitoring").GetAwaiter().GetResult();
     Assert(reply.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False,
         "dispose 後 SendAsync 必須回失敗回覆");
 

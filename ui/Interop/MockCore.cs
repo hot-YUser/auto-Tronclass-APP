@@ -1,263 +1,540 @@
-// Debug-only。這支從未註冊進 DI(MauiProgram 只綁 NativeCore),要用是手動改那一行 —— 而那
-// 只發生在設計時預覽/hot reload,也就是 Debug。Release 編它進去只有壞處:一份用不到的死碼,
-// 外加它的反射式 JsonSerializer 會讓整個組件無法通過 NativeAOT/full-trim 分析(IL2026/IL3050)。
-#if DEBUG
+#if USE_MOCK_CORE
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace TronClass.Interop;
 
-/// <summary>
-/// A design-time fake <see cref="ICore"/>. It scripts a realistic event timeline in the REAL core's
-/// vocabulary (<c>Caps / VaultState / Accounts / AccountStatus / RollcallDetected / Countdown /
-/// SignedIn / QuizPrepared / ReasoningChunk / QuizSubmitted / …</c>) so the whole UI — tabs, the
-/// hero-moment popup, the core-owned countdown, the LLM reasoning stream, the multi-account merge —
-/// can be built and previewed WITHOUT the native library. **Every command below produces a visible
-/// response**, so you can wire and preview any button. Flip <c>MauiProgram</c> to <see cref="NativeCore"/>
-/// for the real core; the UI does not change. Field names/shapes are verbatim from the wire
-/// contract implemented by <c>QuizPreparedContract.cs</c> and <c>core/src/protocol.rs</c>.
-/// </summary>
+/// <summary>Debug fixture-driven core；與 Rust/C# parser 共用 monitoring_snapshot_v1.json。</summary>
 public sealed class MockCore : ICore
 {
     public event Action<JsonElement>? EventReceived;
 
     public JsonElement? LastCaps { get; private set; }
     public JsonElement? LastProviders { get; private set; }
-    public JsonElement? LastAccounts { get; private set; }
+    public JsonElement? LastMonitoringSnapshot { get; private set; }
     public JsonElement? LastVaultState { get; private set; }
     public JsonElement? LastNextClass { get; private set; }
 
-    private const string BaseUrl = "https://ilearn.thu.edu.tw";
+    JsonObject? _snapshot;
+    int _nextAccount = 1;
+    bool _booted;
 
-    // Mutable so the Accounts tab is fully interactive in preview (Add/Delete/Switch re-emit Accounts).
-    // teacher/course mirror AccountMeta (config.rs) so the teacher badge + QR-assist entry preview live.
-    private readonly List<(string id, string label, string user, string school, bool teacher, string? course)> _accounts = new()
+    public async Task BootAsync(string dataDir)
     {
-        ("a1", "我的東海", "s1109999@thu.edu.tw", "thu", false, null),
-        ("a2", "公有雲測試", "demo@example.com", "tronclass", false, null),
-        ("a3", "課堂教師機", "teacher@thu.edu.tw", "thu", true, "55379"),
-    };
-    private string _active = "a1";
-    private int _nextId = 4;
-    private string _rollcallToken = "";
-    private string _quizToken = "";
+        if (_booted) return;
+        await using var stream = await FileSystem.Current.OpenAppPackageFileAsync(
+            "contract/monitoring_snapshot_v1.json");
+        using var reader = new StreamReader(stream);
+        _snapshot = JsonNode.Parse(await reader.ReadToEndAsync())?.AsObject()
+                    ?? throw new InvalidOperationException("Mock snapshot fixture 無效。");
+        _booted = true;
 
-    // 目前生效的設定;UpdateConfig/SetLlmKey 後更新並重發,讓設定頁的預覽是活的。
-    private readonly Dictionary<string, object?> _settings = new()
-    {
-        ["countdown_secs"] = 15,
-        ["attendance_gate_percent"] = 15.0,
-        ["llm_endpoint"] = "https://integrate.api.nvidia.com/v1/chat/completions",
-        ["llm_model"] = "minimaxai/minimax-m3",
-        ["llm_max_tokens"] = 16384,
-        ["resubmit_for_correct"] = true,
-        ["enable_llm_tools"] = true,
-        ["has_llm_key"] = false,
-    };
-
-    public Task BootAsync(string dataDir)
-    {
-        Emit(new { id = (object?)null, @event = "Caps", caps = new {
-            background_monitoring = true, self_update = false,
-            qr_teacher_assist = true, ocr_captcha = false } });
-        Emit(new { id = (object?)null, @event = "StateChanged", state = "idle" });
-        // 核心以 device-key 自動解鎖：Init 後即 unlocked（使用者不需輸入主密碼）。
-        Emit(new { id = (object?)null, @event = "VaultState", exists = true, unlocked = true });
-        Emit(new { id = (object?)null, @event = "Providers", default_key = "thu", schools = new[] {
-            new { key = "thu", label = "Tunghai University iLearn", base_url = BaseUrl },
-            new { key = "tronclass", label = "TronClass Public Cloud", base_url = "https://www.tronclass.com.tw" } } });
-        EmitAccounts();
-        // The soonest upcoming class across monitored accounts (real core derives it from /api/my-courses).
-        // Emit null instead to preview the "no upcoming class → card hidden" state.
-        Emit(new { id = (object?)null, @event = "NextClass", account_id = "a1", course = "行銷管理",
-            start_time = DateTime.Now.AddHours(2).ToString("yyyy-MM-ddTHH:mm:sszzz"), location = "管院 A203" });
+        Emit(new JsonObject
+        {
+            ["id"] = null,
+            ["event"] = "Caps",
+            ["caps"] = new JsonObject
+            {
+                ["background_monitoring"] = true,
+                ["self_update"] = false,
+                ["qr_teacher_assist"] = true,
+                ["ocr_captcha"] = false,
+            },
+        });
+        Emit(new JsonObject
+        {
+            ["id"] = null,
+            ["event"] = "VaultState",
+            ["exists"] = true,
+            ["unlocked"] = true,
+        });
+        Emit(new JsonObject
+        {
+            ["id"] = null,
+            ["event"] = "Providers",
+            ["default_key"] = "thu",
+            ["schools"] = new JsonArray
+            {
+                (JsonNode)new JsonObject
+                {
+                    ["key"] = "thu",
+                    ["label"] = "東海大學",
+                    ["base_url"] = "https://ilearn.thu.edu.tw",
+                },
+                (JsonNode)new JsonObject
+                {
+                    ["key"] = "demo",
+                    ["label"] = "示範平台",
+                    ["base_url"] = "https://demo.example.edu",
+                },
+            },
+        });
         EmitSettings();
-        return Task.CompletedTask;
+        EmitSnapshot();
     }
 
-    public Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
+    public async Task<JsonElement> SendAsync(
+        string cmd,
+        params (string Key, object? Value)[] fields)
     {
-        var f = new Dictionary<string, object?>();
-        foreach (var (k, v) in fields) f[k] = v;
-        string? Str(string k) => f.TryGetValue(k, out var v) ? v?.ToString() : null;
-
+        if (!_booted || _snapshot is null)
+            return Reply(false, "not initialized");
+        var command = JsonNode.Parse(JsonWire.SerializeCommand(0, cmd, fields))!.AsObject();
         switch (cmd)
         {
+            case "GetMonitoringSnapshot":
+                return Reply(true, data: new JsonObject
+                {
+                    ["snapshot"] = _snapshot.DeepClone(),
+                });
+
             case "AddAccount":
-                _accounts.Add(($"a{_nextId++}", Str("label") ?? "新帳號", Str("username") ?? "", Str("school") ?? "thu",
-                    f.TryGetValue("is_teacher", out var it) && it is true, Str("course_id")));
-                EmitAccounts();
-                break;
-            case "DeleteAccount":
-                _accounts.RemoveAll(a => a.id == Str("account_id"));
-                if (_active == Str("account_id")) _active = _accounts.Count > 0 ? _accounts[0].id : "";
-                EmitAccounts();
-                break;
-            case "SwitchAccount":
-                if (Str("account_id") is { } sw) _active = sw;
-                EmitAccounts();
-                break;
+                return AddAccount(command);
+
             case "Login":
-                Emit(new { id = (object?)null, @event = "AccountStatus", account_id = Str("account_id"), state = "online" });
-                return Task.FromResult(Json(new { id = 0, @event = "LoginResult", ok = true, detail = "logged in" }));
             case "ImportCookies":
-            case "SubmitCaptcha":
-                Emit(new { id = (object?)null, @event = "AccountStatus", account_id = Str("account_id"), state = "online" });
-                break;
+                return await VerifyAccount(command);
 
-            case "StartMonitoring":
-                _ = RunMonitoringScript();
-                break;
-            case "StopMonitoring":
-                Emit(new { id = (object?)null, @event = "StateChanged", state = "idle" });
-                break;
+            case "DeleteAccount":
+                return DeleteAccount(command);
 
-            case "SignNow": // signs every participant of the activity (merge model)
-                if (Str("activity_token") != _rollcallToken) return Failed("unknown rollcall activity_token");
-                foreach (var a in new[] { "a1", "a2" })
-                    Emit(new { id = (object?)null, @event = "SignedIn",
-                        activity_token = _rollcallToken, rollcall_id = "30558", account_id = a, course = "行銷管理", method = "radar" });
-                break;
-            case "DeferSignIn":
-                if (Str("activity_token") != _rollcallToken) return Failed("unknown rollcall activity_token");
-                Emit(new { id = (object?)null, @event = "PendingSignIn", activity_token = _rollcallToken, rollcall_id = "30558" });
-                break;
+            case "CreateGroup":
+                return CreateGroup(command);
 
-            case "SetAnswer": // user overrides one subject for ONE account → that account's conflict resolved
-                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
-                if (!f.TryGetValue("answer", out var answer) || answer is not Ui.AnswerWire wire)
-                    return Failed("answer payload is empty or malformed");
-                Emit(new { id = (object?)null, @event = "AnswerUpdated",
-                    activity_token = _quizToken, quiz_id = "32877", account_id = Str("account_id") ?? _active,
-                    subject_id = Str("subject_id"), answer = wire, display_answer = wire.Display, source = "user", conflict = false });
-                break;
-            case "SubmitNow":
-                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
-                foreach (var a in new[] { "a1", "a2" })
-                    Emit(new { id = (object?)null, @event = "QuizSubmitted",
-                        activity_token = _quizToken, quiz_id = "32877", account_id = a, result = "submitted (score 60)" });
-                break;
-            case "DiscardAnswer":
-                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
-                Emit(new { id = (object?)null, @event = "LogLine", level = "info", activity_token = _quizToken,
-                    text = "quiz 32877 答案已捨棄，不送出" });
-                break;
-            case "HoldAnswer":
-                if (Str("activity_token") != _quizToken) return Failed("unknown quiz activity_token");
-                Emit(new { id = (object?)null, @event = "LogLine", level = "info", activity_token = _quizToken,
-                    text = "quiz 32877 已暫緩，停止自動送出" });
-                break;
+            case "UpdateGroup":
+                return UpdateGroup(command);
+
+            case "DeleteGroup":
+                return DeleteGroup(command);
+
+            case "MergeGroups":
+                return MergeGroups(command);
+
+            case "ListCommonCourses":
+                return Reply(true, data: new JsonObject
+                {
+                    ["courses"] = new JsonArray
+                    {
+                        (JsonNode)new JsonObject { ["course_id"] = "course-zh", ["name"] = "大學中文" },
+                        (JsonNode)new JsonObject { ["course_id"] = "course-common", ["name"] = "共同示範課程" },
+                    },
+                    ["account_errors"] = new JsonArray(),
+                });
+
+            case "SetTargetSchedule":
+                return SetTargetSchedule(command);
+
+            case "SetMonitoringPreferences":
+                _snapshot["global_schedule"] = command["global_schedule"]!.DeepClone();
+                _snapshot["time_zone"] = command["time_zone"]!.DeepClone();
+                BumpDefinition(schedule: true);
+                EmitSnapshot();
+                return Reply(true);
+
+            case "ApplyScheduleClock":
+                ApplyClock(command);
+                EmitSnapshot();
+                return Reply(true);
+
+            case "StartTarget":
+                SetTargetRuntime(command["target"]!.AsObject(), "monitoring", forceOpen: true);
+                EmitSnapshot();
+                return Reply(true);
+
+            case "StopTarget":
+                SetTargetRuntime(command["target"]!.AsObject(), "manual_off", forceOpen: false);
+                EmitSnapshot();
+                return Reply(true);
+
+            case "StopAllMonitoring":
+                _snapshot["all_suspended"] = true;
+                _snapshot["can_stop_all"] = false;
+                _snapshot["can_resume"] = true;
+                _snapshot["session_state"] = "idle";
+                foreach (var target in Targets())
+                {
+                    target["runtime_state"] = "manual_off";
+                    target["can_start"] = false;
+                    target["can_stop"] = false;
+                }
+                BumpPlan();
+                EmitSnapshot();
+                return Reply(true);
+
+            case "ResumeScheduledMonitoring":
+                _snapshot["all_suspended"] = false;
+                _snapshot["can_stop_all"] = true;
+                _snapshot["can_resume"] = false;
+                _snapshot["session_state"] = "running";
+                foreach (var target in Targets())
+                {
+                    target["manual_override"] = null;
+                    target["runtime_state"] = target["schedule_open"]?.GetValue<bool>() == true
+                        ? target["target"]?["kind"]?.GetValue<string>() == "account"
+                            ? "suppressed_by_group"
+                            : "monitoring"
+                        : "scheduled_off";
+                    target["can_start"] = target["runtime_state"]?.GetValue<string>() != "monitoring";
+                    target["can_stop"] = target["runtime_state"]?.GetValue<string>() == "monitoring";
+                }
+                BumpPlan();
+                EmitSnapshot();
+                return Reply(true);
+
+            case "AcknowledgeTemporaryMerge":
+                foreach (var prompt in _snapshot["merge_prompts"]!.AsArray().Select(node => node!.AsObject()))
+                    if (prompt["component_id"]?.GetValue<string>() == Text(command, "component_id"))
+                        prompt["acknowledged"] = true;
+                BumpPlan();
+                EmitSnapshot();
+                return Reply(true);
+
+            case "SuspendForPlatformLimit":
+                _snapshot["platform_block"] = new JsonObject
+                {
+                    ["reason"] = Text(command, "reason"),
+                    ["observed_at_utc"] = DateTimeOffset.UtcNow.ToString("O"),
+                };
+                _snapshot["session_state"] = "platform_blocked";
+                foreach (var target in Targets()) target["runtime_state"] = "platform_blocked";
+                BumpPlan();
+                EmitSnapshot();
+                return Reply(true);
+
+            case "ClearPlatformLimit":
+                _snapshot["platform_block"] = null;
+                _snapshot["session_state"] = "idle";
+                BumpPlan();
+                EmitSnapshot();
+                return Reply(true);
+
             case "UpdateConfig":
-                if (f.TryGetValue("patch", out var p) && p is IDictionary<string, object?> patch)
-                    foreach (var kv in patch) _settings[kv.Key] = kv.Value;
-                EmitSettings();
-                break;
             case "SetLlmKey":
-                _settings["has_llm_key"] = true;
                 EmitSettings();
-                break;
-            // Shutdown: no event needed — the Reply below is the whole response.
-        }
-        return Task.FromResult(Json(new { id = 0, @event = "Reply", ok = true, error = (object?)null }));
+                return Reply(true);
 
-        static Task<JsonElement> Failed(string error) =>
-            Task.FromResult(Json(new { id = 0, @event = "Reply", ok = false, error }));
+            case "SubmitCaptcha":
+            case "SignNow":
+            case "DeferSignIn":
+            case "SubmitNow":
+            case "HoldAnswer":
+            case "DiscardAnswer":
+            case "SetAnswer":
+            case "Shutdown":
+                return Reply(true);
+
+            default:
+                return Reply(false, $"Mock 不支援命令：{cmd}");
+        }
     }
 
-    private void EmitSettings() => Emit(new { id = (object?)null, @event = "Settings", settings = _settings });
-
-    /// One pass of the time-limited flows: a radar rollcall (detect → 15s countdown → sign each account),
-    /// then an exam (prepared per-account with 1 conflict → LLM reasoning stream → 15s countdown → submit).
-    private async Task RunMonitoringScript()
+    JsonElement AddAccount(JsonObject command)
     {
-        Emit(new { id = (object?)null, @event = "StateChanged", state = "monitoring" });
-        foreach (var a in _accounts)
-            Emit(new { id = (object?)null, @event = "AccountStatus", account_id = a.id, state = "online" });
-        await Task.Delay(2500);
-
-        const string rc = "30558";
-        _rollcallToken = $"mock-rollcall-{Guid.NewGuid():N}";
-        Emit(new { id = (object?)null, @event = "RollcallDetected", activity_token = _rollcallToken,
-            rollcall_id = rc, base_url = BaseUrl,
-            kind = "radar", course = "行銷管理", attendance_rate = (object?)null, accounts = new[] { "a1", "a2" } });
-        // 未達門檻:core 不倒數,只每秒回報即時簽到率(UI 用它填倒數欄位)。爬過門檻才 holding=false → 開始倒數。
-        var gate = Convert.ToDouble(_settings["attendance_gate_percent"]);
-        foreach (var r in new[] { 3.7, 7.4, 11.1, 14.8 })
+        var id = $"mock-{_nextAccount++:x}";
+        var teacher = command["is_teacher"]?.GetValue<bool>() == true;
+        var account = new JsonObject
         {
-            Emit(new { id = (object?)null, @event = "RollcallGate", activity_token = _rollcallToken,
-                rollcall_id = rc, rate = r, gate_percent = gate, holding = true });
-            await Task.Delay(900);
-        }
-        Emit(new { id = (object?)null, @event = "RollcallGate", activity_token = _rollcallToken,
-            rollcall_id = rc, rate = 42.0, gate_percent = gate, holding = false });
-        for (var s = 15; s >= 0; s--)
-        {
-            Emit(new { id = (object?)null, @event = "Countdown", scope = "rollcall",
-                activity_token = _rollcallToken, external_id = rc, remaining_secs = s });
-            await Task.Delay(700);
-        }
-        foreach (var a in new[] { "a1", "a2" })
-            Emit(new { id = (object?)null, @event = "SignedIn", activity_token = _rollcallToken,
-                rollcall_id = rc, account_id = a, course = "行銷管理", method = "radar" });
-        await Task.Delay(1500);
-
-        const string qz = "32877";
-        // BOTH accounts conflict on Q1 → conflict_count 2. Lets the UI preview the multi-account gate:
-        // submit stays LOCKED until every account's conflict is resolved (resolve one → still locked;
-        // resolve both → unlocks). Never silently overwrite a user's existing answer.
-        await EmitQuizPreparedFixture();
-        foreach (var chunk in new[] { "讓我想想，", "第一題問台灣最高峰，", "玉山 3952 公尺，", "所以答案是玉山。" })
-        {
-            Emit(new { id = (object?)null, @event = "ReasoningChunk", activity_token = _quizToken,
-                subject_id = "1", text = chunk });
-            await Task.Delay(450);
-        }
-        for (var s = 15; s >= 0; s--)
-        {
-            Emit(new { id = (object?)null, @event = "Countdown", scope = "quiz",
-                activity_token = _quizToken, external_id = qz, remaining_secs = s });
-            await Task.Delay(700);
-        }
-        foreach (var a in new[] { "a1", "a2" })
-            Emit(new { id = (object?)null, @event = "QuizSubmitted", activity_token = _quizToken,
-                quiz_id = qz, account_id = a, result = "submitted (score 60)" });
+            ["account_id"] = id,
+            ["label"] = Text(command, "label"),
+            ["school_ref"] = Text(command, "school"),
+            ["username"] = Text(command, "username"),
+            ["role"] = teacher ? "teacher" : "student",
+            ["teacher_course_id"] = command["course_id"]?.DeepClone(),
+            ["login_state"] = "stored",
+            ["login_error"] = null,
+            ["login_in_flight"] = false,
+            ["in_use_targets"] = new JsonArray(),
+        };
+        _snapshot!["accounts"]!.AsArray().Add((JsonNode)account);
+        if (!teacher) _snapshot["targets"]!.AsArray().Add((JsonNode)NewPersonalTarget(id, Text(command, "label")));
+        BumpDefinition(schedule: !teacher);
+        EmitSnapshot();
+        return Reply(true, data: new JsonObject { ["account_id"] = id });
     }
 
-    private async Task EmitQuizPreparedFixture()
+    async Task<JsonElement> VerifyAccount(JsonObject command)
     {
-        await using var stream = await FileSystem.OpenAppPackageFileAsync("contract/quiz_prepared_v1.json");
-        using var document = await JsonDocument.ParseAsync(stream);
-        var fixture = document.RootElement.Clone();
-        _quizToken = fixture.GetProperty("activity_token").GetString() ?? "";
-        Emit(fixture);
+        var account = FindAccount(Text(command, "account_id"));
+        if (account is null) return Reply(false, "no such account");
+        account["login_state"] = "logging_in";
+        account["login_error"] = null;
+        account["login_in_flight"] = true;
+        EmitSnapshot();
+        await Task.Delay(650);
+        var fails = account["account_id"]?.GetValue<string>() == "student-b" ||
+                    account["username"]?.GetValue<string>()?.Contains("fail", StringComparison.OrdinalIgnoreCase) == true;
+        account["login_state"] = fails ? "error" : "online";
+        account["login_error"] = fails
+            ? new JsonObject { ["code"] = "login_failed", ["message"] = "示範：帳號或密碼錯誤" }
+            : null;
+        account["login_in_flight"] = false;
+        EmitSnapshot();
+        return Reply(!fails, fails ? "示範：帳號或密碼錯誤" : null);
     }
 
-    private void EmitAccounts() => Emit(new { id = (object?)null, @event = "Accounts", active = _active,
-        accounts = _accounts.ConvertAll(a => new { id = a.id, label = a.label, username = a.user, school_ref = a.school,
-            is_teacher = a.teacher, course_id = a.course }) });
-
-    private void Emit(object o) => Emit(Json(o));
-
-    private void Emit(JsonElement el)
+    JsonElement DeleteAccount(JsonObject command)
     {
-        if (el.TryGetProperty("event", out var ev))
+        var id = Text(command, "account_id");
+        RemoveWhere(_snapshot!["accounts"]!.AsArray(), node =>
+            node!["account_id"]?.GetValue<string>() == id);
+        RemoveWhere(_snapshot["targets"]!.AsArray(), node =>
+            node!["target"]?["kind"]?.GetValue<string>() == "account" &&
+            node["target"]?["account_id"]?.GetValue<string>() == id);
+        foreach (var target in Targets().Where(target => target["group_definition"] is not null).ToArray())
         {
-            switch (ev.GetString())
+            var members = target["group_definition"]!["member_account_ids"]!.AsArray();
+            RemoveWhere(members, node => node?.GetValue<string>() == id);
+            if (members.Count == 0) _snapshot["targets"]!.AsArray().Remove(target);
+        }
+        BumpDefinition(schedule: true);
+        EmitSnapshot();
+        return Reply(true);
+    }
+
+    JsonElement CreateGroup(JsonObject command)
+    {
+        var input = command["group"]!.AsObject();
+        var id = $"mock-group-{_nextAccount++:x}";
+        _snapshot!["targets"]!.AsArray().Add((JsonNode)NewGroupTarget(id, input));
+        BumpDefinition(schedule: true);
+        EmitSnapshot();
+        return Reply(true, data: new JsonObject { ["group_id"] = id });
+    }
+
+    JsonElement UpdateGroup(JsonObject command)
+    {
+        var target = FindTarget(new JsonObject
+        {
+            ["kind"] = "group",
+            ["group_id"] = Text(command, "group_id"),
+        });
+        if (target is null) return Reply(false, "no such group");
+        ApplyGroupInput(target, command["group"]!.AsObject());
+        BumpDefinition(schedule: true);
+        EmitSnapshot();
+        return Reply(true);
+    }
+
+    JsonElement DeleteGroup(JsonObject command)
+    {
+        var id = Text(command, "group_id");
+        RemoveWhere(_snapshot!["targets"]!.AsArray(), node =>
+            node!["target"]?["kind"]?.GetValue<string>() == "group" &&
+            node["target"]?["group_id"]?.GetValue<string>() == id);
+        BumpDefinition(schedule: true);
+        EmitSnapshot();
+        return Reply(true);
+    }
+
+    JsonElement MergeGroups(JsonObject command)
+    {
+        var ids = command["group_ids"]!.AsArray().Select(node => node!.GetValue<string>()).ToHashSet(StringComparer.Ordinal);
+        RemoveWhere(_snapshot!["targets"]!.AsArray(), node =>
+            node!["target"]?["kind"]?.GetValue<string>() == "group" &&
+            ids.Contains(node["target"]?["group_id"]?.GetValue<string>() ?? ""));
+        _snapshot["targets"]!.AsArray().Add((JsonNode)NewGroupTarget($"mock-merged-{_nextAccount++:x}", command["group"]!.AsObject()));
+        BumpDefinition(schedule: true);
+        EmitSnapshot();
+        return Reply(true);
+    }
+
+    JsonElement SetTargetSchedule(JsonObject command)
+    {
+        var target = FindTarget(command["target"]!.AsObject());
+        if (target is null) return Reply(false, "no such target");
+        target["schedule"] = command["schedule"]!.DeepClone();
+        target["schedule_open"] = false;
+        target["next_boundary_utc"] = null;
+        BumpDefinition(schedule: true);
+        EmitSnapshot();
+        return Reply(true);
+    }
+
+    void ApplyClock(JsonObject command)
+    {
+        _snapshot!["clock_revision"] = command["clock_revision"]!.DeepClone();
+        foreach (var entry in command["targets"]!.AsArray().Select(node => node!.AsObject()))
+        {
+            var target = FindTarget(entry["target"]!.AsObject());
+            if (target is null) continue;
+            target["schedule_open"] = entry["is_open"]!.DeepClone();
+            target["next_boundary_utc"] = entry["next_boundary_utc"]?.DeepClone();
+        }
+        BumpPlan();
+    }
+
+    void SetTargetRuntime(JsonObject id, string state, bool forceOpen)
+    {
+        var target = FindTarget(id);
+        if (target is null) return;
+        target["runtime_state"] = state;
+        target["manual_override"] = new JsonObject
+        {
+            ["force_open"] = forceOpen,
+            ["expires_at_utc"] = null,
+        };
+        target["can_start"] = state != "monitoring";
+        target["can_stop"] = state == "monitoring";
+        _snapshot!["session_state"] = state == "monitoring" ? "running" : "idle";
+        _snapshot["can_stop_all"] = Targets().Any(item => item["runtime_state"]?.GetValue<string>() == "monitoring");
+        BumpPlan();
+    }
+
+    JsonObject NewPersonalTarget(string accountId, string name) => new()
+    {
+        ["target"] = new JsonObject { ["kind"] = "account", ["account_id"] = accountId },
+        ["name"] = name,
+        ["runtime_state"] = "scheduled_off",
+        ["schedule"] = new JsonObject { ["kind"] = "disabled" },
+        ["schedule_open"] = false,
+        ["next_boundary_utc"] = null,
+        ["manual_override"] = null,
+        ["detector"] = null,
+        ["group_definition"] = null,
+        ["courses"] = new JsonArray(),
+        ["in_use_account_ids"] = new JsonArray(),
+        ["account_results"] = new JsonArray(),
+        ["can_start"] = true,
+        ["can_stop"] = false,
+        ["can_edit_schedule"] = true,
+        ["disabled_reason"] = null,
+        ["error"] = null,
+    };
+
+    JsonObject NewGroupTarget(string groupId, JsonObject input)
+    {
+        var target = new JsonObject
+        {
+            ["target"] = new JsonObject { ["kind"] = "group", ["group_id"] = groupId },
+            ["runtime_state"] = "scheduled_off",
+            ["schedule_open"] = false,
+            ["next_boundary_utc"] = null,
+            ["manual_override"] = null,
+            ["detector"] = null,
+            ["courses"] = new JsonArray(),
+            ["in_use_account_ids"] = new JsonArray(),
+            ["account_results"] = new JsonArray(),
+            ["can_start"] = true,
+            ["can_stop"] = false,
+            ["can_edit_schedule"] = true,
+            ["disabled_reason"] = null,
+            ["error"] = null,
+        };
+        ApplyGroupInput(target, input);
+        return target;
+    }
+
+    static void ApplyGroupInput(JsonObject target, JsonObject input)
+    {
+        target["name"] = input["name"]!.DeepClone();
+        target["schedule"] = input["schedule"]!.DeepClone();
+        target["group_definition"] = new JsonObject
+        {
+            ["member_account_ids"] = input["member_account_ids"]!.DeepClone(),
+            ["course_ids"] = input["course_ids"]!.DeepClone(),
+            ["detector_selection"] = input["detector"]!.DeepClone(),
+        };
+        var courses = new JsonArray();
+        foreach (var courseId in input["course_ids"]!.AsArray())
+            courses.Add((JsonNode)new JsonObject
             {
-                case "Caps": LastCaps = el; break;
-                case "Providers": LastProviders = el; break;
-                case "Accounts": LastAccounts = el; break;
-                case "VaultState": LastVaultState = el; break;
-                case "NextClass": LastNextClass = el; break;
-            }
-        }
-        EventReceived?.Invoke(el);
+                ["course_id"] = courseId!.GetValue<string>(),
+                ["name"] = courseId.GetValue<string>(),
+            });
+        target["courses"] = courses;
     }
 
-    // 這裡刻意保留反射式序列化:mock 的 payload 是一堆一次性匿名型別,手寫 writer 只會讓
-    // 「照著真核心 wire 格式抄」這件事更難看清楚。豁免範圍僅此一個方法,而且整個 MockCore
-    // 只存在於 Debug(見檔頭 #if DEBUG),永遠不會進入 NativeAOT/trim 的出貨路徑。
-#pragma warning disable IL2026, IL3050 // Debug-only 設計時假核心,不出貨
-    private static JsonElement Json(object o) => JsonSerializer.SerializeToElement(o);
-#pragma warning restore IL2026, IL3050
+    JsonObject? FindAccount(string id) => _snapshot!["accounts"]!.AsArray()
+        .Select(node => node!.AsObject())
+        .FirstOrDefault(account => account["account_id"]?.GetValue<string>() == id);
+
+    JsonObject? FindTarget(JsonObject id) => Targets().FirstOrDefault(target =>
+        TargetKey(target["target"]!.AsObject()) == TargetKey(id));
+
+    IEnumerable<JsonObject> Targets() => _snapshot!["targets"]!.AsArray()
+        .Select(node => node!.AsObject());
+
+    static string TargetKey(JsonObject target)
+    {
+        var kind = Text(target, "kind");
+        return kind == "account"
+            ? $"account:{Text(target, "account_id")}"
+            : $"group:{Text(target, "group_id")}";
+    }
+
+    void BumpDefinition(bool schedule)
+    {
+        _snapshot!["config_revision"] = Number(_snapshot, "config_revision") + 1;
+        if (schedule) _snapshot["schedule_revision"] = Number(_snapshot, "schedule_revision") + 1;
+        BumpPlan();
+    }
+
+    void BumpPlan() => _snapshot!["plan_revision"] = Number(_snapshot, "plan_revision") + 1;
+
+    static long Number(JsonObject value, string name) => value[name]!.GetValue<long>();
+    static string Text(JsonObject value, string name) => value[name]?.GetValue<string>() ?? "";
+
+    static void RemoveWhere(JsonArray array, Func<JsonNode?, bool> predicate)
+    {
+        for (var index = array.Count - 1; index >= 0; index--)
+            if (predicate(array[index])) array.RemoveAt(index);
+    }
+
+    void EmitSettings() => Emit(new JsonObject
+    {
+        ["id"] = null,
+        ["event"] = "Settings",
+        ["settings"] = new JsonObject
+        {
+            ["countdown_secs"] = 15,
+            ["attendance_gate_percent"] = 0.0,
+            ["llm_endpoint"] = "https://api.openai.com/v1",
+            ["llm_model"] = "gpt-4o-mini",
+            ["llm_max_tokens"] = 4096,
+            ["resubmit_for_correct"] = false,
+            ["enable_llm_tools"] = true,
+            ["has_llm_key"] = true,
+        },
+    });
+
+    void EmitSnapshot() => Emit(new JsonObject
+    {
+        ["id"] = null,
+        ["event"] = "MonitoringSnapshot",
+        ["snapshot"] = _snapshot!.DeepClone(),
+    });
+
+    void Emit(JsonObject payload)
+    {
+        var element = Element(payload);
+        switch (payload["event"]?.GetValue<string>())
+        {
+            case "Caps": LastCaps = element; break;
+            case "Providers": LastProviders = element; break;
+            case "MonitoringSnapshot": LastMonitoringSnapshot = element; break;
+            case "VaultState": LastVaultState = element; break;
+            case "NextClass": LastNextClass = element; break;
+        }
+        EventReceived?.Invoke(element);
+    }
+
+    static JsonElement Reply(bool ok, string? error = null, JsonObject? data = null)
+    {
+        var payload = new JsonObject
+        {
+            ["id"] = 0,
+            ["event"] = "Reply",
+            ["ok"] = ok,
+        };
+        if (error is not null) payload["error"] = error;
+        if (data is not null) payload["data"] = data;
+        return Element(payload);
+    }
+
+    static JsonElement Element(JsonNode node)
+    {
+        using var document = JsonDocument.Parse(node.ToJsonString());
+        return document.RootElement.Clone();
+    }
 }
 #endif

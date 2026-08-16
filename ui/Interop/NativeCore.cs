@@ -31,7 +31,7 @@ public sealed class NativeCore : ICore, IDisposable
 
     public JsonElement? LastCaps { get; private set; }
     public JsonElement? LastProviders { get; private set; }
-    public JsonElement? LastAccounts { get; private set; }
+    public JsonElement? LastMonitoringSnapshot { get; private set; }
     public JsonElement? LastVaultState { get; private set; }
     public JsonElement? LastNextClass { get; private set; }
 
@@ -280,7 +280,7 @@ public sealed class NativeCore : ICore, IDisposable
             {
                 case "Caps": self.LastCaps = clone; break;
                 case "Providers": self.LastProviders = clone; break;
-                case "Accounts": self.LastAccounts = clone; break;
+                case "MonitoringSnapshot": self.LastMonitoringSnapshot = clone; break;
                 case "VaultState": self.LastVaultState = clone; break;
                 case "NextClass": self.LastNextClass = clone; break;
             }

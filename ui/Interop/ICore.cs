@@ -20,7 +20,7 @@ public interface ICore
 
     JsonElement? LastCaps { get; }
     JsonElement? LastProviders { get; }
-    JsonElement? LastAccounts { get; }
+    JsonElement? LastMonitoringSnapshot { get; }
     JsonElement? LastVaultState { get; }
     JsonElement? LastNextClass { get; } // null ⇒ no upcoming class → hide the Home "下一堂課" card
 }

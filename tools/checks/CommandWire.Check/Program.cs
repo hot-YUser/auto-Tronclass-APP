@@ -15,6 +15,15 @@ using TronClass.Interop;
 using Ui;
 
 var failures = 0;
+var weekly = new WeeklyScheduleSpec(monday: [new TimeWindowSpec(60, 120)]);
+var group = new GroupInputWire(
+    " Team ",
+    ["a", "b"],
+    ["course-1"],
+    DetectorSelectionSpec.Preferred("a"),
+    ScheduleBindingSpec.InheritGlobal);
+const string WeeklyJson = """{"monday":[{"start_minute":60,"end_minute":120}],"tuesday":[],"wednesday":[],"thursday":[],"friday":[],"saturday":[],"sunday":[]}""";
+const string GroupJson = """{"name":"Team","member_account_ids":["a","b"],"course_ids":["course-1"],"detector":{"kind":"preferred","account_id":"a"},"schedule":{"kind":"inherit_global"}}""";
 
 // ---- 逐位元組釘樁(純 ASCII 情境,期望值直接可讀)----
 
@@ -53,9 +62,100 @@ Equal("SetAnswer:AnswerWire 純文字種類",
         ("subject_id", "2"), ("answer", new AnswerWire { Kind = "text", Value = "Jade Mt" })),
     """{"id":5,"cmd":"SetAnswer","activity_token":"t","account_id":"a","subject_id":"2","answer":{"kind":"text","value":"Jade Mt"}}""");
 
-Equal("無欄位命令",
-    JsonWire.SerializeCommand(6, "StopMonitoring"),
-    """{"id":6,"cmd":"StopMonitoring"}""");
+Equal("DeleteAccount:revision 與群組移除意圖",
+    JsonWire.SerializeCommand(6, "DeleteAccount",
+        ("account_id", "a"), ("expected_revision", 12UL), ("remove_from_groups", true)),
+    """{"id":6,"cmd":"DeleteAccount","account_id":"a","expected_revision":12,"remove_from_groups":true}""");
+
+Equal("CreateGroup",
+    JsonWire.SerializeCommand(7, "CreateGroup", ("expected_revision", 12UL), ("group", group)),
+    """{"id":7,"cmd":"CreateGroup","expected_revision":12,"group":""" + GroupJson + "}");
+
+Equal("UpdateGroup",
+    JsonWire.SerializeCommand(8, "UpdateGroup",
+        ("group_id", "g"), ("expected_revision", 13UL), ("group", group)),
+    """{"id":8,"cmd":"UpdateGroup","group_id":"g","expected_revision":13,"group":""" + GroupJson + "}");
+
+Equal("DeleteGroup",
+    JsonWire.SerializeCommand(9, "DeleteGroup", ("group_id", "g"), ("expected_revision", 14UL)),
+    """{"id":9,"cmd":"DeleteGroup","group_id":"g","expected_revision":14}""");
+
+Equal("MergeGroups",
+    JsonWire.SerializeCommand(10, "MergeGroups",
+        ("group_ids", new[] { "g1", "g2" }), ("expected_revision", 14UL), ("group", group)),
+    """{"id":10,"cmd":"MergeGroups","group_ids":["g1","g2"],"expected_revision":14,"group":""" + GroupJson + "}");
+
+Equal("ListCommonCourses",
+    JsonWire.SerializeCommand(11, "ListCommonCourses", ("member_account_ids", new[] { "a", "b" })),
+    """{"id":11,"cmd":"ListCommonCourses","member_account_ids":["a","b"]}""");
+
+Equal("SetTargetSchedule",
+    JsonWire.SerializeCommand(12, "SetTargetSchedule",
+        ("target", new TargetIdSpec("account", "a")), ("expected_revision", 15UL),
+        ("schedule", ScheduleBindingSpec.Disabled)),
+    """{"id":12,"cmd":"SetTargetSchedule","target":{"kind":"account","account_id":"a"},"expected_revision":15,"schedule":{"kind":"disabled"}}""");
+
+Equal("SetMonitoringPreferences",
+    JsonWire.SerializeCommand(13, "SetMonitoringPreferences",
+        ("expected_revision", 16UL), ("global_schedule", weekly),
+        ("time_zone", TimeZoneSpec.Named("Asia/Taipei"))),
+    """{"id":13,"cmd":"SetMonitoringPreferences","expected_revision":16,"global_schedule":""" +
+    WeeklyJson + ""","time_zone":{"kind":"named","iana_id":"Asia/Taipei"}}""");
+
+var clockEntries = new ScheduleClockEntriesWire(
+[
+    new(
+        new TargetIdSpec("group", "g"),
+        new ScheduleEvaluation(
+            true,
+            "window-1",
+            new DateTimeOffset(2026, 8, 17, 1, 0, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 8, 17, 2, 0, 0, TimeSpan.Zero),
+            false,
+            null)),
+]);
+Equal("ApplyScheduleClock",
+    JsonWire.SerializeCommand(14, "ApplyScheduleClock",
+        ("clock_revision", 9UL), ("config_revision", 12UL), ("schedule_revision", 7UL),
+        ("evaluated_at_utc", "2026-08-17T01:00:00.0000000Z"), ("targets", clockEntries)),
+    """{"id":14,"cmd":"ApplyScheduleClock","clock_revision":9,"config_revision":12,"schedule_revision":7,"evaluated_at_utc":"2026-08-17T01:00:00.0000000Z","targets":[{"target":{"kind":"group","group_id":"g"},"is_open":true,"window_key":"window-1","current_window_start_utc":"2026-08-17T01:00:00.0000000Z","next_boundary_utc":"2026-08-17T02:00:00.0000000Z","next_is_open":false,"clock_error":null}]}""");
+
+Equal("StartTarget",
+    JsonWire.SerializeCommand(15, "StartTarget", ("target", new TargetIdSpec("group", "g"))),
+    """{"id":15,"cmd":"StartTarget","target":{"kind":"group","group_id":"g"}}""");
+Equal("StopTarget",
+    JsonWire.SerializeCommand(16, "StopTarget", ("target", new TargetIdSpec("account", "a"))),
+    """{"id":16,"cmd":"StopTarget","target":{"kind":"account","account_id":"a"}}""");
+Equal("StopAllMonitoring",
+    JsonWire.SerializeCommand(17, "StopAllMonitoring"),
+    """{"id":17,"cmd":"StopAllMonitoring"}""");
+Equal("ResumeScheduledMonitoring",
+    JsonWire.SerializeCommand(18, "ResumeScheduledMonitoring"),
+    """{"id":18,"cmd":"ResumeScheduledMonitoring"}""");
+Equal("AcknowledgeTemporaryMerge",
+    JsonWire.SerializeCommand(19, "AcknowledgeTemporaryMerge",
+        ("component_id", "component-1"), ("plan_revision", 31UL)),
+    """{"id":19,"cmd":"AcknowledgeTemporaryMerge","component_id":"component-1","plan_revision":31}""");
+Equal("SuspendForPlatformLimit",
+    JsonWire.SerializeCommand(20, "SuspendForPlatformLimit", ("reason", "quota")),
+    """{"id":20,"cmd":"SuspendForPlatformLimit","reason":"quota"}""");
+Equal("ClearPlatformLimit",
+    JsonWire.SerializeCommand(21, "ClearPlatformLimit", ("reason", "quota reset")),
+    """{"id":21,"cmd":"ClearPlatformLimit","reason":"quota reset"}""");
+Equal("GetMonitoringSnapshot",
+    JsonWire.SerializeCommand(22, "GetMonitoringSnapshot"),
+    """{"id":22,"cmd":"GetMonitoringSnapshot"}""");
+
+var supportedMonitoringCommands = new[]
+{
+    "CreateGroup", "UpdateGroup", "DeleteGroup", "MergeGroups", "ListCommonCourses",
+    "SetTargetSchedule", "SetMonitoringPreferences", "ApplyScheduleClock", "StartTarget",
+    "StopTarget", "StopAllMonitoring", "ResumeScheduledMonitoring",
+    "AcknowledgeTemporaryMerge", "SuspendForPlatformLimit", "ClearPlatformLimit",
+    "GetMonitoringSnapshot",
+};
+foreach (var removed in new[] { "StartMonitoring", "StopMonitoring", "SwitchAccount" })
+    Check($"舊命令 {removed} 不得回到支援集合", !supportedMonitoringCommands.Contains(removed, StringComparer.Ordinal), "");
 
 // 本地合成的失敗 Reply:欄位形狀必須與核心的 Reply 信封一致,否則 AppState.OkReply 讀不到。
 Equal("JsonWire.Object:失敗 Reply 信封",

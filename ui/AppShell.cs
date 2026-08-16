@@ -23,7 +23,7 @@ public sealed class AppShell : Shell
         Title = "自動 Tronclass";
 
         var tabs = new TabBar();
-        tabs.Items.Add(Tab("首頁", "tab_home.png", () => new HomePage(state)));
+        tabs.Items.Add(Tab("監控", "tab_home.png", () => new HomePage(state)));
         tabs.Items.Add(_tabRollcall = Tab("點名", "tab_rollcall.png", () => new RollcallListPage(state)));
         tabs.Items.Add(_tabQuiz = Tab("答題", "tab_quiz.png", () => new QuizListPage(state)));
         tabs.Items.Add(Tab("帳號", "tab_accounts.png", () => new AccountsPage(state)));

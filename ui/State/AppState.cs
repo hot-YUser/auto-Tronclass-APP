@@ -12,15 +12,19 @@ namespace Ui;
 public sealed class AppState : ObservableObject
 {
     readonly ICore _core;
+    readonly ScheduleCoordinator _schedule;
     // Quiz 出現前的推理串流暫存:StringBuilder 線性累積,避免逐 chunk string concat 的 O(n²);
     // 轉入 ReasoningVm 時才 ToString 一次;已綁定畫面的可見更新仍全量投影,頻率由 core batching 限制。
     readonly Dictionary<(string ActivityToken, string AccountId, string SubjectId), StringBuilder> _pendingReasoning = [];
     bool _bootReady;
 
-    public AppState(ICore core)
+    public AppState(ICore core, ScheduleCoordinator schedule)
     {
         _core = core;
+        _schedule = schedule;
         core.EventReceived += e => MainThread.BeginInvokeOnMainThread(() => RouteSafely(e));
+        schedule.Diagnostic += message =>
+            MainThread.BeginInvokeOnMainThread(() => AddLog("error", message));
     }
 
     public bool BootReady => _bootReady;
@@ -41,16 +45,14 @@ public sealed class AppState : ObservableObject
     {
         try
         {
-            await _core.BootAsync(DataPaths.Resolve());
+            await _schedule.BootAsync(DataPaths.Resolve());
             _bootReady = true;
             Raise(nameof(BootReady));
-            Raise(nameof(CanToggleMonitoring));
         }
         catch (Exception error)
         {
             _bootReady = false;
             Raise(nameof(BootReady));
-            MonitorState = "idle";
             AddLog("error", $"初始化失敗：{error.Message}");
             Toast?.Invoke("error", $"初始化失敗：{error.Message}");
         }
@@ -61,36 +63,38 @@ public sealed class AppState : ObservableObject
         }
     }
 
-    // ---------------- 標量 ----------------
-
-    string _monitorState = "starting";
-    public string MonitorState
+    public async Task ResumeScheduleAsync()
     {
-        get => _monitorState;
-        private set
+        if (!_bootReady) return;
+        try
         {
-            if (Set(ref _monitorState, value))
-            {
-                Raise(nameof(IsMonitoring));
-                Raise(nameof(MonitorStateText));
-                Raise(nameof(CanToggleMonitoring));
-            }
+            await _schedule.OnResumeAsync();
+            if (Monitoring?.PlatformBlock is { } block)
+                await ClearPlatformLimit(block.Reason);
+        }
+        catch (Exception error)
+        {
+            AddLog("error", $"排程重算失敗：{error.Message}");
+            Toast?.Invoke("error", $"排程重算失敗：{error.Message}");
         }
     }
-    public bool IsMonitoring => MonitorState == "monitoring";
-    public bool CanToggleMonitoring => _bootReady && MonitorState is not ("starting" or "stopping");
-    public string MonitorStateText => MonitorState switch
-    {
-        "monitoring" => "監控中",
-        "starting" => "啟動中",
-        "stopping" => "停止中",
-        "login_failed" => "登入失敗",
-        "offline" => "離線",
-        _ => "閒置",
-    };
 
-    string? _activeAccountId;
-    public string? ActiveAccountId { get => _activeAccountId; private set => Set(ref _activeAccountId, value); }
+    // ---------------- 封閉監控快照 ----------------
+
+    MonitoringSnapshotContract? _monitoring;
+    public MonitoringSnapshotContract? Monitoring
+    {
+        get => _monitoring;
+        private set
+        {
+            if (!Set(ref _monitoring, value)) return;
+            Raise(nameof(HasMonitoringSnapshot));
+            MonitoringChanged?.Invoke();
+        }
+    }
+    public bool HasMonitoringSnapshot => Monitoring is not null;
+    public event Action? MonitoringChanged;
+    public event Action? CommandStateChanged;
 
     NextClassVm? _nextClass;
     public NextClassVm? NextClass { get => _nextClass; private set => Set(ref _nextClass, value); }
@@ -106,7 +110,6 @@ public sealed class AppState : ObservableObject
 
     // ---------------- 集合(只在 UI thread 讀寫) ----------------
 
-    public ObservableCollection<AccountVm> Accounts { get; } = [];
     public ObservableCollection<RollcallVm> Rollcalls { get; } = [];
     public ObservableCollection<QuizVm> Quizzes { get; } = [];
     public ObservableCollection<LogEntry> Logs { get; } = [];
@@ -142,9 +145,9 @@ public sealed class AppState : ObservableObject
         switch (evEl.GetString())
         {
             case "Tick": Ticked?.Invoke(); break;
-            case "StateChanged":
-                MonitorState = Str(e, "state") ?? MonitorState;
-                if (MonitorState == "idle") MonitoringServiceLifetime.Stop();
+            case "MonitoringSnapshot":
+                ApplyMonitoringSnapshot(MonitoringSnapshotContract.Parse(
+                    WireShape.Required(e, "snapshot")));
                 break;
 
             case "Caps" when e.TryGetProperty("caps", out var c):
@@ -163,15 +166,6 @@ public sealed class AppState : ObservableObject
                         Schools.Add(new SchoolVm(Str(s, "key") ?? "", Str(s, "label") ?? "", Str(s, "base_url") ?? ""));
                 break;
 
-            case "Accounts": OnAccounts(e); break;
-
-            case "AccountStatus":
-                if (Accounts.FirstOrDefault(a => a.Id == Str(e, "account_id")) is { } acct)
-                {
-                    acct.State = Str(e, "state") ?? acct.State;
-                    acct.Error = Str(e, "error");
-                }
-                break;
 
             // VaultState：核心以 device-key 自動解鎖（無主密碼），使用者不需介入；
             // 硬失敗會另以 Error 事件呈現，故此處不需處理。
@@ -235,26 +229,14 @@ public sealed class AppState : ObservableObject
         }
     }
 
-    void OnAccounts(JsonElement e)
+    void ApplyMonitoringSnapshot(MonitoringSnapshotContract snapshot)
     {
-        ActiveAccountId = Str(e, "active");
-        var seen = new HashSet<string>();
-        if (e.TryGetProperty("accounts", out var arr))
-            foreach (var a in arr.EnumerateArray())
-            {
-                var id = Str(a, "id") ?? "";
-                seen.Add(id);
-                var vm = Accounts.FirstOrDefault(x => x.Id == id);
-                if (vm is null) Accounts.Add(vm = new AccountVm { Id = id });
-                vm.Label = Str(a, "label") ?? "";
-                vm.Username = Str(a, "username") ?? "";
-                vm.SchoolRef = Str(a, "school_ref") ?? "";
-                vm.IsTeacher = Bool(a, "is_teacher");
-                vm.CourseId = Str(a, "course_id");
-                vm.IsActive = id == ActiveAccountId;
-            }
-        foreach (var gone in Accounts.Where(x => !seen.Contains(x.Id)).ToList()) Accounts.Remove(gone);
+        Monitoring = snapshot;
+        if (snapshot.SessionState == "idle" &&
+            snapshot.Targets.All(target => target.RuntimeState is "scheduled_off" or "manual_off" or "suppressed_by_group"))
+            MonitoringServiceLifetime.Stop();
     }
+
 
     void OnCaptcha(JsonElement e)
     {
@@ -272,7 +254,8 @@ public sealed class AppState : ObservableObject
 
     RollcallVm? FindRollcall(string? activityToken) => Rollcalls.FirstOrDefault(r => r.ActivityToken == activityToken);
     QuizVm? FindQuiz(string? activityToken) => Quizzes.FirstOrDefault(q => q.ActivityToken == activityToken);
-    string AccountLabel(string id) => Accounts.FirstOrDefault(a => a.Id == id)?.Label ?? id;
+    public string AccountLabel(string id) =>
+        Monitoring?.Accounts.FirstOrDefault(account => account.AccountId == id)?.Label ?? id;
 
     void OnRollcallDetected(JsonElement e)
     {
@@ -488,71 +471,274 @@ public sealed class AppState : ObservableObject
 
     // ---------------- 命令(UI → core) ----------------
 
-    public async Task StartMonitoring()
+    readonly object _commandGate = new();
+    readonly HashSet<string> _pendingCommands = new(StringComparer.Ordinal);
+
+    public bool IsCommandPending(string key)
     {
-        if (!_bootReady || MonitorState is "monitoring" or "starting" or "stopping") return;
-        MonitorState = "starting";
-        // Android 12+ 只允許在使用者前景互動時啟動多數 FGS；按鈕呼叫路徑就是授權時點。
+        lock (_commandGate) return _pendingCommands.Contains(key);
+    }
+
+    bool BeginCommand(string key)
+    {
+        lock (_commandGate)
+        {
+            if (!_pendingCommands.Add(key)) return false;
+        }
+        NotifyCommandStateChanged();
+        return true;
+    }
+
+    void EndCommand(string key)
+    {
+        lock (_commandGate) _pendingCommands.Remove(key);
+        NotifyCommandStateChanged();
+    }
+
+    void NotifyCommandStateChanged()
+    {
+        if (MainThread.IsMainThread) CommandStateChanged?.Invoke();
+        else MainThread.BeginInvokeOnMainThread(() => CommandStateChanged?.Invoke());
+    }
+
+    async Task<JsonElement?> SendKeyed(
+        string key,
+        string cmd,
+        params (string Key, object? Value)[] fields)
+    {
+        if (!BeginCommand(key)) return null;
+        try
+        {
+            return await Send(cmd, fields);
+        }
+        finally
+        {
+            EndCommand(key);
+        }
+    }
+
+    public async Task<string?> AddAndVerifyAccount(
+        string label,
+        string school,
+        string username,
+        string password,
+        bool isTeacher = false,
+        string? courseId = null)
+    {
+        var reply = await SendKeyed(
+            "account:add",
+            "AddAccount",
+            ("label", label),
+            ("school", school),
+            ("username", username),
+            ("password", password),
+            ("is_teacher", isTeacher),
+            ("course_id", string.IsNullOrWhiteSpace(courseId) ? null : courseId.Trim()));
+        if (!OkReply(reply)) return null;
+        try
+        {
+            var accountId = WireShape.RequiredString(
+                WireShape.Required(reply!.Value, "data"),
+                "account_id");
+            await Login(accountId);
+            return accountId;
+        }
+        catch (FormatException error)
+        {
+            ContractError($"AddAccount reply 無效：{error.Message}");
+            return null;
+        }
+    }
+
+    public async Task<bool> Login(string accountId) =>
+        OkReply(await SendKeyed(
+            $"account:{accountId}:auth",
+            "Login",
+            ("account_id", accountId)));
+
+    public async Task<bool> ImportCookies(string accountId, string cookiesJson) =>
+        OkReply(await SendKeyed(
+            $"account:{accountId}:auth",
+            "ImportCookies",
+            ("account_id", accountId),
+            ("cookies_json", cookiesJson)));
+
+    public async Task<bool> DeleteAccount(
+        string accountId,
+        ulong expectedRevision,
+        bool removeFromGroups) =>
+        OkReply(await SendKeyed(
+            $"account:{accountId}:delete",
+            "DeleteAccount",
+            ("account_id", accountId),
+            ("expected_revision", expectedRevision),
+            ("remove_from_groups", removeFromGroups)));
+
+    public Task SubmitCaptcha(string id, string text) =>
+        Send("SubmitCaptcha", ("account_id", id), ("text", text));
+
+    public async Task<CourseContract[]?> ListCommonCourses(string[] memberAccountIds)
+    {
+        var key = $"courses:{string.Join(',', memberAccountIds.Order(StringComparer.Ordinal))}";
+        var reply = await SendKeyed(
+            key,
+            "ListCommonCourses",
+            ("member_account_ids", memberAccountIds));
+        if (!OkReply(reply)) return null;
+        try
+        {
+            var courses = WireShape.Required(
+                WireShape.Required(reply!.Value, "data"),
+                "courses");
+            if (courses.ValueKind != JsonValueKind.Array)
+                throw new FormatException("courses 必須是陣列。");
+            return courses.EnumerateArray().Select(CourseContract.FromJson).ToArray();
+        }
+        catch (FormatException error)
+        {
+            ContractError($"ListCommonCourses reply 無效：{error.Message}");
+            return null;
+        }
+    }
+
+    public Task<bool> CreateGroup(ulong expectedRevision, GroupInputWire group) =>
+        SendDefinitionCommand(
+            "group:create",
+            "CreateGroup",
+            ("expected_revision", expectedRevision),
+            ("group", group));
+
+    public Task<bool> UpdateGroup(string groupId, ulong expectedRevision, GroupInputWire group) =>
+        SendDefinitionCommand(
+            $"group:{groupId}:update",
+            "UpdateGroup",
+            ("group_id", groupId),
+            ("expected_revision", expectedRevision),
+            ("group", group));
+
+    public Task<bool> DeleteGroup(string groupId, ulong expectedRevision) =>
+        SendDefinitionCommand(
+            $"group:{groupId}:delete",
+            "DeleteGroup",
+            ("group_id", groupId),
+            ("expected_revision", expectedRevision));
+
+    public Task<bool> MergeGroups(
+        string[] groupIds,
+        ulong expectedRevision,
+        GroupInputWire group) =>
+        SendDefinitionCommand(
+            $"group:merge:{string.Join(',', groupIds.Order(StringComparer.Ordinal))}",
+            "MergeGroups",
+            ("group_ids", groupIds),
+            ("expected_revision", expectedRevision),
+            ("group", group));
+
+    public Task<bool> SetTargetSchedule(
+        TargetIdSpec target,
+        ulong expectedRevision,
+        ScheduleBindingSpec schedule) =>
+        SendDefinitionCommand(
+            $"{TargetCommandKey(target)}:schedule",
+            "SetTargetSchedule",
+            ("target", target),
+            ("expected_revision", expectedRevision),
+            ("schedule", schedule));
+
+    public Task<bool> SaveMonitoringPreferences(
+        ulong expectedRevision,
+        WeeklyScheduleSpec globalSchedule,
+        TimeZoneSpec timeZone) =>
+        SendDefinitionCommand(
+            "monitoring:preferences",
+            "SetMonitoringPreferences",
+            ("expected_revision", expectedRevision),
+            ("global_schedule", globalSchedule),
+            ("time_zone", timeZone));
+
+    async Task<bool> SendDefinitionCommand(
+        string key,
+        string command,
+        params (string Key, object? Value)[] fields)
+    {
+        if (!OkReply(await SendKeyed(key, command, fields))) return false;
+        try
+        {
+            await _schedule.OnResumeAsync();
+        }
+        catch (Exception error)
+        {
+            AddLog("error", $"定義已儲存，但排程時鐘更新失敗：{error.Message}");
+            Toast?.Invoke("error", "設定已儲存；排程暫停，請重新開啟 App。");
+        }
+        return true;
+    }
+
+    public static string TargetCommandKey(TargetIdSpec target) => $"target:{target.Kind}:{target.Id}";
+
+    public async Task<bool> StartTarget(TargetIdSpec target)
+    {
+        if (!_bootReady || !TryStartMonitoringService()) return false;
+        return OkReply(await SendKeyed(
+            TargetCommandKey(target),
+            "StartTarget",
+            ("target", target)));
+    }
+
+    public async Task<bool> StopTarget(TargetIdSpec target) =>
+        OkReply(await SendKeyed(
+            TargetCommandKey(target),
+            "StopTarget",
+            ("target", target)));
+
+    public async Task<bool> StopAllMonitoring()
+    {
+        var ok = OkReply(await SendKeyed("monitoring:all", "StopAllMonitoring"));
+        if (ok) MonitoringServiceLifetime.Stop();
+        return ok;
+    }
+
+    public async Task<bool> ResumeScheduledMonitoring()
+    {
+        if (!OkReply(await SendKeyed("monitoring:all", "ResumeScheduledMonitoring")))
+            return false;
+        await _schedule.OnResumeAsync();
+        return TryStartMonitoringService();
+    }
+
+    public async Task<bool> AcknowledgeTemporaryMerge(string componentId, ulong planRevision) =>
+        OkReply(await SendKeyed(
+            $"merge:{componentId}",
+            "AcknowledgeTemporaryMerge",
+            ("component_id", componentId),
+            ("plan_revision", planRevision)));
+
+    public async Task<bool> SuspendForPlatformLimit(string reason) =>
+        OkReply(await SendKeyed(
+            "platform:limit",
+            "SuspendForPlatformLimit",
+            ("reason", reason)));
+
+    public async Task<bool> ClearPlatformLimit(string reason) =>
+        OkReply(await SendKeyed(
+            "platform:limit",
+            "ClearPlatformLimit",
+            ("reason", reason)));
+
+    bool TryStartMonitoringService()
+    {
         try
         {
             MonitoringServiceLifetime.Start();
+            return true;
         }
         catch (Exception error)
         {
-            MonitorState = "idle";
             AddLog("error", $"無法啟動背景監控服務：{error.Message}");
             Toast?.Invoke("error", $"無法啟動背景監控服務：{error.Message}");
-            return;
-        }
-        if (OkReply(await Send("StartMonitoring"))) return;
-        // 啟動失敗(含命令逾時)時 core 可能仍在 Starting:先送 StopMonitoring 並等待有界回覆,
-        // 再把 UI/FGS 設回 idle——不能靠猜 school 端 timeout 來判斷 core 到底有沒有啟動。
-        await RecoverAfterFailedStart();
-        MonitoringServiceLifetime.Stop();
-        MonitorState = "idle";
-    }
-
-    /// <summary>StartMonitoring 失敗後的有界復原:送一次 StopMonitoring。
-    /// core 若其實已開始監控(逾時但命令已生效),這一步會把它停掉,不留幽靈監控;
-    /// 若它已無回應,等待到界就放手,不放任 UI 卡在「啟動中」。</summary>
-    async Task RecoverAfterFailedStart()
-    {
-        var stop = _core.SendAsync("StopMonitoring");
-        // 活著的 core 對 StopMonitoring 是同步即時回覆;只有已失去回應的 core 才等不到。
-        // 到點後 stop task 仍由 NativeCore 自己的 300s safety net 收尾,這裡不阻擋 UI 回到 idle。
-        _ = stop.ContinueWith(static t => _ = t.Exception, CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
-        try
-        {
-            var done = await Task.WhenAny(stop, Task.Delay(StopReplyBound));
-            if (done == stop) await stop;
-        }
-        catch (Exception error)
-        {
-            AddLog("error", $"啟動失敗後停止核心未獲回覆：{error.Message}");
+            return false;
         }
     }
-
-    static readonly TimeSpan StopReplyBound = TimeSpan.FromSeconds(20);
-
-    public async Task StopMonitoring()
-    {
-        if (MonitorState != "monitoring") return;
-        MonitorState = "stopping";
-        if (OkReply(await Send("StopMonitoring"))) MonitoringServiceLifetime.Stop();
-        else if (MonitorState == "stopping") MonitorState = "monitoring";
-    }
-
-    public async Task<bool> AddAccount(string label, string school, string username, string password,
-                                       bool isTeacher = false, string? courseId = null) =>
-        OkReply(await Send("AddAccount", ("label", label), ("school", school), ("username", username), ("password", password),
-                           ("is_teacher", isTeacher), ("course_id", string.IsNullOrWhiteSpace(courseId) ? null : courseId.Trim())));
-    public Task SwitchAccount(string id) => Send("SwitchAccount", ("account_id", id));
-    public Task DeleteAccount(string id) => Send("DeleteAccount", ("account_id", id));
-    public Task Login(string id) => Send("Login", ("account_id", id));
-    public async Task<bool> ImportCookies(string id, string cookiesJson) =>
-        OkReply(await Send("ImportCookies", ("account_id", id), ("cookies_json", cookiesJson)));
-    public Task SubmitCaptcha(string id, string text) => Send("SubmitCaptcha", ("account_id", id), ("text", text));
 
     public Task SignNow(RollcallVm rollcall) => Send("SignNow", ("activity_token", rollcall.ActivityToken));
     public Task DeferSignIn(RollcallVm rollcall) => Send("DeferSignIn", ("activity_token", rollcall.ActivityToken));
@@ -601,12 +787,19 @@ public sealed class AppState : ObservableObject
             ["enable_llm_tools"] = tools,
         })));
 
-    /// <summary>統一送命令:Reply 失敗與例外一律 Toast+Logs(錯誤永不吞)。回 null 表示丟例外。</summary>
+    /// <summary>統一送命令；失敗與例外一律 Toast+Logs，reply 內最新 snapshot 也立即成為 UI authority。</summary>
     async Task<JsonElement?> Send(string cmd, params (string Key, object? Value)[] fields)
     {
         try
         {
             var reply = await _core.SendAsync(cmd, fields);
+            if (reply.TryGetProperty("data", out var data) &&
+                data.ValueKind == JsonValueKind.Object &&
+                data.TryGetProperty("snapshot", out var snapshotElement))
+            {
+                var snapshot = MonitoringSnapshotContract.Parse(snapshotElement);
+                await MainThread.InvokeOnMainThreadAsync(() => ApplyMonitoringSnapshot(snapshot));
+            }
             if (!OkReply(reply))
             {
                 var err = Str(reply, "error") ?? Str(reply, "reason") ?? Str(reply, "detail") ?? "操作失敗";

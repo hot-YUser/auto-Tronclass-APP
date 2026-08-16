@@ -81,6 +81,18 @@ public sealed class SettingsPage : ContentPage
             },
         });
 
+        var scheduleCard = Theme.Card(new VerticalStackLayout
+        {
+            Spacing = 8,
+            Children =
+            {
+                Theme.Dim("設定全局每週時段與 Device／Named IANA 時區。監控中儲存會先 fail closed，再發布新時鐘。", 12.5),
+                Theme.Primary(
+                    "編輯全局時間表與時區",
+                    () => Navigation.PushAsync(new MonitoringPreferencesPage(state))),
+            },
+        });
+
         // --- LLM 金鑰(存保險庫,與其他 LLM 設定分開) ---
         var keyCard = Theme.Card(new VerticalStackLayout
         {
@@ -169,6 +181,8 @@ public sealed class SettingsPage : ContentPage
                     new StatusBanner(state),
                     Theme.Section("監控"),
                     monitorCard,
+                    Theme.Section("全局排程"),
+                    scheduleCard,
                     Theme.Section("LLM 金鑰"),
                     keyCard,
                     Theme.Section("LLM 連線與答題"),

@@ -8,7 +8,10 @@
   <ItemGroup>
     <Compile Include="..\..\..\ui\Interop\JsonWire.cs" Link="JsonWire.cs" />
     <Compile Include="..\..\..\ui\State\Models.cs" Link="Models.cs" />
+    <Compile Include="..\..\..\ui\State\ScheduleCalculator.cs" Link="ScheduleCalculator.cs" />
+    <Compile Include="..\..\..\ui\State\MonitoringSnapshotContract.cs" Link="MonitoringSnapshotContract.cs" />
     <Compile Include="..\..\..\ui\Interop\QuizPreparedContract.cs" Link="QuizPreparedContract.cs" />
     <None Include="..\..\..\core\src\assets\quiz_prepared_v1.json" Link="quiz_prepared_v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\..\core\src\assets\monitoring_snapshot_v1.json" Link="monitoring_snapshot_v1.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

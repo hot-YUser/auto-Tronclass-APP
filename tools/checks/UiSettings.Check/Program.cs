@@ -1,3 +1,5 @@
+using System.Text.Json;
+using TronClass.Interop;
 using Ui;
 
 // 設定頁未儲存編輯保護的純邏輯(SettingsPage 共用)。
@@ -27,9 +29,138 @@ Assert(llm.IsDirty, "另一張卡回填不得清除 LLM 卡的 dirty");
 llm.Saved();
 Assert(llm.ShouldPopulate, "LLM 卡儲存後重新允許核心回填");
 
+var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+var spring = new WeeklyScheduleSpec(sunday:
+[
+    new TimeWindowSpec(150, 240), // 02:30 不存在，必須移到 03:00
+]);
+var springResult = ScheduleCalculator.Evaluate(
+    spring, newYork, new DateTimeOffset(2026, 3, 8, 6, 0, 0, TimeSpan.Zero));
+Assert(!springResult.IsOpen, "spring gap 前尚未開啟");
+Assert(springResult.NextBoundaryUtc == new DateTimeOffset(2026, 3, 8, 7, 0, 0, TimeSpan.Zero),
+    "不存在的 02:30 邊界移到 gap 後第一個有效分鐘 03:00");
+
+var fall = new WeeklyScheduleSpec(sunday:
+[
+    new TimeWindowSpec(90, 105), // 01:30→01:45 都重複
+]);
+var fallResult = ScheduleCalculator.Evaluate(
+    fall, newYork, new DateTimeOffset(2026, 11, 1, 5, 40, 0, TimeSpan.Zero));
+Assert(fallResult.IsOpen, "fall overlap 第一次 01:40 已在時間窗內");
+Assert(fallResult.CurrentWindowStartUtc == new DateTimeOffset(2026, 11, 1, 5, 30, 0, TimeSpan.Zero),
+    "重複開始取較早 UTC");
+Assert(fallResult.NextBoundaryUtc == new DateTimeOffset(2026, 11, 1, 6, 45, 0, TimeSpan.Zero),
+    "重複結束取較晚 UTC");
+
+var sundayCrossMidnight = new WeeklyScheduleSpec(sunday:
+[
+    new TimeWindowSpec(1380, 60),
+]);
+var crossResult = ScheduleCalculator.Evaluate(
+    sundayCrossMidnight, TimeZoneInfo.Utc,
+    new DateTimeOffset(2026, 1, 5, 0, 30, 0, TimeSpan.Zero));
+Assert(crossResult.IsOpen, "週日跨午夜時間窗涵蓋週一 00:30");
+
+var global = new WeeklyScheduleSpec(monday: [new TimeWindowSpec(0, 60)]);
+var inherited = ScheduleCalculator.Evaluate(
+    ScheduleBindingSpec.InheritGlobal, global, TimeZoneSpec.Named("Etc/UTC"),
+    new DateTimeOffset(2026, 1, 5, 0, 30, 0, TimeSpan.Zero));
+Assert(inherited.IsOpen, "inherit_global 使用全局時間表");
+var empty = ScheduleCalculator.Evaluate(
+    ScheduleBindingSpec.InheritGlobal, new WeeklyScheduleSpec(), TimeZoneSpec.Device,
+    DateTimeOffset.UtcNow);
+Assert(!empty.IsOpen && empty.NextBoundaryUtc is null, "空時間表沒有自動時段");
+
+var core = new ScheduleCoreFake();
+using (var coordinator = new ScheduleCoordinator(core))
+{
+    await coordinator.BootAsync("unused");
+    var command = core.LastCommand ?? throw new InvalidOperationException("未送出 ApplyScheduleClock。");
+    Assert(command.GetProperty("clock_revision").GetUInt64() == 8,
+        "cold boot 從 snapshot clock_revision + 1 發布");
+    Assert(command.GetProperty("config_revision").GetUInt64() == 4 &&
+           command.GetProperty("schedule_revision").GetUInt64() == 6,
+        "clock 綁定 matching definition revisions");
+    Assert(command.GetProperty("targets").GetArrayLength() == 1,
+        "clock 必須完整覆蓋所有 target");
+}
+
+Assert(
+    AndroidSchedulePolicy.AtBoundary(canScheduleExact: true) ==
+    AlarmBoundaryAction.StartForegroundService,
+    "exact boundary 才可自動啟動 FGS");
+Assert(
+    AndroidSchedulePolicy.AtBoundary(canScheduleExact: false) ==
+    AlarmBoundaryAction.NotifyUser,
+    "未授 exact boundary 只能通知使用者");
+Assert(
+    AndroidSchedulePolicy.AfterBoot(hasFutureBoundary: true, activeNow: true) ==
+    new BootScheduleAction(true, true, false),
+    "reboot 落在 active window：重排未來邊界、通知、絕不由 boot 啟 FGS");
+Assert(
+    AndroidSchedulePolicy.AfterBoot(hasFutureBoundary: false, activeNow: false) ==
+    new BootScheduleAction(false, true, false),
+    "已過 boundary：只通知並等待 App 重算");
+Assert(
+    AndroidSchedulePolicy.WakeMode(atLeastApi31: true, canScheduleExact: false) ==
+    "inexact_user_action_required",
+    "拒絕 exact access 時 wake_mode 必須 fail closed");
+
 Console.WriteLine("UiSettings.Check：全部通過");
 
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException($"設定邏輯檢查失敗：{message}");
+}
+
+sealed class ScheduleCoreFake : ICore
+{
+    public event Action<JsonElement>? EventReceived { add { } remove { } }
+    public JsonElement? LastCaps => null;
+    public JsonElement? LastProviders => null;
+    public JsonElement? LastVaultState => null;
+    public JsonElement? LastNextClass => null;
+    public JsonElement? LastMonitoringSnapshot { get; } = Parse(
+        """
+        {
+          "id": null,
+          "event": "MonitoringSnapshot",
+          "snapshot": {
+            "config_revision": 4,
+            "schedule_revision": 6,
+            "clock_revision": 7,
+            "global_schedule": {
+              "monday": [], "tuesday": [], "wednesday": [], "thursday": [],
+              "friday": [], "saturday": [], "sunday": []
+            },
+            "time_zone": { "kind": "device" },
+            "targets": [
+              {
+                "target": { "kind": "account", "account_id": "a" },
+                "schedule": { "kind": "disabled" }
+              }
+            ]
+          }
+        }
+        """);
+
+    public JsonElement? LastCommand { get; private set; }
+
+    public Task BootAsync(string dataDir) => Task.CompletedTask;
+
+    public Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
+    {
+        if (cmd == "ApplyScheduleClock") LastCommand = JsonWire.Object(fields);
+        return Task.FromResult(JsonWire.Object(
+            ("id", 1),
+            ("event", "Reply"),
+            ("ok", true),
+            ("data", null)));
+    }
+
+    static JsonElement Parse(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        return document.RootElement.Clone();
+    }
 }

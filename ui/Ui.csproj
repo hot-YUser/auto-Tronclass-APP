@@ -67,6 +67,10 @@
 		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
 	</PropertyGroup>
 
+	<PropertyGroup Condition="'$(Configuration)' == 'Debug' and '$(UseMockCore)' == 'true'">
+		<DefineConstants>$(DefineConstants);USE_MOCK_CORE</DefineConstants>
+	</PropertyGroup>
+
 	<ItemGroup>
 		<!-- App Icon: the prepared neon-glitch mark, single full-bleed PNG on a dark backdrop. -->
 		<MauiIcon Include="Resources\AppIcon\appicon.png" Color="#0A0A0F" />
@@ -84,6 +88,7 @@
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
 		<!-- Rust 與 C# Mock 共用的跨語言 golden contract。 -->
 		<MauiAsset Include="..\core\src\assets\quiz_prepared_v1.json" LogicalName="contract/quiz_prepared_v1.json" />
+		<MauiAsset Include="..\core\src\assets\monitoring_snapshot_v1.json" LogicalName="contract/monitoring_snapshot_v1.json" />
 	</ItemGroup>
 
 	<ItemGroup>

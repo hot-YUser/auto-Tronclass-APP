@@ -11,5 +11,7 @@
   <ItemGroup>
     <Compile Include="..\..\..\ui\Interop\JsonWire.cs" Link="JsonWire.cs" />
     <Compile Include="..\..\..\ui\State\Models.cs" Link="Models.cs" />
+    <Compile Include="..\..\..\ui\State\ScheduleCalculator.cs" Link="ScheduleCalculator.cs" />
+    <Compile Include="..\..\..\ui\State\MonitoringSnapshotContract.cs" Link="MonitoringSnapshotContract.cs" />
   </ItemGroup>
 </Project>

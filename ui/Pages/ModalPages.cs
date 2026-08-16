@@ -298,7 +298,7 @@ public sealed class CaptchaModalPage : ModalPageBase
     {
         AccountId = accountId;
         _cancel = () => close(this);
-        var label = state.Accounts.FirstOrDefault(a => a.Id == accountId)?.Label ?? accountId;
+        var label = state.AccountLabel(accountId);
         var entry = new Entry { Placeholder = "驗證碼" };
         _image = new Image { Source = image, HeightRequest = 90, Aspect = Aspect.AspectFit };
 

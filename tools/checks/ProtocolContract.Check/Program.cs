@@ -139,9 +139,60 @@ Assert(!Quiz(("a", "submitting", false), ("b", "gone", false)).IsComplete, "subm
 // 全帳號送出 → 完成
 Assert(Quiz(("a", "ready", true), ("b", "ready", true)).IsComplete, "all submitted must complete");
 
+var monitoringFixturePath = Path.Combine(AppContext.BaseDirectory, "monitoring_snapshot_v1.json");
+using var monitoringDocument = JsonDocument.Parse(File.ReadAllText(monitoringFixturePath));
+var snapshot = MonitoringSnapshotContract.Parse(monitoringDocument.RootElement);
+Assert(snapshot.SchemaVersion == 1 && snapshot.ConfigRevision == 12 && snapshot.ScheduleRevision == 7, "monitoring revisions");
+Assert(snapshot.Accounts.Single(account => account.AccountId == "teacher-a").TeacherCourseId == "course-zh", "teacher account");
+var primaryGroup = snapshot.Targets.Single(target => target.Target == new TargetIdSpec("group", "group-a"));
+Assert(primaryGroup.Detector is { AccountId: "student-a", IsFallback: true }, "fallback detector");
+Assert(primaryGroup.GroupDefinition?.DetectorSelection == new DetectorSelectionSpec(false, "student-b"), "preferred detector");
+Assert(snapshot.Targets.Single(target => target.Target == new TargetIdSpec("account", "student-a")).RuntimeState == "suppressed_by_group", "personal suppression");
+var restartResult = snapshot.Targets
+    .Single(target => target.Target == new TargetIdSpec("group", "group-b"))
+    .AccountResults.Single();
+Assert(restartResult is { Phase: "unknown_after_restart", CourseName: null, UpdatedAtUtc: null }, "restart uncertainty and nullables");
+Assert(snapshot.MergePrompts.Any(prompt => prompt.Coverage == "single_detector" && prompt.DetectorCount == 1), "single detector merge");
+Assert(snapshot.MergePrompts.Any(prompt => prompt.Coverage == "multiple_detectors_required" && prompt.DetectorCount == 2), "multiple detector merge");
+
+var unknownRuntime = File.ReadAllText(monitoringFixturePath)
+    .Replace("\"runtime_state\": \"scheduled_off\"", "\"runtime_state\": \"future_state\"", StringComparison.Ordinal);
+AssertThrowsFormat(
+    () =>
+    {
+        using var malformed = JsonDocument.Parse(unknownRuntime);
+        MonitoringSnapshotContract.Parse(malformed.RootElement);
+    },
+    "unknown runtime state must fail closed");
+
+var missingMonitoringField = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+    monitoringDocument.RootElement.GetRawText())!;
+missingMonitoringField.Remove("session_state");
+AssertThrowsFormat(
+    () =>
+    {
+        using var malformed = JsonDocument.Parse(JsonSerializer.Serialize(missingMonitoringField));
+        MonitoringSnapshotContract.Parse(malformed.RootElement);
+    },
+    "missing monitoring field must fail closed");
+
 Console.WriteLine("ProtocolContract.Check：全部通過");
 
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException($"契約檢查失敗：{message}");
+}
+
+static void AssertThrowsFormat(Action action, string message)
+{
+    try
+    {
+        action();
+    }
+    catch (FormatException)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException($"契約檢查失敗：{message}");
 }
