@@ -222,9 +222,40 @@ public sealed class NativeCore : ICore, IDisposable
         }
         catch (Exception error)
         {
-            try { System.Diagnostics.Debug.WriteLine($"Native callback 已隔離 {error.GetType().Name}"); }
-            catch { /* the ABI boundary itself must remain no-throw */ }
+            ReportIsolatedFault("原生回呼", error);
         }
+    }
+
+    // ── 隔離故障的可觀測性 ──────────────────────────────────────────────
+    // 這兩個 catch(ABI 邊界與 subscriber 迴圈)必須吞掉例外,但**不能無聲**:
+    // Debug.WriteLine 帶 [Conditional("DEBUG")],Release 會被整個編掉 —— 而 Release 正是
+    // NativeAOT / full-trim 迴歸最先咬人的地方。真實案例:事件處理一拋例外,UI 就永遠停在
+    // 「啟動中」,logcat 乾淨、沒有崩潰、什麼線索都沒有。故改成走與真實事件同一條延後佇列,
+    // 讓它出現在 App 自己的日誌與 Toast。
+    private static int _isolatedFaults;
+    private const int MaxIsolatedFaultReports = 5;
+
+    /// <summary>
+    /// 把被隔離的例外轉成可見的 Error 事件。**本身必須 no-throw**(邊界之上再拋就是 UB),
+    /// 且**不得**在此直接呼叫 managed 訂閱者(Rust 可能還握著 state mutex)——只入佇列。
+    /// 只回報前 N 次:系統性失敗不該把日誌洗爆,也避免「回報本身又失敗」的無限迴圈。
+    /// </summary>
+    private static void ReportIsolatedFault(string origin, Exception error)
+    {
+        try
+        {
+            var seen = Interlocked.Increment(ref _isolatedFaults);
+            if (seen > MaxIsolatedFaultReports) return;
+            var tail = seen == MaxIsolatedFaultReports ? "；後續同類錯誤不再回報" : "";
+            EventQueue.Enqueue(JsonWire.Object(
+                ("id", null),
+                ("event", "Error"),
+                ("severity", "error"),
+                ("message", $"FFI 縫（{origin}）已隔離例外 #{seen}：" +
+                            $"{error.GetType().Name}：{error.Message}{tail}")));
+            ScheduleEventDrain();
+        }
+        catch { /* the ABI boundary itself must remain no-throw */ }
     }
 
     private static void ProcessEvent(ReadOnlySpan<byte> bytes)
@@ -279,8 +310,10 @@ public sealed class NativeCore : ICore, IDisposable
                     try { subscriber(coreEvent); }
                     catch (Exception error)
                     {
-                        try { System.Diagnostics.Debug.WriteLine($"Core event subscriber 已隔離 {error.GetType().Name}"); }
-                        catch { }
+                        // 訂閱者(AppState)在處理事件時拋例外 → 該事件的狀態更新就沒發生。
+                        // 這比回呼本身失敗更常見,也更難察覺,同樣不能無聲。回報自己也會經過
+                        // 這個迴圈,靠 MaxIsolatedFaultReports 上限收斂,不會無限自我餵食。
+                        ReportIsolatedFault("事件訂閱者", error);
                     }
                 }
             }
