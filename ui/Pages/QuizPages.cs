@@ -80,7 +80,7 @@ sealed class QuizRow : Border
 
         var course = Theme.Strong("", 15.5);
         course.VerticalOptions = LayoutOptions.Center;
-        course.SetBinding(Label.TextProperty, new Binding(nameof(QuizVm.Course), source: vm));
+        course.SetBinding(Label.TextProperty, static (QuizVm quiz) => quiz.Course, source: vm);
 
         var statusPill = new StatusPill(vm, () => QuizToneOf(vm), nameof(QuizVm.StatusTag));
         statusPill.VerticalOptions = LayoutOptions.Center;
@@ -93,7 +93,7 @@ sealed class QuizRow : Border
         header.Add(statusPill, 1, 0);
 
         var meta = Theme.Dim("", 12.5);
-        meta.SetBinding(Label.TextProperty, new Binding(nameof(QuizVm.SubtitleText), source: vm));
+        meta.SetBinding(Label.TextProperty, static (QuizVm quiz) => quiz.SubtitleText, source: vm);
 
         var chips = new ChipsView(vm.PerAccount,
             o => { var a = (QuizAccountVm)o; return (a.ChipText, a.Submitted); },
@@ -152,12 +152,12 @@ public sealed class QuizDetailPage : ContentPage
         });
 
         var conflictLabel = Theme.Text("", 13, Theme.FontSemibold, Theme.WarnL, Theme.WarnD);
-        conflictLabel.SetBinding(Label.TextProperty, nameof(QuizVm.ConflictText));
+        conflictLabel.SetBinding(Label.TextProperty, static (QuizVm quiz) => quiz.ConflictText);
         var conflictCard = Theme.TintCard(conflictLabel, Theme.WarnBgL, Theme.WarnBgD, Theme.WarnL, Theme.WarnD);
-        conflictCard.SetBinding(IsVisibleProperty, nameof(QuizVm.HasConflicts));
+        conflictCard.SetBinding(IsVisibleProperty, static (QuizVm quiz) => quiz.HasConflicts);
 
         var submit = Theme.Primary("立即送出", () => state.SubmitNow(vm));
-        submit.SetBinding(IsEnabledProperty, nameof(QuizVm.CanSubmit));
+        submit.SetBinding(IsEnabledProperty, static (QuizVm quiz) => quiz.CanSubmit);
         var actionRow = new Grid { ColumnSpacing = 8 };
         actionRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
         actionRow.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
@@ -171,7 +171,7 @@ public sealed class QuizDetailPage : ContentPage
             Spacing = 12,
             Children = { new CountdownView(vm, "自動送出", 14), actionRow },
         });
-        actionsCard.SetBinding(IsVisibleProperty, nameof(QuizVm.ActionsVisible));
+        actionsCard.SetBinding(IsVisibleProperty, static (QuizVm quiz) => quiz.ActionsVisible);
 
         Content = new ScrollView
         {
@@ -196,14 +196,14 @@ public sealed class QuizDetailPage : ContentPage
     Label SubBound()
     {
         var l = Theme.Dim("");
-        l.SetBinding(Label.TextProperty, nameof(QuizVm.SubtitleText));
+        l.SetBinding(Label.TextProperty, static (QuizVm quiz) => quiz.SubtitleText);
         return l;
     }
 
     Label StatusBound()
     {
         var l = Theme.Text("", 12.5, Theme.FontSemibold, Theme.PrimL, Theme.PrimD);
-        l.SetBinding(Label.TextProperty, nameof(QuizVm.StatusText));
+        l.SetBinding(Label.TextProperty, static (QuizVm quiz) => quiz.StatusText);
         return l;
     }
 
@@ -407,7 +407,7 @@ sealed class QuestionCard : ContentView
             var toggle = Theme.Dim(_expanded ? "▾ 推理過程" : "▸ 推理過程", 12.5);
             var body = Theme.Dim("", 12);
             body.BindingContext = reasoning;
-            body.SetBinding(Label.TextProperty, nameof(ReasoningVm.Text));
+            body.SetBinding(Label.TextProperty, static (ReasoningVm reasoning) => reasoning.Text);
             body.IsVisible = _expanded;
             toggle.OnTap(() =>
             {

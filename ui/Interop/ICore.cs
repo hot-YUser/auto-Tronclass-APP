@@ -4,8 +4,8 @@ namespace TronClass.Interop;
 
 /// <summary>
 /// The one seam the UI binds to. <see cref="NativeCore"/> drives the real Rust core over the FFI;
-/// <see cref="MockCore"/> scripts a realistic event timeline so the UI can be built and previewed
-/// WITHOUT the native library. Swap the two with one line in <c>MauiProgram</c>.
+/// <c>MockCore</c> (Debug 建置才編入) scripts a realistic event timeline so the UI can be built and
+/// previewed WITHOUT the native library. Swap the two with one line in <c>MauiProgram</c>.
 ///
 /// Commands are fire-and-await: <see cref="SendAsync"/> returns the id-correlated reply. Unsolicited
 /// events arrive on <see cref="EventReceived"/> — raised on a worker thread, so marshal to the UI

@@ -153,11 +153,9 @@ public sealed class NativeCore : ICore, IDisposable
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = tcs;
 
-        var dict = new Dictionary<string, object?> { ["id"] = id, ["cmd"] = cmd };
-        foreach (var (k, v) in fields) dict[k] = v;
         try
         {
-            Send(JsonSerializer.Serialize(dict));
+            Send(JsonWire.SerializeCommand(id, cmd, fields));
         }
         catch
         {
@@ -174,29 +172,18 @@ public sealed class NativeCore : ICore, IDisposable
         return await tcs.Task;
     }
 
-    private static JsonElement TimeoutReply(ulong id, string cmd) => JsonSerializer.SerializeToElement(new
-    {
-        id,
-        @event = "Reply",
-        ok = false,
-        error = $"命令逾時：核心未在 {CommandTimeout.TotalSeconds:0} 秒內回覆（{cmd}）",
-    });
+    private static JsonElement TimeoutReply(ulong id, string cmd) =>
+        FailedReply(id, $"命令逾時：核心未在 {CommandTimeout.TotalSeconds:0} 秒內回覆（{cmd}）");
 
-    private static JsonElement CoreUnavailableReply(ulong id, string cmd) => JsonSerializer.SerializeToElement(new
-    {
-        id,
-        @event = "Reply",
-        ok = false,
-        error = $"核心尚未完成啟動，無法執行 {cmd}。",
-    });
+    private static JsonElement CoreUnavailableReply(ulong id, string cmd) =>
+        FailedReply(id, $"核心尚未完成啟動，無法執行 {cmd}。");
 
-    private static JsonElement DisposedReply(ulong id) => JsonSerializer.SerializeToElement(new
-    {
-        id,
-        @event = "Reply",
-        ok = false,
-        error = "核心已釋放，無法執行命令。",
-    });
+    private static JsonElement DisposedReply(ulong id) =>
+        FailedReply(id, "核心已釋放，無法執行命令。");
+
+    /// <summary>本地合成的失敗 Reply(核心沒回時才用),欄位形狀與核心的 Reply 信封一致。</summary>
+    private static JsonElement FailedReply(ulong id, string error) =>
+        JsonWire.Object(("id", id), ("event", "Reply"), ("ok", false), ("error", error));
 
     private static unsafe bool HasNativeHandle() => _handle != null;
 

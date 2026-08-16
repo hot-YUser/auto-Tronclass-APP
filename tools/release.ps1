@@ -420,10 +420,12 @@ Step "cargo clippy"
 Invoke-Native -FilePath "cargo" -Arguments @("clippy", "--manifest-path", "$core/Cargo.toml", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings") -FailureMessage "Rust cargo clippy 失敗"
 
 if (-not $SkipWindows) {
-    # 三個檢查直接連結 production source，防止 OS key、Rust↔C# wire contract 與設定頁保護邏輯在發版前漂移。
+    # 四個檢查直接連結 production source，防止 OS key、Rust↔C# wire contract（入站解析與出站命令
+    # 序列化各一支）與設定頁保護邏輯在發版前漂移。
     foreach ($check in @(
         @{ Name = "DeviceKey"; Path = (Join-Path $tools "checks\DeviceKey.Check\DeviceKey.Check.csproj") },
         @{ Name = "ProtocolContract"; Path = (Join-Path $tools "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") },
+        @{ Name = "CommandWire"; Path = (Join-Path $tools "checks\CommandWire.Check\CommandWire.Check.csproj") },
         @{ Name = "UiSettings"; Path = (Join-Path $tools "checks\UiSettings.Check\UiSettings.Check.csproj") }
     )) {
         if (-not (Test-Path -LiteralPath $check.Path -PathType Leaf)) {

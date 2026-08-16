@@ -19,6 +19,7 @@ public static class MauiProgram
 
 		// The FFI seam. NativeCore drives the real Rust core; swap to MockCore for design-time
 		// preview / hot-reload without a native build (the UI is identical either way).
+		// MockCore 只在 Debug 建置存在 —— 預覽本來就只在 Debug 做,Release 不編死碼進去。
 		builder.Services.AddSingleton<ICore, NativeCore>();
 		builder.Services.AddSingleton<AppState>();
 		builder.Services.AddSingleton<AppShell>();

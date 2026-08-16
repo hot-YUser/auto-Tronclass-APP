@@ -10,6 +10,16 @@
 
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
+		<!-- AOT-ready 常駐防線。本專案目前**不**以 NativeAOT 出貨(MAUI 框架層的 Shell/TabBar 在
+		     NativeAOT 下不渲染 — dotnet/maui#31227，Open/Backlog；Android 端微軟自標 XA1040
+		     實驗性)，但我們自己的程式碼維持零 trim/AOT 警告，等框架補上就能直接開關打開。
+		     沒有這道 gate，反射式序列化與字串路徑 binding 會不知不覺長回來。
+		     只把「我們自己碼」會觸發的診斷升級為錯誤；IL2104/IL3053 是組件層總結警告，
+		     由 ILC 在 publish 階段對框架組件發出，不在此列(否則等於把不可修的框架問題變成建置失敗)。 -->
+		<EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
+		<WarningsAsErrors>$(WarningsAsErrors);IL2026;IL3050</WarningsAsErrors>
+
 		<!-- Note for MacCatalyst:
 		The default runtime is maccatalyst-x64, except in Release config, in which case the default is maccatalyst-x64;maccatalyst-arm64.
 		When specifying both architectures, use the plural <RuntimeIdentifiers> instead of the singular <RuntimeIdentifier>.

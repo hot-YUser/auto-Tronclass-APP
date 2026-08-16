@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\..\..\ui\Interop\JsonWire.cs" Link="JsonWire.cs" />
     <Compile Include="..\..\..\ui\Pages\SettingsSync.cs" Link="SettingsSync.cs" />
     <Compile Include="..\..\..\ui\State\Models.cs" Link="Models.cs" />
   </ItemGroup>

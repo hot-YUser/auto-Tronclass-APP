@@ -36,7 +36,7 @@ public sealed class HomePage : ContentPage
 
         var fgPill = Theme.TextPill("僅前景執行 · 螢幕關閉時暫停監控", Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD);
         fgPill.BindingContext = state.Caps;
-        fgPill.SetBinding(IsVisibleProperty, nameof(CapsVm.ForegroundOnly));
+        fgPill.SetBinding(IsVisibleProperty, static (CapsVm caps) => caps.ForegroundOnly);
 
         var monitorCard = Theme.Card(new VerticalStackLayout
         {
@@ -238,9 +238,11 @@ public sealed class HomePage : ContentPage
     {
         _feed.Children.Clear();
         var items = _state.Rollcalls
-            .Select(r => (r.DetectedAt, view: FeedRow("點名", r, r.Course, () => ((AppShell)Shell.Current).OpenRollcallDetail(r), nameof(RollcallVm.StatusText))))
+            .Select(r => (r.DetectedAt, view: FeedRow("點名", r, r.Course, () => ((AppShell)Shell.Current).OpenRollcallDetail(r),
+                static l => l.SetBinding(Label.TextProperty, static (RollcallVm v) => v.StatusText))))
             .Concat(_state.Quizzes
-                .Select(q => (q.DetectedAt, view: FeedRow("答題", q, q.Course, () => ((AppShell)Shell.Current).OpenQuizDetail(q), nameof(QuizVm.StatusText)))))
+                .Select(q => (q.DetectedAt, view: FeedRow("答題", q, q.Course, () => ((AppShell)Shell.Current).OpenQuizDetail(q),
+                    static l => l.SetBinding(Label.TextProperty, static (QuizVm v) => v.StatusText)))))
             .OrderByDescending(x => x.DetectedAt)
             .Take(8)
             .ToList();
@@ -252,11 +254,14 @@ public sealed class HomePage : ContentPage
         foreach (var (_, view) in items) _feed.Children.Add(view);
     }
 
-    static View FeedRow(string kind, ObservableObject vm, string course, Func<Task> open, string statusPath)
+    /// 綁定動作由呼叫端傳入,而不是傳字串路徑或 getter 委派:字串路徑要靠反射解析(full trim /
+    /// NativeAOT 下屬性會被砍掉,綁定靜默失效),而 MAUI 的 bindings source generator 要求 lambda
+    /// 必須「字面」出現在 SetBinding 呼叫點(傳委派會得到 BSG0002),所以 lambda 留在呼叫端。
+    static View FeedRow(string kind, ObservableObject vm, string course, Func<Task> open, Action<Label> bindStatus)
     {
         var status = Theme.Dim("", 12);
         status.BindingContext = vm;
-        status.SetBinding(Label.TextProperty, statusPath);
+        bindStatus(status);
 
         var grid = new Grid { ColumnSpacing = 10 };
         grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));

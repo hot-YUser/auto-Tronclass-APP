@@ -150,7 +150,7 @@ public sealed class SettingsPage : ContentPage
         BindableLayout.SetItemTemplate(logs, new DataTemplate(() =>
         {
             var l = Theme.Dim("", 11);
-            l.SetBinding(Label.TextProperty, nameof(LogEntry.Display));
+            l.SetBinding(Label.TextProperty, static (LogEntry entry) => entry.Display);
             return l;
         }));
         SyncLogEmpty();

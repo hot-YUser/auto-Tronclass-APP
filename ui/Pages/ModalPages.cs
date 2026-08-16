@@ -211,9 +211,9 @@ public sealed class HeroQuizPage : ModalPageBase
         var stack = new VerticalStackLayout { Spacing = 12, BindingContext = vm };
 
         var conflictLabel = Theme.Text("", 13, Theme.FontSemibold, Theme.WarnL, Theme.WarnD);
-        conflictLabel.SetBinding(Label.TextProperty, nameof(QuizVm.ConflictText));
+        conflictLabel.SetBinding(Label.TextProperty, static (QuizVm quiz) => quiz.ConflictText);
         var conflictCard = Theme.TintCard(conflictLabel, Theme.WarnBgL, Theme.WarnBgD, Theme.WarnL, Theme.WarnD);
-        conflictCard.SetBinding(IsVisibleProperty, nameof(QuizVm.HasConflicts));
+        conflictCard.SetBinding(IsVisibleProperty, static (QuizVm quiz) => quiz.HasConflicts);
 
         var big = Centered(Theme.Text("", 46, Theme.FontSemibold, Theme.PrimL, Theme.PrimD));
         void UpdateBig()
@@ -223,7 +223,7 @@ public sealed class HeroQuizPage : ModalPageBase
         }
 
         var submit = Theme.Primary("立即送出", () => state.SubmitNow(vm));
-        submit.SetBinding(IsEnabledProperty, nameof(QuizVm.CanSubmit));
+        submit.SetBinding(IsEnabledProperty, static (QuizVm quiz) => quiz.CanSubmit);
 
         stack.Children.Add(Header("偵測到測驗", _collapse));
         stack.Children.Add(Centered(Theme.Strong(vm.Course, 20)));

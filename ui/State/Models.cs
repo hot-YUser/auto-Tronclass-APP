@@ -3,7 +3,7 @@ using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
+using TronClass.Interop;
 
 namespace Ui;
 
@@ -363,30 +363,38 @@ public sealed record QuestionOptionVm(string Id, string Text);
 
 /// <summary>
 /// UI ↔ core 的唯一答案 wire model。保留答案種類，避免把選項 ID、填空陣列與自由文字
-/// 壓成不可逆字串；屬性名稱直接對齊 Rust <c>AnswerWire</c>。
+/// 壓成不可逆字串；欄位名稱直接對齊 Rust <c>AnswerWire</c>。
+/// 讀寫都手寫且成對:<see cref="FromJson"/> 讀、<see cref="WriteTo"/> 寫,欄位名只在這兩處出現,
+/// 不靠反射屬性推導(NativeAOT 下反射序列化不可用,見 <see cref="JsonWire"/>)。
 /// </summary>
-public sealed record AnswerWire
+public sealed record AnswerWire : IWireValue
 {
-    [JsonPropertyName("kind")]
     public required string Kind { get; init; }
-
-    [JsonPropertyName("option_ids")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? OptionIds { get; init; }
-
-    [JsonPropertyName("values")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Values { get; init; }
-
-    [JsonPropertyName("value")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Value { get; init; }
-
-    [JsonPropertyName("letters")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Letters { get; init; }
 
-    [JsonIgnore]
+    /// <summary>寫出與 <see cref="FromJson"/> 對稱的形狀:null 成員整個略過,不送 <c>null</c>。</summary>
+    public void WriteTo(Utf8JsonWriter writer)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("kind", Kind);
+        WriteArray(writer, "option_ids", OptionIds);
+        WriteArray(writer, "values", Values);
+        if (Value is not null) writer.WriteString("value", Value);
+        WriteArray(writer, "letters", Letters);
+        writer.WriteEndObject();
+    }
+
+    static void WriteArray(Utf8JsonWriter writer, string name, string[]? items)
+    {
+        if (items is null) return;
+        writer.WriteStartArray(name);
+        foreach (var item in items) writer.WriteStringValue(item);
+        writer.WriteEndArray();
+    }
+
     public string Display => Kind switch
     {
         "options" => string.Join(", ", OptionIds ?? []),

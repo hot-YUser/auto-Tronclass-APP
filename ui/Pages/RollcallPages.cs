@@ -75,11 +75,11 @@ sealed class RollcallRow : Border
         if (BindingContext is not RollcallVm vm) { Content = null; return; }
 
         var (emblem, glyph) = Theme.Emblem();
-        glyph.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.KindEmblem), source: vm));
+        glyph.SetBinding(Label.TextProperty, static (RollcallVm rollcall) => rollcall.KindEmblem, source: vm);
 
         var course = Theme.Strong("", 15.5);
         course.VerticalOptions = LayoutOptions.Center;
-        course.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.Course), source: vm));
+        course.SetBinding(Label.TextProperty, static (RollcallVm rollcall) => rollcall.Course, source: vm);
 
         var statusPill = new StatusPill(vm, () => RollcallToneOf(vm), nameof(RollcallVm.StatusTag));
         statusPill.VerticalOptions = LayoutOptions.Center;
@@ -92,7 +92,7 @@ sealed class RollcallRow : Border
         header.Add(statusPill, 1, 0);
 
         var meta = Theme.Dim("", 12.5);
-        meta.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.MetaText), source: vm));
+        meta.SetBinding(Label.TextProperty, static (RollcallVm rollcall) => rollcall.MetaText, source: vm);
 
         var chips = new ChipsView(vm.Accounts,
             o => { var a = (RollcallAccountVm)o; return (a.ChipText, a.Signed); },
@@ -130,9 +130,9 @@ public sealed class RollcallDetailPage : ContentPage
 
         // --- 大標頭 ---
         var (emblem, glyph) = Theme.Emblem(46);
-        glyph.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.KindEmblem), source: vm));
+        glyph.SetBinding(Label.TextProperty, static (RollcallVm rollcall) => rollcall.KindEmblem, source: vm);
         var metaLabel = Theme.Dim("", 13);
-        metaLabel.SetBinding(Label.TextProperty, new Binding(nameof(RollcallVm.MetaText), source: vm));
+        metaLabel.SetBinding(Label.TextProperty, static (RollcallVm rollcall) => rollcall.MetaText, source: vm);
         var titleCol = new VerticalStackLayout
         {
             Spacing = 3,
@@ -162,7 +162,7 @@ public sealed class RollcallDetailPage : ContentPage
             Spacing = 12,
             Children = { new CountdownView(vm, "自動簽到", 14), actionRow },
         });
-        countingCard.SetBinding(IsVisibleProperty, nameof(RollcallVm.IsCounting));
+        countingCard.SetBinding(IsVisibleProperty, static (RollcallVm rollcall) => rollcall.IsCounting);
 
         var pendingCard = Theme.TintCard(new VerticalStackLayout
         {
@@ -173,19 +173,21 @@ public sealed class RollcallDetailPage : ContentPage
                 Theme.Primary("立即補簽", () => state.SignNow(vm)),
             },
         }, Theme.WarnBgL, Theme.WarnBgD, Theme.WarnL, Theme.WarnD);
-        pendingCard.SetBinding(IsVisibleProperty, nameof(RollcallVm.IsPending));
+        pendingCard.SetBinding(IsVisibleProperty, static (RollcallVm rollcall) => rollcall.IsPending);
 
         var doneCard = Theme.TintCard(
             Theme.Text("✓ 已完成簽到", 14, Theme.FontSemibold, Theme.OkL, Theme.OkD),
             Theme.OkBgL, Theme.OkBgD, Theme.OkL, Theme.OkD);
-        doneCard.SetBinding(IsVisibleProperty, nameof(RollcallVm.IsDone));
+        doneCard.SetBinding(IsVisibleProperty, static (RollcallVm rollcall) => rollcall.IsDone);
 
         var info = Theme.Card(new VerticalStackLayout
         {
             Spacing = 8,
             Children =
             {
-                KeyValueBound("全班簽到率", nameof(RollcallVm.AttendanceRateText)), // 未達門檻時每秒重查,要活的
+                // 未達門檻時每秒重查,要活的
+                KeyValueBound("全班簽到率",
+                    static l => l.SetBinding(Label.TextProperty, static (RollcallVm r) => r.AttendanceRateText)),
                 KeyValue("偵測時間", vm.DetectedAt.ToString("yyyy/M/d HH:mm:ss")),
                 KeyValue("平台", vm.BaseUrl),
             },
@@ -219,10 +221,12 @@ public sealed class RollcallDetailPage : ContentPage
     static Grid KeyValue(string key, string value) => KeyValueView(key, Theme.Body(value));
 
     /// 值會變的欄位:綁 VM 屬性(頁面 BindingContext = vm),而不是建構當下的快照。
-    static Grid KeyValueBound(string key, string path)
+    /// 綁定動作由呼叫端傳入 —— 字串路徑要靠反射解析(full trim / NativeAOT 下會被砍掉),而
+    /// MAUI 的 bindings source generator 要求 lambda 必須字面出現在 SetBinding 呼叫點(BSG0002)。
+    static Grid KeyValueBound(string key, Action<Label> bindValue)
     {
         var v = Theme.Body("");
-        v.SetBinding(Label.TextProperty, path);
+        bindValue(v);
         return KeyValueView(key, v);
     }
 

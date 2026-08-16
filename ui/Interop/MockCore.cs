@@ -1,3 +1,7 @@
+// Debug-only。這支從未註冊進 DI(MauiProgram 只綁 NativeCore),要用是手動改那一行 —— 而那
+// 只發生在設計時預覽/hot reload,也就是 Debug。Release 編它進去只有壞處:一份用不到的死碼,
+// 外加它的反射式 JsonSerializer 會讓整個組件無法通過 NativeAOT/full-trim 分析(IL2026/IL3050)。
+#if DEBUG
 using System.Text.Json;
 
 namespace TronClass.Interop;
@@ -249,5 +253,11 @@ public sealed class MockCore : ICore
         EventReceived?.Invoke(el);
     }
 
+    // 這裡刻意保留反射式序列化:mock 的 payload 是一堆一次性匿名型別,手寫 writer 只會讓
+    // 「照著真核心 wire 格式抄」這件事更難看清楚。豁免範圍僅此一個方法,而且整個 MockCore
+    // 只存在於 Debug(見檔頭 #if DEBUG),永遠不會進入 NativeAOT/trim 的出貨路徑。
+#pragma warning disable IL2026, IL3050 // Debug-only 設計時假核心,不出貨
     private static JsonElement Json(object o) => JsonSerializer.SerializeToElement(o);
+#pragma warning restore IL2026, IL3050
 }
+#endif

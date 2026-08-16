@@ -4,11 +4,12 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- 這支檢查的存在意義就是「不靠反射也能序列化」；開著分析器,任何回頭用
+         JsonSerializer 反射路徑的改動都會在這裡先亮警告。 -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\..\..\ui\Interop\JsonWire.cs" Link="JsonWire.cs" />
     <Compile Include="..\..\..\ui\State\Models.cs" Link="Models.cs" />
-    <Compile Include="..\..\..\ui\Interop\QuizPreparedContract.cs" Link="QuizPreparedContract.cs" />
-    <None Include="..\..\..\core\src\assets\quiz_prepared_v1.json" Link="quiz_prepared_v1.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

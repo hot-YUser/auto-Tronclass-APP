@@ -63,6 +63,9 @@ jobs:
       - name: Run protocol contract check
         shell: pwsh
         run: dotnet run --project tools/checks/ProtocolContract.Check/ProtocolContract.Check.csproj -c Release
+      - name: Run command wire check
+        shell: pwsh
+        run: dotnet run --project tools/checks/CommandWire.Check/CommandWire.Check.csproj -c Release
       - name: Run device-key check
         shell: pwsh
         run: dotnet run --project tools/checks/DeviceKey.Check/DeviceKey.Check.csproj -c Release
