@@ -2,6 +2,7 @@ using Android.App;
 using Android.Content;
 using Android.Content.PM;
 using Android.OS;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Ui;
 
@@ -20,5 +21,19 @@ public class MainActivity : MauiAppCompatActivity
         {
             RequestPermissions(new[] { Android.Manifest.Permission.PostNotifications }, 1001);
         }
+    }
+
+    protected override void OnResume()
+    {
+        base.OnResume();
+        AndroidScheduleAlarms.RescheduleStored(this, fromBoot: false);
+        if (IPlatformApplication.Current?.Services.GetService<AppState>() is { } state)
+            _ = ResumeCoreAsync(state);
+    }
+
+    static async Task ResumeCoreAsync(AppState state)
+    {
+        await state.BootAsync();
+        await state.ResumeScheduleAsync();
     }
 }
