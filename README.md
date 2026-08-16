@@ -7,18 +7,19 @@ v1 行為基準保留在 [auto-rollcall-thu-tronclass](https://github.com/hot-YU
 
 ## 目前支援範圍
 
-- Windows x64：可攜式資料夾（portable）與開發用的 setup/MSIX 建置路徑。
-- Android：arm64-v8a 與 x86_64 APK；監控時使用 Android `dataSync` 前景服務。
-- Rust native core 與 MAUI UI 透過版本化 JSON/FFI 事件溝通；活動使用不透明 `activity_token`，避免只靠租戶內裸 ID。
+- Windows x64：可攜式資料夾（portable）與開發用的 setup/MSIX 建置路徑；App 存活時執行排程。
+- Android：arm64-v8a 與 x86_64 APK；精準鬧鐘喚醒後使用 `dataSync` 前景服務。
+- 學生可建立個人 target 與同租戶群組；每個 target 有獨立時間表、手動開始／停止，群組偵測後由各成員自己的 session 執行。
+- Rust native core 與 MAUI UI 只以版本化命令及封閉 `MonitoringSnapshot` 溝通；活動使用不透明 `activity_token`，避免只靠租戶內裸 ID。
 - 點名與測驗流程仍取決於目標 TronClass 租戶的實際 API、權限與活動設定。QR、教師輔助、LLM、各題型和特殊租戶行為不可在沒有實機契約測試時宣稱「完整支援」。
 
 ## 使用流程
 
 1. 從 GitHub Releases 下載對應平台產物，或依下方建置步驟自行建置。
-2. 首次啟動，在「帳號」頁新增有權限的 TronClass 帳號；不要把密碼、Cookie、vault 或 API key 貼到 Issue、截圖或聊天中。
-3. 在「設定」頁選擇監控時段、點名門檻與答題/LLM 選項。LLM 是可選功能；沒有有效金鑰時應略過答題，不會以空白答案提交。
-4. 回到首頁按「開始監控」。點名、測驗、錯誤與警告會出現在首頁、點名/答題分頁及日誌；需要人工決定的活動可在詳細頁介入。
-5. 需要停止時按「停止監控」。停止後應確認 UI 狀態回到待命；若 Android 曾觸發系統時限，重新開啟 App 後由使用者再次啟動。
+2. 在「帳號」頁新增帳號；新增後會立即驗證，失敗帳號仍會保留供重新驗證或 Cookie 登入。不要把密碼、Cookie、vault 或 API key 貼到 Issue、截圖或聊天中。
+3. 在「監控」建立同租戶學生群組，為個人／群組選擇「停用、跟隨全局、自訂」時間表；全局時間表與 Device／Named IANA 時區位於「設定」。
+4. 各 target 可個別立即開始／停止；群組重疊時依畫面選擇暫時去重或永久合併。點名、測驗、錯誤與警告會出現在監控、點名／答題分頁及日誌。
+5. 「一鍵停止全部」會跨重啟保留；「恢復照時間表」會清除手動 override 並重新計算排程。
 
 ## Windows
 
@@ -34,14 +35,14 @@ setup/MSIX 是目前的發行或開發路徑，請以 Releases 的說明為準�
 
 - portable：`<Ui.exe 所在資料夾>\\Data\\`。
 - 安裝/開發：`%LOCALAPPDATA%\\AutoTronclass\\Data\\`。
-- 保險庫（vault）與設定由 Rust 保存；裝置金鑰在 Windows 使用目前使用者的 DPAPI（CurrentUser）保護，另以原子寫入與毀損隔離避免把壞檔當成首次啟動。
+- 保險庫（vault）與設定由 Rust 保存；裝置金鑰在 Windows 使用目前使用者的 DPAPI（CurrentUser）保護。設定以原子方式寫入；只對精確舊 schema 先備份再重設，毀損或未來 schema 保持原檔並拒絕啟動。
 - portable 只代表資料跟著資料夾走，不代表可跨電腦或跨 Windows 使用者解密。DPAPI 仍綁定原裝置/使用者；搬移前請使用應用程式支援的匯出/復原流程，不要手動複製秘密檔期待能解密。
 
 ## Android
 
-Android 使用平台沙盒資料夾與 Android Keystore 產生的 AES-GCM 裝置金鑰；應用程式不把 vault/金鑰加入 Android 自動備份。前景服務會顯示持續通知，程序死亡或服務逾時後不會偷偷恢復監控。
+Android 使用平台沙盒資料夾與 Android Keystore 產生的 AES-GCM 裝置金鑰；應用程式不把 vault／金鑰加入 Android 自動備份。只有授予「精準鬧鐘」特殊權限時，未來排程邊界才能自動啟動前景服務；未授權時只發可點擊通知。Force-stop 會停用鬧鐘與 receiver，必須重新開啟 App；API 35+ 重新開機若已落在有效時段內也只通知，不由 `BOOT_COMPLETED` 直接啟動 `dataSync`。
 
-Android API 35 以上的 `dataSync` 前景服務有系統配額：每個滾動 24 小時最多執行 6 小時。達到時限時，服務會停止並通知使用者；請開啟 App、確認狀態，再由使用者手動重新啟動。這是平台限制，不是可以由本專案保證繞過的錯誤。詳見 [Android 前景服務時限文件](https://developer.android.com/develop/background-work/services/fgs/timeout) 與 [前景服務類型文件](https://developer.android.com/develop/background-work/services/fgs/service-types)。
+Android API 35 以上的 `dataSync` 前景服務有系統配額：每個滾動 24 小時最多執行 6 小時。達到時限時只停止新偵測、保存 platform block、立即結束服務；已取得 mutation 許可的請求不會被宣稱已撤回。使用者回到前景或後續精準鬧鐘成功完成 cold-start clock handshake 後才清除 block。這是平台限制，不能繞過。詳見 [Android 前景服務時限文件](https://developer.android.com/develop/background-work/services/fgs/timeout) 與 [前景服務類型文件](https://developer.android.com/develop/background-work/services/fgs/service-types)。
 
 ## LLM 設定
 
@@ -64,7 +65,7 @@ Rust core（登入、持久化、監控、點名、測驗、LLM、redaction）
         └─ Android: libtronclass_core.so（arm64-v8a / x86_64）
 ```
 
-`core/src/assets/quiz_prepared_v1.json` 是 Rust 與 C# 共用的 golden fixture。跨邊界變更必須同時更新核心、UI、Mock/檢查器與測試，不應只修改其中一端。
+`core/src/assets/quiz_prepared_v1.json` 與 `core/src/assets/monitoring_snapshot_v1.json` 是 Rust、C# parser、Native cache 與 Debug Mock 共用的 golden fixtures。跨邊界變更必須同時更新核心、UI、Mock／檢查器與測試。
 
 ## 從原始碼建置與測試
 
@@ -110,7 +111,7 @@ Subject: CN=Auto TronClass, OU=Dev, O=hot-YUser, C=TW
 
 ## 目前限制
 
-Windows 目前是前景程序模型；關閉視窗就停止監控，不提供 tray／背景常駐。Android 的前景服務仍受系統時限與程序生命週期約束。完整 Android release 另依賴本機私有 keystore 與密碼配對，這些秘密不在 Repository，因此 CI 只驗證未簽 Windows 發行路徑。
+Windows 目前是前景程序模型；關閉視窗就停止監控，不提供 tray／開機常駐。Android 自動喚醒依賴使用者授予精準鬧鐘特殊權限，且仍受 Force-stop、API 35 reboot 限制、`dataSync` 六小時配額與程序生命週期約束。完整 Android release 另依賴本機私有 keystore 與密碼配對；秘密不在 Repository，因此 CI 只驗證未簽 Windows 發行路徑。
 
 ## 授權
 
