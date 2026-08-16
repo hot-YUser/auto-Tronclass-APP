@@ -459,23 +459,38 @@ fn handle_sync(core: &Core, cmd: Command) {
             ..
         } => {
             let dir = PathBuf::from(&data_dir);
-            let _ = std::fs::create_dir_all(&dir);
+            // 建目錄失敗是後續每一步失敗的根因,不能像以前那樣 `let _ =` 丟掉 —— 那會讓
+            // 真正的原因(權限/唯讀/路徑不存在)完全消失,只剩下游一句黑箱訊息。
+            let dir_error = std::fs::create_dir_all(&dir).err();
             let registry = match Registry::load_or_seed(&dir.join("providers.json")) {
-                Ok(registry) => registry,
-                // Fixed message — the loader's error bundles the serde literal, which can echo file
-                // content verbatim; nothing from the file may cross the seam.
-                Err(_) => {
+                Ok(loaded) => {
+                    // 播種沒能保存:App 照常啟動(內容全部來自內建種子),只是把話講清楚。
+                    if let Some(warning) = loaded.persist_warning {
+                        emit(
+                            cb,
+                            &json!({ "id": null, "event": "Error", "severity": "warn",
+                            "code": "providers_not_persisted",
+                            "message": format!(
+                                "學校清單未能保存（{warning}）；本次使用內建清單，之後新增的學校不會被保存"
+                            ) }),
+                        );
+                    }
+                    loaded.registry
+                }
+                Err(error) => {
+                    // safe_detail 只含操作名與 errno:serde 的錯誤(可能逐字回吐檔案內容)
+                    // 一律收斂成固定描述,IO 失敗則據實以告,讓這類問題可被診斷。
+                    let mut message =
+                        format!("providers registry unavailable：{}", error.safe_detail());
+                    if let Some(dir_error) = &dir_error {
+                        message.push_str(&format!("；資料目錄建立失敗（{:?}）", dir_error.kind()));
+                    }
                     emit(
                         cb,
                         &json!({ "id": null, "event": "Error", "severity": "error",
-                        "code": "providers_unavailable", "message": "providers registry unavailable" }),
+                        "code": "providers_unavailable", "message": message }),
                     );
-                    return reply(
-                        cb,
-                        id,
-                        false,
-                        Some("providers registry unavailable".to_string()),
-                    );
+                    return reply(cb, id, false, Some(message));
                 }
             };
             let config_path = dir.join("config.json");
@@ -2395,7 +2410,9 @@ mod tests {
         config: Config,
         vault: Option<VaultFile>,
     ) -> Arc<Mutex<Option<CoreState>>> {
-        let registry = Registry::load_or_seed(&data_dir.join("providers.json")).unwrap();
+        let registry = Registry::load_or_seed(&data_dir.join("providers.json"))
+            .unwrap()
+            .registry;
         Arc::new(Mutex::new(Some(CoreState {
             data_dir,
             registry,
