@@ -46,18 +46,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"]
-                .as_array()?
-                .iter()
-                .find(|a| a["label"] == label)
-            {
-                return a["id"].as_str().map(str::to_string);
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -131,10 +120,7 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(reply_ok(i), 5);
     let i = hz.next();
     send(
@@ -151,11 +137,13 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     );
     wait_for(reply_ok(i), 5);
     let dave = account_id("dave").unwrap();
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(reply_ok(i), 15);
+    let clock_id = hz.next();
+    let start_id = hz.next();
+    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    wait_for(reply_ok(clock_id), 5);
+    wait_for(reply_ok(start_id), 15);
     wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
         10,
     );
     (hz, dave)

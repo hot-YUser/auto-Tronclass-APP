@@ -53,18 +53,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"]
-                .as_array()?
-                .iter()
-                .find(|a| a["label"] == label)
-            {
-                return a["id"].as_str().map(str::to_string);
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -132,10 +121,7 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     let i = hz.next();
     send(
@@ -152,11 +138,13 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
     );
     wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let dave = account_id("dave").unwrap();
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
+    let clock_id = hz.next();
+    let start_id = hz.next();
+    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
+    wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
         10,
     )
     .expect("帳號未上線");
@@ -277,11 +265,10 @@ fn per_family_detection_and_gates() {
 fn sso_redirect_login_resolves_relative_action() {
     let _g = SEQ.lock().unwrap();
     let base = start_fake();
-    post(&base, "/_test/sso_redirect", r#"{"enabled":true}"#); // before StartMonitoring logs in
-    let (hz, _dave) = boot("sso", &base, 30, 1);
-    // boot() already waited for AccountStatus online; reaching here means the relative-action POST worked.
+    post(&base, "/_test/sso_redirect", r#"{"enabled":true}"#); // target activation logs in
+    let (hz, dave) = boot("sso", &base, 30, 1);
     assert!(
-        any(|v| v["event"] == "AccountStatus" && v["state"] == "online"),
+        any(|v| crate::test_support::event_account_login_state(v, &dave, "online")),
         "SSO relative-action login came online"
     );
     drop(hz);
@@ -293,12 +280,12 @@ fn sso_redirect_login_resolves_relative_action() {
 fn session_expiry_recovers_to_online() {
     let _g = SEQ.lock().unwrap();
     let base = start_fake();
-    let (hz, _dave) = boot("expire", &base, 30, 1);
-    events().lock().unwrap().clear(); // drop the startup 'online' so we assert the RECOVERY one
+    let (hz, dave) = boot("expire", &base, 30, 1);
+    events().lock().unwrap().clear(); // drop the startup online so we assert the recovery snapshot
     post(&base, "/_test/expire", r#"{"expired":true}"#);
     assert!(
         wait_for(
-            |v| v["event"] == "AccountStatus" && v["state"] == "online",
+            |v| crate::test_support::event_account_login_state(v, &dave, "online"),
             20
         )
         .is_some(),
@@ -311,8 +298,8 @@ fn session_expiry_recovers_to_online() {
 /// 200-login-page mode already covered) — each re-logins back to online.
 fn expiry_mode_recovers(tag: &str, mode: &str) {
     let base = start_fake();
-    let (hz, _dave) = boot(tag, &base, 30, 1);
-    events().lock().unwrap().clear(); // drop the startup online so we assert the RECOVERY one
+    let (hz, dave) = boot(tag, &base, 30, 1);
+    events().lock().unwrap().clear();
     post(
         &base,
         "/_test/expire",
@@ -320,7 +307,7 @@ fn expiry_mode_recovers(tag: &str, mode: &str) {
     );
     assert!(
         wait_for(
-            |v| v["event"] == "AccountStatus" && v["state"] == "online",
+            |v| crate::test_support::event_account_login_state(v, &dave, "online"),
             20
         )
         .is_some(),
@@ -345,26 +332,34 @@ fn expiry_redirect_recovers_to_online() {
 fn transient_down_then_ok_clears_stale_offline() {
     let _g = SEQ.lock().unwrap();
     let base = start_fake();
-    let (hz, _dave) = boot("staleoff", &base, 30, 1);
+    let (hz, dave) = boot("staleoff", &base, 30, 1);
     events().lock().unwrap().clear();
     post(&base, "/_test/down", r#"{"enabled":true}"#);
     assert!(
         wait_for(
-            |v| v["event"] == "AccountStatus" && v["state"] == "offline",
-            15
+            |v| crate::test_support::event_account_login_state(v, &dave, "error"),
+            3
         )
-        .is_some(),
-        "503 blip → offline"
+        .is_none(),
+        "暫時 transport 失敗不得冒充 terminal login error"
     );
-    events().lock().unwrap().clear();
     post(&base, "/_test/down", r#"{"enabled":false}"#);
+    post(
+        &base,
+        "/_test/open_rollcall",
+        r#"{"id":"RC_RECOVER","kind":"self_registration","attendance_rate":100.0}"#,
+    );
     assert!(
         wait_for(
-            |v| v["event"] == "AccountStatus" && v["state"] == "online",
+            |v| {
+                v["event"] == "SignedIn"
+                    && v["rollcall_id"] == "RC_RECOVER"
+                    && v["account_id"] == dave
+            },
             15
         )
         .is_some(),
-        "recovery → online (edge-triggered)"
+        "transport recovery resumes detection without a false login-state transition"
     );
     drop(hz);
 }
@@ -466,11 +461,7 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         r#"{"id":2,"cmd":"UpdateConfig","patch":{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"prepare_retry_budget_secs":30}}"#,
         "UpdateConfig",
     );
-    step(
-        &mut hz,
-        r#"{"id":3,"cmd":"CreateVault","master_password":"pw"}"#,
-        "CreateVault",
-    );
+    step(&mut hz, r#"{"id":3,"cmd":"CreateVault"}"#, "CreateVault");
     step(
         &mut hz,
         &format!(
@@ -492,11 +483,21 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         "/_test/expire_signs",
         r#"{"enabled":true,"user":"bb"}"#,
     ); // only B's signs expire
-    step(
-        &mut hz,
-        r#"{"id":6,"cmd":"StartMonitoring"}"#,
-        "StartMonitoring",
+    let clock_id = hz.next();
+    let clock = crate::test_support::apply_clock_command(
+        clock_id,
+        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
     );
+    send(hz.h, &clock);
+    wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
+    for account in [&a, &b] {
+        let start_id = hz.next();
+        send(
+            hz.h,
+            &crate::test_support::start_account_command(start_id, account),
+        );
+        wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
+    }
     post(
         &base,
         "/_test/open_rollcall",

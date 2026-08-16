@@ -45,16 +45,7 @@ fn send(handle: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(handle, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(list) = ev["accounts"].as_array() {
-                if let Some(a) = list.iter().find(|a| a["label"] == label) {
-                    return a["id"].as_str().map(str::to_string);
-                }
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 fn signed(rollcall_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (account, rollcall_id) = (account.to_string(), rollcall_id.to_string());
@@ -114,39 +105,65 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
 
     let h = crate::core_init(Some(collect));
     let mut id = 0u64;
-    let mut cmd = |body: String| {
-        id += 1;
-        let this = id;
-        send(h, &format!(r#"{{"id":{this},{body}}}"#));
-        assert!(
-            wait_for(
-                move |v| v["event"] == "Reply" && v["id"] == this && v["ok"] == true,
-                15
-            )
-            .is_some(),
-            "command {this} ok; events={:?}",
-            snapshot()
-        );
-    };
+    {
+        let mut cmd = |body: String| {
+            id += 1;
+            let this = id;
+            send(h, &format!(r#"{{"id":{this},{body}}}"#));
+            assert!(
+                wait_for(
+                    move |v| v["event"] == "Reply" && v["id"] == this && v["ok"] == true,
+                    15
+                )
+                .is_some(),
+                "command {this} ok; events={:?}",
+                snapshot()
+            );
+        };
 
-    cmd(format!(r#""cmd":"Init","data_dir":"{data_dir}""#));
-    cmd(r#""cmd":"UpdateConfig","patch":{"countdown_secs":1,"poll_idle_secs":1}"#.to_string());
-    cmd(r#""cmd":"CreateVault","master_password":"pw""#.to_string());
-    // Teacher lives on teacher_base; the monitored student lives on a DIFFERENT host.
-    cmd(format!(
-        r#""cmd":"AddAccount","label":"teacher","school":"{teacher_base}","username":"teacher","password":"secret","is_teacher":true,"course_id":"C1""#
-    ));
-    cmd(format!(
-        r#""cmd":"AddAccount","label":"student","school":"{student_base}","username":"student","password":"secret""#
-    ));
+        cmd(format!(r#""cmd":"Init","data_dir":"{data_dir}""#));
+        cmd(r#""cmd":"UpdateConfig","patch":{"countdown_secs":1,"poll_idle_secs":1}"#.to_string());
+        cmd(r#""cmd":"CreateVault""#.to_string());
+        // Teacher lives on teacher_base; the monitored student lives on a DIFFERENT host.
+        cmd(format!(
+            r#""cmd":"AddAccount","label":"teacher","school":"{teacher_base}","username":"teacher","password":"secret","is_teacher":true,"course_id":"C1""#
+        ));
+        cmd(format!(
+            r#""cmd":"AddAccount","label":"student","school":"{student_base}","username":"student","password":"secret""#
+        ));
+    }
+    let teacher = account_id("teacher").expect("teacher account id");
     let student = account_id("student").expect("student account id");
-
-    cmd(r#""cmd":"StartMonitoring""#.to_string());
+    let teacher_login_id = id + 1;
+    send(
+        h,
+        &format!(r#"{{"id":{teacher_login_id},"cmd":"Login","account_id":"{teacher}"}}"#),
+    );
     assert!(wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
-        10
+        move |v| { v["event"] == "LoginResult" && v["id"] == teacher_login_id && v["ok"] == true },
+        15
     )
     .is_some());
+    let clock_id = id + 2;
+    let start_id = id + 3;
+    crate::test_support::activate_account(h, clock_id, start_id, &snapshot(), &student);
+    assert!(wait_for(
+        move |v| v["event"] == "Reply" && v["id"] == clock_id && v["ok"] == true,
+        5
+    )
+    .is_some());
+    assert!(wait_for(
+        move |v| v["event"] == "Reply" && v["id"] == start_id && v["ok"] == true,
+        15
+    )
+    .is_some());
+    for account in [&teacher, &student] {
+        assert!(wait_for(
+            |v| crate::test_support::event_account_login_state(v, account, "online"),
+            10
+        )
+        .is_some());
+    }
 
     // --- Phase 1: happy cross-endpoint path ---
     // The teacher (base_a) sources the token; the student (base_b) signs on its OWN endpoint. A latent

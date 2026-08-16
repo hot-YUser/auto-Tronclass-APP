@@ -6,7 +6,9 @@
 //! path (that would corrupt the user's real key into `[redacted]`; docs 90 §4). Also holds the global
 //! logging level so `debug` lines are dropped unless the user opted into debug logging.
 
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 pub type EventCb = extern "C" fn(*const u8, usize);
@@ -39,6 +41,7 @@ pub fn set_level(level: &str) {
     );
 }
 
+#[cfg(test)]
 fn is_debug() -> bool {
     LOG_LEVEL.load(Ordering::Relaxed) == 1
 }
@@ -70,6 +73,7 @@ pub fn emit(cb: EventCb, v: &Value) {
 
 /// Leveled log line (docs 20 `LogLine` = already-redacted). `debug` lines are dropped unless the
 /// current level is debug; everything goes through `emit` so it is redacted like any other event.
+#[cfg(test)]
 pub fn log_line(cb: EventCb, level: &str, text: &str) {
     if level.eq_ignore_ascii_case("debug") && !is_debug() {
         return;

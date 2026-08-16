@@ -53,16 +53,7 @@ fn send(handle: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(handle, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(list) = ev["accounts"].as_array() {
-                if let Some(a) = list.iter().find(|a| a["label"] == label) {
-                    return a["id"].as_str().map(str::to_string);
-                }
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 
 fn start_fake() -> String {
@@ -151,10 +142,7 @@ fn slice2_multi_account_monitoring_and_four_types() {
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = next();
-    send(
-        h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
 
     // Four accounts: alice/bob on A (students), a teacher on A (for QR), carol on B.
@@ -175,17 +163,31 @@ fn slice2_multi_account_monitoring_and_four_types() {
     }
     let alice = account_id("alice").unwrap();
     let bob = account_id("bob").unwrap();
+    let teacher = account_id("teacher").unwrap();
     let carol = account_id("carol").unwrap();
 
-    let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
-    // all four should authenticate
-    wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
-        10,
-    )
-    .expect("帳號未上線");
+    let clock_id = next();
+    let clock = crate::test_support::apply_clock_command(
+        clock_id,
+        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
+    );
+    send(h, &clock);
+    wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
+    for account in [&alice, &bob, &carol] {
+        let start_id = next();
+        send(
+            h,
+            &crate::test_support::start_account_command(start_id, account),
+        );
+        wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
+    }
+    for account in [&alice, &bob, &teacher, &carol] {
+        wait_for(
+            |v| crate::test_support::event_account_login_state(v, account, "online"),
+            10,
+        )
+        .unwrap_or_else(|| panic!("{account} 未上線"));
+    }
 
     // --- number rollcall on A, visible to alice+bob → both sign, merged into one activity ---
     open_rollcall(
@@ -384,7 +386,7 @@ fn slice2_multi_account_monitoring_and_four_types() {
     assert_eq!(missing["ok"], false);
 
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"StopMonitoring"}}"#));
+    send(h, &crate::test_support::stop_all_command(i));
     wait_for(reply_ok(i), 5);
     unsafe { crate::core_free(h) };
 }

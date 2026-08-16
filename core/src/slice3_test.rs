@@ -45,18 +45,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"]
-                .as_array()?
-                .iter()
-                .find(|a| a["label"] == label)
-            {
-                return a["id"].as_str().map(str::to_string);
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 fn submitted(quiz_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (q, a) = (quiz_id.to_string(), account.to_string());
@@ -122,10 +111,7 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     );
     wait_for(reply_ok(i), 5);
     let i = next();
-    send(
-        h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(reply_ok(i), 5);
     let i = next();
     send(
@@ -147,13 +133,25 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     let alice = account_id("alice").unwrap();
     let bob = account_id("bob").unwrap();
 
-    let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    assert!(wait_for(reply_ok(i), 15).is_some());
-    wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
-        10,
+    let clock_id = next();
+    let clock = crate::test_support::apply_clock_command(
+        clock_id,
+        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
     );
+    send(h, &clock);
+    assert!(wait_for(reply_ok(clock_id), 5).is_some());
+    for account in [&alice, &bob] {
+        let start_id = next();
+        send(
+            h,
+            &crate::test_support::start_account_command(start_id, account),
+        );
+        assert!(wait_for(reply_ok(start_id), 15).is_some());
+        wait_for(
+            |v| crate::test_support::event_account_login_state(v, account, "online"),
+            10,
+        );
+    }
 
     // Open an exam with two subjects: s1 (selection, LLM → option "o1"), s2 (short_answer, LLM → text).
     // bob has an EXISTING answer on s1 = "o2" → a per-account conflict (o2 ≠ LLM's o1). alice: none.
@@ -273,7 +271,7 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     );
 
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"StopMonitoring"}}"#));
+    send(h, &crate::test_support::stop_all_command(i));
     wait_for(reply_ok(i), 5);
     unsafe { crate::core_free(h) };
 }

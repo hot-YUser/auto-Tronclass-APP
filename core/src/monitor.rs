@@ -6,15 +6,16 @@
 //! DISCIPLINE: the actor loop does pure state/coordination and **never awaits network** — every HTTP
 //! step (gate fetch, code read, radar solve, sign, on_call_fine recheck) is spawned through the
 //! session's `TaskGroup` and its result comes back as a `MonitorMsg`. One slow account can never
-//! freeze the others' countdowns. Every spawned helper is TRACKED: `MonitorHandle::stop` cancels the
-//! whole group, so StopMonitoring never leaves a detached brute-force / sign / QR / quiz job running
-//! against the tenant (the one sanctioned exception is the abort-safe teacher-QR cleanup, bounded).
-//! A helper panic is contained by its `TaskGroup` wrapper: one fixed `core_panicked` event + one
-//! `panic_tx` ping reach the engine watchdog, which recovers the monitor lifecycle.
+//! freeze the others' countdowns. Every spawned helper is tracked by the actor's `TaskGroup`; actor
+//! shutdown cancels pending helpers while definition barriers preserve already-authorized mutation.
+//! The bounded abort-safe teacher-QR cleanup is the sole detached cleanup. A helper panic becomes one
+//! fixed `core_panicked` event plus one generation-bound watchdog ping.
 
 use crate::answer::{self, Source};
+use crate::config::TargetId;
 use crate::llm::LlmConfig;
 use crate::login;
+use crate::protocol::AccountResultPhase;
 use crate::protocol::AnswerWire;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
@@ -69,6 +70,37 @@ pub struct Account {
     pub password: crate::secrets::Secret,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MonitorPlan {
+    pub generation: u64,
+    pub routes: Vec<MonitorRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorRoute {
+    pub source_targets: Vec<TargetId>,
+    pub detector_account_id: String,
+    pub participant_account_ids: Vec<String>,
+    pub course_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeEvent {
+    AccountResult {
+        sources: Vec<TargetId>,
+        account_id: String,
+        phase: AccountResultPhase,
+        activity_kind: String,
+        course_name: String,
+        error: Option<String>,
+    },
+    AccountLogin {
+        account_id: String,
+        online: bool,
+        error: Option<String>,
+    },
+}
+
 type ActivityKey = (String, String, String); // (base_url, kind_str, rollcall_id)
 
 /// R4.1 #2: bound sign re-login retries so a permanent 403 (not a real expiry) can't loop forever.
@@ -84,10 +116,9 @@ const RELOGIN_BASE_DELAY_SECS: u64 = 5;
 const RELOGIN_MAX_ATTEMPTS: u32 = 6;
 const RELOGIN_MAX_DELAY_SECS: u64 = 300;
 
-/// One cancellation scope per monitor session. Every spawned network helper — gate check, code read,
-/// sign (incl. the 0000–9999 brute-force round), re-login, QR teacher-assist, quiz prepare/submit —
-/// is registered here, so `MonitorHandle::stop` (StopMonitoring) aborts ALL of them: no detached
-/// request loop may outlive the session. A spawn racing an in-progress stop is aborted immediately.
+/// One cancellation scope for the long-lived actor. Every spawned network helper — gate check, code
+/// read, sign, re-login, QR teacher-assist, quiz prepare/submit — is registered here. Actor shutdown
+/// aborts them; definition changes instead use source-aware permits/barriers.
 ///
 /// Panic containment: each helper runs inside a single-task `JoinSet` wrapper. A helper panic is
 /// observed exactly once — one fixed `core_panicked` Error event plus one `panic_tx` ping for the
@@ -203,11 +234,13 @@ impl Drop for TaskGroup {
 }
 
 pub struct Detected {
+    generation: u64,
     account_id: String,
     base_url: String,
     rollcall_id: String,
     kind: RollcallKind,
     course: String,
+    course_id: Option<String>,
 }
 
 pub(crate) enum MonitorMsg {
@@ -235,6 +268,7 @@ pub(crate) enum MonitorMsg {
     },
     // --- quiz (slice 3) ---
     QuizDetected {
+        generation: u64,
         account_id: String,
         base_url: String,
         source: String,
@@ -304,6 +338,22 @@ pub(crate) enum MonitorMsg {
     },
     /// Settings changed while monitoring: adopt them live (boxed — much larger than the other variants).
     ConfigUpdated(Box<MonitorConfig>),
+    ApplyPlan {
+        plan: MonitorPlan,
+        cancel_removed_pending: bool,
+    },
+    UpsertAccounts(Vec<Account>),
+    PrepareDefinitionChange {
+        affected_sources: HashSet<TargetId>,
+        reply: std::sync::mpsc::SyncSender<()>,
+    },
+    CommitDefinitionChange {
+        plan: MonitorPlan,
+        reply: std::sync::mpsc::SyncSender<()>,
+    },
+    RollbackDefinitionChange {
+        reply: std::sync::mpsc::SyncSender<()>,
+    },
     Stop,
 }
 
@@ -325,6 +375,9 @@ struct Activity {
     sign_failed: HashSet<String>, // non-auth sign failures → manual SignNow retries these only
     needs_resign: HashSet<String>, // accounts whose sign hit a dead session → re-sign after re-login
     resign_attempts: HashMap<String, u32>, // per-account failed sign count (bounds retries, incl. manual)
+    sources: HashSet<TargetId>,
+    plan_generation: u64,
+    mutation_blocked: bool,
 }
 
 pub struct MonitorHandle {
@@ -346,6 +399,60 @@ impl MonitorHandle {
         }
     }
 
+    pub fn apply_plan(
+        &self,
+        plan: MonitorPlan,
+        cancel_removed_pending: bool,
+    ) -> Result<(), String> {
+        self.tx
+            .send(MonitorMsg::ApplyPlan {
+                plan,
+                cancel_removed_pending,
+            })
+            .map_err(|_| "monitor actor stopped".to_string())
+    }
+
+    pub fn upsert_accounts(&self, accounts: Vec<Account>) -> Result<(), String> {
+        self.tx
+            .send(MonitorMsg::UpsertAccounts(accounts))
+            .map_err(|_| "monitor actor stopped".to_string())
+    }
+
+    pub fn prepare_definition_change(
+        &self,
+        affected_sources: HashSet<TargetId>,
+    ) -> Result<(), String> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(0);
+        self.tx
+            .send(MonitorMsg::PrepareDefinitionChange {
+                affected_sources,
+                reply,
+            })
+            .map_err(|_| "monitor actor stopped".to_string())?;
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "monitor definition barrier timed out".to_string())
+    }
+
+    pub fn commit_definition_change(&self, plan: MonitorPlan) -> Result<(), String> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(0);
+        self.tx
+            .send(MonitorMsg::CommitDefinitionChange { plan, reply })
+            .map_err(|_| "monitor actor stopped".to_string())?;
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "monitor definition commit timed out".to_string())
+    }
+
+    pub fn rollback_definition_change(&self) -> Result<(), String> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(0);
+        self.tx
+            .send(MonitorMsg::RollbackDefinitionChange { reply })
+            .map_err(|_| "monitor actor stopped".to_string())?;
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "monitor definition rollback timed out".to_string())
+    }
     /// Stop monitoring: ask the actor to break (it emits `idle`), then cancel the whole task group —
     /// pollers, actor, and every tracked network helper (a brute-force round, QR assist, quiz
     /// prepare/submit) stop at their next await point. A helper spawned by a racing actor message
@@ -388,8 +495,6 @@ pub struct MonitorConfig {
     pub number_max_cooldowns: u32,
     pub poll_idle_secs: u64,
     pub quiz_detect_secs: u64,
-    pub operating: crate::config::Operating,
-    pub tz_offset_minutes: i64,
 }
 
 impl MonitorConfig {
@@ -404,25 +509,21 @@ impl MonitorConfig {
         }
     }
 
-    /// The slice of the config each poller needs (cadences + schedule + family allowlist).
+    /// The slice of the config each poller needs (cadences + family allowlist).
     fn tuning(&self) -> PollTuning {
         PollTuning {
             idle: Duration::from_secs(self.poll_idle_secs.max(1)),
             quiz_detect: Duration::from_secs(self.quiz_detect_secs.max(1)),
-            operating: self.operating.clone(),
-            tz_offset_minutes: self.tz_offset_minutes,
             wanted_types: self.autoanswer_types.clone(),
         }
     }
 }
 
-/// Per-poller tuning snapshot (schedule gate + cadences). Cloned into each poller at `start()`.
+/// Per-poller tuning snapshot. Target scheduling is owned by the supervisor, never by pollers.
 #[derive(Clone)]
 struct PollTuning {
     idle: Duration,
     quiz_detect: Duration,
-    operating: crate::config::Operating,
-    tz_offset_minutes: i64,
     wanted_types: Vec<String>, // R4 auto-answer family allowlist (empty = all)
 }
 
@@ -479,21 +580,11 @@ async fn relogin(acc: &Account) -> bool {
     )
 }
 
-/// Spawn a re-login (tracked); emit the account's new online/offline status, then clear the actor's
-/// in-flight flag.
-fn spawn_relogin(
-    acc: Arc<Account>,
-    tx: UnboundedSender<MonitorMsg>,
-    cb: EventCb,
-    group: &TaskGroup,
-) {
+/// Spawn a tracked re-login, then report its result back to the actor. The engine projects the
+/// actor result into the authoritative MonitoringSnapshot.
+fn spawn_relogin(acc: Arc<Account>, tx: UnboundedSender<MonitorMsg>, group: &TaskGroup) {
     group.spawn(async move {
         let ok = relogin(&acc).await;
-        emit(
-            cb,
-            &json!({ "id": null, "event": "AccountStatus", "account_id": acc.id,
-                          "state": if ok { "online" } else { "offline" } }),
-        );
         tx.send(MonitorMsg::AuthRestored {
             account_id: acc.id.clone(),
             ok,
@@ -530,106 +621,116 @@ impl Drop for StartupGuard {
     }
 }
 
-/// Spawn the actor + one poller per account on the current tokio runtime. `panic_tx` is the engine
-/// watchdog's channel: every helper panic pings it once (with a fixed `core_panicked` event), and
-/// closing the channel (a normal stop drops the group and handle) tells the watchdog to no-op.
+/// Spawn the actor plus one dormant-or-active poller per student on the current Tokio runtime.
 pub fn start(
     cb: EventCb,
     accounts: Vec<Account>,
+    initial_plan: MonitorPlan,
     cfg: MonitorConfig,
     panic_tx: UnboundedSender<()>,
+    runtime_tx: UnboundedSender<RuntimeEvent>,
 ) -> MonitorHandle {
     let (tx, rx) = unbounded_channel();
     let map: HashMap<String, Arc<Account>> = accounts
         .into_iter()
-        .map(|a| (a.id.clone(), Arc::new(a)))
+        .map(|account| (account.id.clone(), Arc::new(account)))
         .collect();
-
-    // Pollers read their tuning from a watch channel so a live `ConfigUpdated` reaches them too — the
-    // actor owns the sender and republishes on every settings change (no stop/start needed).
     let (tune_tx, tune_rx) = watch::channel(cfg.tuning());
-
+    let (plan_tx, plan_rx) = watch::channel(initial_plan.clone());
     let group = Arc::new(TaskGroup::new(cb, panic_tx));
-    // Armed until the handle below is fully built: any unwind here must cancel the group, because
-    // the actor's own `group` clone keeps the group alive past this frame (TaskGroup::drop can't run).
     let mut startup = StartupGuard::new(group.clone());
-    // A teacher account is only a QR data source (dispatch_signs uses it via the actor's `map`), never a
-    // monitored student — so it gets no poller. Polling it as a student would waste a request loop and
-    // could enrol it as a spurious rollcall participant.
-    for acc in map.values().filter(|acc| !acc.is_teacher) {
-        group.spawn(poller(acc.clone(), tx.clone(), cb, tune_rx.clone()));
+    for account in map.values().filter(|account| !account.is_teacher) {
+        group.spawn(poller(
+            account.clone(),
+            tx.clone(),
+            tune_rx.clone(),
+            plan_rx.clone(),
+        ));
     }
-    group.spawn(actor(cb, map, rx, tx.clone(), cfg, tune_tx, group.clone()));
-
-    emit(
+    group.spawn(actor(ActorInit {
         cb,
-        &json!({ "id": null, "event": "StateChanged", "state": "monitoring" }),
-    );
+        accounts: map,
+        rx,
+        self_tx: tx.clone(),
+        cfg,
+        tune_tx,
+        plan_tx,
+        plan: initial_plan,
+        runtime_tx,
+        group: group.clone(),
+    }));
     startup.disarm();
     MonitorHandle { tx, group }
 }
 
-/// Poll one account's rollcalls; report each newly-seen rollcall once (the actor fetches fresh
-/// attendance itself). Adaptive cadence: faster when something is active. Outside the operating-hours
-/// schedule the poller neither polls nor detects (docs 20) — the actor stays alive but idle.
+/// Poll one active detector's rollcalls and report each newly-seen rollcall once. Target scheduling
+/// is enforced before a detector route reaches this poller.
 async fn poller(
     acc: Arc<Account>,
     tx: UnboundedSender<MonitorMsg>,
-    cb: EventCb,
     mut tune_rx: watch::Receiver<PollTuning>,
+    mut plan_rx: watch::Receiver<MonitorPlan>,
 ) {
     let mut tune = tune_rx.borrow_and_update().clone();
     let ep = Endpoints::derive(&acc.base_url);
     let mut seen: HashSet<String> = HashSet::new();
-    let mut courses: Vec<String> = Vec::new(); // refreshed every 300s (a new enrolment appears)
+    let mut courses: Vec<String> = Vec::new();
     let mut last_courses: Option<Instant> = None;
     let mut seen_quiz: HashSet<String> = HashSet::new();
-    let mut voted_quiz: HashSet<String> = HashSet::new(); // interactions already voted (skip re-cast)
-    let mut last_quiz: Option<Instant> = None; // None → detect on the very first open iteration
-    let mut online = true; // the engine emitted the initial online; edge-trigger status changes only
-                           // ponytail: active=1s / idle=poll_idle_secs. The docs' 0.5s startup fast-window is a refinement —
-                           // the first poll is immediate anyway, so detection latency is already ~one interval.
+    let mut voted_quiz: HashSet<String> = HashSet::new();
+    let mut last_quiz: Option<Instant> = None;
+    let mut generation = u64::MAX;
+
     loop {
         if tx.is_closed() {
             break;
         }
-        // Adopt a live settings change (cheap: only clones when the actor actually republished).
         if tune_rx.has_changed().unwrap_or(false) {
             tune = tune_rx.borrow_and_update().clone();
         }
-        // Operating-hours gate: closed → skip polling + detection, re-check on a coarse cadence.
-        if !tune
-            .operating
-            .is_open(now_epoch_secs(), tune.tz_offset_minutes)
+        let plan = plan_rx.borrow_and_update().clone();
+        if plan.generation != generation {
+            generation = plan.generation;
+            seen.clear();
+            seen_quiz.clear();
+            voted_quiz.clear();
+            last_quiz = None;
+        }
+        if !plan
+            .routes
+            .iter()
+            .any(|route| route.detector_account_id == acc.id)
         {
-            crate::redaction::log_line(cb, "debug", &format!("schedule closed, {} idle", acc.id));
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::select! {
+                changed = plan_rx.changed() => {
+                    if changed.is_err() { break; }
+                }
+                changed = tune_rx.changed() => {
+                    if changed.is_err() { break; }
+                }
+            }
             continue;
         }
 
         let interval = match fetch_classified(&acc.client, &ep.rollcalls()).await {
-            Fetched::Ok(v) => {
-                if !online {
-                    // recovered from a transient blip → clear the stale offline badge (edge-triggered).
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "AccountStatus", "account_id": acc.id, "state": "online" }),
-                    );
-                    online = true;
-                }
-                let list = extract_rollcalls(&v);
+            Fetched::Ok(value) => {
+                let list = extract_rollcalls(&value);
                 let active = !list.is_empty();
-                for rc in list {
-                    let Some(id) = rollcall_id(&rc) else { continue };
+                for rollcall in list {
+                    let Some(id) = rollcall_id(&rollcall) else {
+                        continue;
+                    };
                     if !seen.insert(id.clone()) {
-                        continue; // already reported
+                        continue;
                     }
                     tx.send(MonitorMsg::Detected(Detected {
+                        generation,
                         account_id: acc.id.clone(),
                         base_url: acc.base_url.clone(),
                         rollcall_id: id,
-                        kind: rollcall::classify(&rc),
-                        course: course_name(&rc),
+                        kind: rollcall::classify(&rollcall),
+                        course: course_name(&rollcall),
+                        course_id: rollcall_course_id(&rollcall),
                     }))
                     .ok();
                 }
@@ -639,8 +740,6 @@ async fn poller(
                     tune.idle
                 }
             }
-            // The rollcall poll is the auth-lost canary (it runs every cycle): a 401 / redirect-to-login /
-            // 200-login-page → ask the actor to re-login (it dedups). Covers a session lost mid-sign too.
             Fetched::AuthLost => {
                 tx.send(MonitorMsg::AuthLost {
                     account_id: acc.id.clone(),
@@ -648,20 +747,9 @@ async fn poller(
                 .ok();
                 tune.idle
             }
-            Fetched::Down => {
-                if online {
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "AccountStatus",
-                                      "account_id": acc.id, "state": "offline" }),
-                    );
-                    online = false;
-                }
-                tune.idle
-            }
+            Fetched::Down => tune.idle,
         };
-        // Quiz detection on its own (slower) cadence, decoupled from the rollcall poll (docs 31).
-        if last_quiz.is_none_or(|t| t.elapsed() >= tune.quiz_detect) {
+        if last_quiz.is_none_or(|last| last.elapsed() >= tune.quiz_detect) {
             detect_quizzes(
                 &acc,
                 &ep,
@@ -671,16 +759,23 @@ async fn poller(
                 &mut seen_quiz,
                 &mut voted_quiz,
                 &tune.wanted_types,
+                generation,
             )
             .await;
             last_quiz = Some(Instant::now());
         }
-
-        // Stop cleanly when the actor (and its receiver) is gone.
         if tx.is_closed() {
             break;
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            changed = plan_rx.changed() => {
+                if changed.is_err() { break; }
+            }
+            changed = tune_rx.changed() => {
+                if changed.is_err() { break; }
+            }
+        }
     }
 }
 
@@ -697,6 +792,7 @@ async fn detect_quizzes(
     seen: &mut HashSet<String>,
     voted: &mut HashSet<String>,
     wanted: &[String],
+    generation: u64,
 ) {
     if last_courses.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) || courses.is_empty() {
         if let Ok(v) = get_json(&acc.client, &ep.my_courses()).await {
@@ -716,7 +812,18 @@ async fn detect_quizzes(
         if want("exam") {
             for a in family_list(acc, &ep.course_exam_list(&cid), "exams").await {
                 if exam_answerable(&a, now) {
-                    emit_quiz(tx, acc, seen, "exam", &cid, &a, "");
+                    emit_quiz(
+                        tx,
+                        acc,
+                        seen,
+                        QuizDetection {
+                            source: "exam",
+                            course_id: &cid,
+                            activity: &a,
+                            stem: "",
+                            generation,
+                        },
+                    );
                 }
             }
         }
@@ -727,7 +834,18 @@ async fn detect_quizzes(
                     && !field_or(&a, "is_closed", false)
                     && !already_submitted(&a)
                 {
-                    emit_quiz(tx, acc, seen, "questionnaire", &cid, &a, "");
+                    emit_quiz(
+                        tx,
+                        acc,
+                        seen,
+                        QuizDetection {
+                            source: "questionnaire",
+                            course_id: &cid,
+                            activity: &a,
+                            stem: "",
+                            generation,
+                        },
+                    );
                 }
             }
         }
@@ -739,12 +857,23 @@ async fn detect_quizzes(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    emit_quiz(tx, acc, seen, "homework", &cid, &a, &stem);
+                    emit_quiz(
+                        tx,
+                        acc,
+                        seen,
+                        QuizDetection {
+                            source: "homework",
+                            course_id: &cid,
+                            activity: &a,
+                            stem: &stem,
+                            generation,
+                        },
+                    );
                 }
             }
         }
         if want("vote") {
-            detect_vote(acc, ep, tx, &cid, seen, voted).await;
+            detect_vote(acc, ep, tx, &cid, seen, voted, generation).await;
         }
         if want("classroom") {
             for a in family_list(acc, &ep.course_classroom_list(&cid), "classrooms").await {
@@ -755,12 +884,23 @@ async fn detect_quizzes(
                         .unwrap_or(0)
                         >= 1
                 {
-                    emit_quiz(tx, acc, seen, "classroom-exam", &cid, &a, "");
+                    emit_quiz(
+                        tx,
+                        acc,
+                        seen,
+                        QuizDetection {
+                            source: "classroom-exam",
+                            course_id: &cid,
+                            activity: &a,
+                            stem: "",
+                            generation,
+                        },
+                    );
                 }
             }
         }
         if want("courseware") {
-            detect_courseware(acc, ep, tx, &cid, seen).await;
+            detect_courseware(acc, ep, tx, &cid, seen, generation).await;
         }
     }
 }
@@ -781,20 +921,33 @@ fn quiz_seen_key(source: &str, cid: &str, aid: &str) -> String {
 }
 
 /// Dedup on `source/cid/aid`, then emit one QuizDetected with the family's canonical `source`.
+struct QuizDetection<'a> {
+    source: &'a str,
+    course_id: &'a str,
+    activity: &'a Value,
+    stem: &'a str,
+    generation: u64,
+}
+
 fn emit_quiz(
     tx: &UnboundedSender<MonitorMsg>,
     acc: &Arc<Account>,
     seen: &mut HashSet<String>,
-    source: &str,
-    cid: &str,
-    a: &Value,
-    stem: &str,
+    detection: QuizDetection<'_>,
 ) {
+    let QuizDetection {
+        source,
+        course_id: cid,
+        activity: a,
+        stem,
+        generation,
+    } = detection;
     let Some(aid) = id_of(a) else { return };
     if !seen.insert(quiz_seen_key(source, cid, &aid)) {
         return;
     }
     tx.send(MonitorMsg::QuizDetected {
+        generation,
         account_id: acc.id.clone(),
         base_url: acc.base_url.clone(),
         source: source.to_string(),
@@ -1049,6 +1202,7 @@ async fn detect_vote(
     cid: &str,
     seen: &mut HashSet<String>,
     voted: &mut HashSet<String>,
+    generation: u64,
 ) {
     for a in family_list(acc, &ep.course_interactions(cid), "interactions").await {
         if a.get("type").and_then(Value::as_str) != Some("vote")
@@ -1078,7 +1232,18 @@ async fn detect_vote(
                 continue;
             }
         }
-        emit_quiz(tx, acc, seen, "vote", cid, &a, "");
+        emit_quiz(
+            tx,
+            acc,
+            seen,
+            QuizDetection {
+                source: "vote",
+                course_id: cid,
+                activity: &a,
+                stem: "",
+                generation,
+            },
+        );
     }
 }
 
@@ -1090,6 +1255,7 @@ async fn detect_courseware(
     tx: &UnboundedSender<MonitorMsg>,
     cid: &str,
     seen: &mut HashSet<String>,
+    generation: u64,
 ) {
     for m in family_list(acc, &ep.course_activities(cid), "activities").await {
         if m.get("type").and_then(Value::as_str) != Some("material") {
@@ -1112,7 +1278,18 @@ async fn detect_courseware(
             if done {
                 continue;
             }
-            emit_quiz(tx, acc, seen, "courseware-quiz", cid, &q, "");
+            emit_quiz(
+                tx,
+                acc,
+                seen,
+                QuizDetection {
+                    source: "courseware-quiz",
+                    course_id: cid,
+                    activity: &q,
+                    stem: "",
+                    generation,
+                },
+            );
         }
     }
 }
@@ -1183,19 +1360,36 @@ fn retryable_accounts(a: &Activity) -> Vec<String> {
         .collect()
 }
 
-async fn actor(
+struct ActorInit {
     cb: EventCb,
     accounts: HashMap<String, Arc<Account>>,
-    mut rx: UnboundedReceiver<MonitorMsg>,
+    rx: UnboundedReceiver<MonitorMsg>,
     self_tx: UnboundedSender<MonitorMsg>,
-    mut cfg: MonitorConfig,
+    cfg: MonitorConfig,
     tune_tx: watch::Sender<PollTuning>,
+    plan_tx: watch::Sender<MonitorPlan>,
+    plan: MonitorPlan,
+    runtime_tx: UnboundedSender<RuntimeEvent>,
     group: Arc<TaskGroup>,
-) {
+}
+
+async fn actor(init: ActorInit) {
+    let ActorInit {
+        cb,
+        mut accounts,
+        mut rx,
+        self_tx,
+        mut cfg,
+        tune_tx,
+        plan_tx,
+        mut plan,
+        runtime_tx,
+        group,
+    } = init;
     let mut activities: HashMap<ActivityKey, Activity> = HashMap::new();
     let mut quizzes: HashMap<ActivityKey, QuizActivity> = HashMap::new();
-    let mut reauth: HashSet<String> = HashSet::new(); // accounts with a re-login in flight (dedup)
-    let mut relogin_backoff: HashMap<String, ReloginState> = HashMap::new(); // bounded per-account pacing
+    let mut reauth: HashSet<String> = HashSet::new();
+    let mut relogin_backoff: HashMap<String, ReloginState> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -1204,22 +1398,55 @@ async fn actor(
                 let Some(msg) = maybe else { break };
                 match msg {
                     MonitorMsg::Stop => break,
-                    MonitorMsg::Detected(d) => on_detected(&mut activities, &accounts, &self_tx, &group, cb, &cfg, d),
-                    MonitorMsg::GateResult { key, rate } => on_gate(&mut activities, &accounts, &self_tx, &group, cb, &cfg, key, rate),
+                    MonitorMsg::Detected(detection) => {
+                        if detection.generation == plan.generation {
+                            on_detected(
+                                &mut activities,
+                                DetectionContext {
+                                    accounts: &accounts,
+                                    tx: &self_tx,
+                                    group: &group,
+                                    cb,
+                                    cfg: &cfg,
+                                    plan: &plan,
+                                },
+                                detection,
+                            );
+                        }
+                    }
+                    MonitorMsg::GateResult { key, rate } =>
+                        on_gate(&mut activities, &accounts, &self_tx, &group, cb, &cfg, key, rate),
                     MonitorMsg::CodeRead { key, code } => {
-                        // A manual override may be waiting on this code (below-gate number: gate held before
-                        // the code-read step). Record it, then sign now if an override was pending.
                         let dispatch = match activities.get_mut(&key) {
-                            Some(a) => { a.number_code = code; a.code_requested = true; std::mem::take(&mut a.sign_pending) }
+                            Some(activity) => {
+                                activity.number_code = code;
+                                activity.code_requested = true;
+                                std::mem::take(&mut activity.sign_pending)
+                            }
                             None => false,
                         };
-                        if dispatch { dispatch_signs(&mut activities, &accounts, &self_tx, &group, &cfg, cb, &key); }
+                        if dispatch {
+                            dispatch_signs(
+                                &mut activities,
+                                &accounts,
+                                &self_tx,
+                                &group,
+                                &cfg,
+                                cb,
+                                &key,
+                            );
+                        }
                     }
-                    MonitorMsg::SignResult { key, account_id, result } => on_sign_result(&mut activities, &self_tx, cb, key, account_id, result),
+                    MonitorMsg::SignResult { key, account_id, result } => {
+                        publish_rollcall_result(&runtime_tx, &activities, &key, &account_id, &result);
+                        on_sign_result(&mut activities, &self_tx, cb, key, account_id, result);
+                    }
                     MonitorMsg::SignNow { command_id, activity_token } => {
                         let result = find_activity_key(&activities, &activity_token)
                             .ok_or_else(|| "unknown rollcall activity_token".to_string())
-                            .and_then(|key| on_sign_now(&mut activities, &accounts, &self_tx, &group, &cfg, cb, &key));
+                            .and_then(|key| on_sign_now(
+                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &key,
+                            ));
                         command_reply(cb, command_id, result);
                     }
                     MonitorMsg::Defer { command_id, activity_token } => {
@@ -1228,24 +1455,44 @@ async fn actor(
                             .map(|key| on_defer(&mut activities, cb, &key));
                         command_reply(cb, command_id, result);
                     }
-                    MonitorMsg::QuizDetected { account_id, base_url, source, course, course_id, activity_id, stem } =>
-                        on_quiz_detected(&mut quizzes, base_url, source, course, course_id, activity_id, account_id, stem),
+                    MonitorMsg::QuizDetected {
+                        generation, account_id, base_url, source, course, course_id, activity_id, stem
+                    } => {
+                        if generation == plan.generation {
+                            on_quiz_detected(
+                                &mut quizzes, &plan, generation, base_url, source, course,
+                                course_id, activity_id, account_id, stem,
+                            );
+                        }
+                    }
                     MonitorMsg::QuizPrepared { key, attempts } =>
                         on_quiz_prepared(&mut quizzes, &cfg, cb, key, attempts),
                     MonitorMsg::QuizPrepareGone { key, account_id, generation } =>
                         on_quiz_prepare_gone(&mut quizzes, &cfg, cb, key, account_id, generation),
-                    MonitorMsg::QuizPrepareRetry { key, account_id, generation, contract, partial, missing } =>
-                        on_quiz_prepare_retry(&mut quizzes, &cfg, cb, key, account_id, generation, contract, partial, missing),
-                    MonitorMsg::QuizPrepareFailed { key, account_id, generation, code, message } =>
-                        on_quiz_prepare_failed(&mut quizzes, &cfg, cb, key, account_id, generation, code, message),
-                    MonitorMsg::QuizSetAnswer { command_id, activity_token, account_id, subject_id, answer } => {
-                        let result = on_quiz_set_answer(&mut quizzes, &cfg, cb, &activity_token, &account_id, &subject_id, answer);
+                    MonitorMsg::QuizPrepareRetry {
+                        key, account_id, generation, contract, partial, missing
+                    } => on_quiz_prepare_retry(
+                        &mut quizzes, &cfg, cb, key, account_id, generation, contract, partial, missing,
+                    ),
+                    MonitorMsg::QuizPrepareFailed {
+                        key, account_id, generation, code, message
+                    } => on_quiz_prepare_failed(
+                        &mut quizzes, &cfg, cb, key, account_id, generation, code, message,
+                    ),
+                    MonitorMsg::QuizSetAnswer {
+                        command_id, activity_token, account_id, subject_id, answer
+                    } => {
+                        let result = on_quiz_set_answer(
+                            &mut quizzes, &cfg, cb, &activity_token, &account_id, &subject_id, answer,
+                        );
                         command_reply(cb, command_id, result);
                     }
                     MonitorMsg::QuizSubmitNow { command_id, activity_token } => {
                         let result = find_quiz_key(&quizzes, &activity_token)
                             .ok_or_else(|| "unknown quiz activity_token".to_string())
-                            .and_then(|key| dispatch_quiz_submits(&mut quizzes, &accounts, &self_tx, &group, &cfg, &key));
+                            .and_then(|key| dispatch_quiz_submits(
+                                &mut quizzes, &accounts, &self_tx, &group, &cfg, &key,
+                            ));
                         command_reply(cb, command_id, result);
                     }
                     MonitorMsg::QuizHold { command_id, activity_token } => {
@@ -1257,49 +1504,120 @@ async fn actor(
                     MonitorMsg::QuizDiscard { command_id, activity_token } => {
                         let result = find_quiz_mut(&mut quizzes, &activity_token)
                             .ok_or_else(|| "unknown quiz activity_token".to_string())
-                            .and_then(|q| on_quiz_discard(q, cb));
+                            .and_then(|quiz| on_quiz_discard(quiz, cb));
                         command_reply(cb, command_id, result);
                     }
-                    MonitorMsg::QuizSubmitResult { key, account_id, result } => on_quiz_submit_result(&mut quizzes, cb, key, account_id, result),
+                    MonitorMsg::QuizSubmitResult { key, account_id, result } => {
+                        publish_quiz_result(&runtime_tx, &quizzes, &key, &account_id, &result);
+                        on_quiz_submit_result(&mut quizzes, cb, key, account_id, result);
+                    }
                     MonitorMsg::AuthLost { account_id } => {
-                        // Session expired mid-poll / mid-sign. In-flight attempts are deduped (reauth);
-                        // otherwise the bounded per-account backoff paces retries — a permanent credential
-                        // failure must not hammer the login endpoint every poll cycle, and gives up with
-                        // one Error (the terminal report lives in the AuthRestored arm).
                         if !reauth.contains(&account_id)
                             && relogin_due(&relogin_backoff, &account_id, Instant::now())
                         {
-                            if let Some(acc) = accounts.get(&account_id).cloned() {
+                            if let Some(account) = accounts.get(&account_id).cloned() {
                                 reauth.insert(account_id.clone());
-                                spawn_relogin(acc, self_tx.clone(), cb, &group);
+                                spawn_relogin(account, self_tx.clone(), &group);
                             }
                         }
                     }
-                    // Settings changed mid-run: adopt them here AND republish the poller slice, so the
-                    // change bites immediately (a held rollcall re-checks its gate on the next tick).
-                    // Already-armed countdowns keep their deadline — only new ones use the new length.
                     MonitorMsg::ConfigUpdated(new) => {
                         cfg = *new;
                         let _ = tune_tx.send(cfg.tuning());
                     }
+                    MonitorMsg::ApplyPlan { plan: next, cancel_removed_pending } => {
+                        if next.generation > plan.generation {
+                            if cancel_removed_pending {
+                                cancel_removed_sources(&mut activities, &mut quizzes, &next);
+                            }
+                            plan = next;
+                            let _ = plan_tx.send(plan.clone());
+                        }
+                    }
+                    MonitorMsg::PrepareDefinitionChange { affected_sources, reply } => {
+                        for activity in activities.values_mut().filter(|activity| !activity.acted) {
+                            activity.mutation_blocked = !activity.sources.is_empty()
+                                && activity.sources.iter().all(|source| affected_sources.contains(source));
+                        }
+                        for quiz in quizzes.values_mut() {
+                            let authorized = quiz.attempts.values().any(|attempt| {
+                                matches!(attempt.state, AttemptState::Submitting | AttemptState::Submitted)
+                            });
+                            if !authorized {
+                                quiz.mutation_blocked = !quiz.sources.is_empty()
+                                    && quiz.sources.iter().all(|source| affected_sources.contains(source));
+                            }
+                        }
+                        let _ = reply.send(());
+                    }
+                    MonitorMsg::CommitDefinitionChange { plan: next, reply } => {
+                        cancel_removed_sources(&mut activities, &mut quizzes, &next);
+                        for activity in activities.values_mut() {
+                            activity.mutation_blocked = false;
+                        }
+                        for quiz in quizzes.values_mut() {
+                            quiz.mutation_blocked = false;
+                        }
+                        if next.generation >= plan.generation {
+                            plan = next;
+                            let _ = plan_tx.send(plan.clone());
+                        }
+                        let _ = reply.send(());
+                    }
+                    MonitorMsg::RollbackDefinitionChange { reply } => {
+                        for activity in activities.values_mut() {
+                            activity.mutation_blocked = false;
+                        }
+                        for quiz in quizzes.values_mut() {
+                            quiz.mutation_blocked = false;
+                        }
+                        let _ = reply.send(());
+                    }
+                    MonitorMsg::UpsertAccounts(new_accounts) => {
+                        for account in new_accounts {
+                            if accounts.contains_key(&account.id) {
+                                continue;
+                            }
+                            let account = Arc::new(account);
+                            if !account.is_teacher {
+                                group.spawn(poller(
+                                    account.clone(),
+                                    self_tx.clone(),
+                                    tune_tx.subscribe(),
+                                    plan_tx.subscribe(),
+                                ));
+                            }
+                            accounts.insert(account.id.clone(), account);
+                        }
+                    }
                     MonitorMsg::AuthRestored { account_id, ok } => {
                         reauth.remove(&account_id);
                         if ok {
-                            relogin_backoff.remove(&account_id); // success resets the backoff
-                            // Only on a SUCCESSFUL re-login do we re-sign the rollcalls this account lost.
-                            redispatch_signs(&mut activities, &accounts, &self_tx, &group, &cfg, cb, &account_id);
+                            relogin_backoff.remove(&account_id);
+                            redispatch_signs(
+                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &account_id,
+                            );
+                            let _ = runtime_tx.send(RuntimeEvent::AccountLogin {
+                                account_id: account_id.clone(),
+                                online: true,
+                                error: None,
+                            });
                         } else {
-                            // One clear Error exactly when the bounded backoff gives up on this account;
-                            // further AuthLost signals are dropped (relogin_due → GivenUp).
-                            let n = relogin_failed(&mut relogin_backoff, &account_id, Instant::now());
-                            if n == RELOGIN_MAX_ATTEMPTS {
-                                emit(cb, &json!({ "id": null, "event": "Error", "severity": "error",
+                            let attempts =
+                                relogin_failed(&mut relogin_backoff, &account_id, Instant::now());
+                            if attempts == RELOGIN_MAX_ATTEMPTS {
+                                emit(cb, &json!({
+                                    "id": null, "event": "Error", "severity": "error",
                                     "code": "relogin_failed", "account_id": account_id,
                                     "message": format!(
-                                        "account {account_id}: re-login failed {n} times — the session cannot be recovered (wrong password or SSO?); automatic retries stopped") }));
-                                emit(cb, &json!({ "id": null, "event": "AccountStatus",
-                                    "account_id": account_id, "state": "offline",
-                                    "error": "automatic re-login attempts exhausted" }));
+                                        "account {account_id}: re-login failed {attempts} times; automatic retries stopped"
+                                    )
+                                }));
+                                let _ = runtime_tx.send(RuntimeEvent::AccountLogin {
+                                    account_id: account_id.clone(),
+                                    online: false,
+                                    error: Some("登入狀態已無法恢復".to_string()),
+                                });
                             }
                         }
                     }
@@ -1311,31 +1629,142 @@ async fn actor(
             }
         }
     }
-    emit(
-        cb,
-        &json!({ "id": null, "event": "StateChanged", "state": "idle" }),
-    );
+}
+
+fn publish_rollcall_result(
+    runtime_tx: &UnboundedSender<RuntimeEvent>,
+    activities: &HashMap<ActivityKey, Activity>,
+    key: &ActivityKey,
+    account_id: &str,
+    result: &Result<SignOutcome, String>,
+) {
+    let Some(activity) = activities.get(key) else {
+        return;
+    };
+    let (phase, error) = match result {
+        Ok(_) => (AccountResultPhase::Succeeded, None),
+        Err(message) => (AccountResultPhase::Failed, Some(message.clone())),
+    };
+    let _ = runtime_tx.send(RuntimeEvent::AccountResult {
+        sources: activity.sources.iter().cloned().collect(),
+        account_id: account_id.to_string(),
+        phase,
+        activity_kind: activity.kind.as_str().to_string(),
+        course_name: activity.course.clone(),
+        error,
+    });
+}
+
+fn publish_quiz_result(
+    runtime_tx: &UnboundedSender<RuntimeEvent>,
+    quizzes: &HashMap<ActivityKey, QuizActivity>,
+    key: &ActivityKey,
+    account_id: &str,
+    result: &Result<QuizSubmitReport, QuizSubmitFailure>,
+) {
+    let Some(quiz) = quizzes.get(key) else {
+        return;
+    };
+    let (phase, error) = match result {
+        Ok(_) => (AccountResultPhase::Succeeded, None),
+        Err(failure) => (AccountResultPhase::Failed, Some(failure.error.clone())),
+    };
+    let _ = runtime_tx.send(RuntimeEvent::AccountResult {
+        sources: quiz.sources.iter().cloned().collect(),
+        account_id: account_id.to_string(),
+        phase,
+        activity_kind: quiz.source.as_str().to_string(),
+        course_name: quiz.course.clone(),
+        error,
+    });
+}
+
+fn cancel_removed_sources(
+    activities: &mut HashMap<ActivityKey, Activity>,
+    quizzes: &mut HashMap<ActivityKey, QuizActivity>,
+    next: &MonitorPlan,
+) {
+    let active: HashSet<&TargetId> = next
+        .routes
+        .iter()
+        .flat_map(|route| route.source_targets.iter())
+        .collect();
+    activities.retain(|_, activity| {
+        activity.sources.retain(|source| active.contains(source));
+        !activity.sources.is_empty() || activity.acted
+    });
+    quizzes.retain(|_, quiz| {
+        quiz.sources.retain(|source| active.contains(source));
+        let mutation_authorized = quiz.attempts.values().any(|attempt| {
+            matches!(
+                attempt.state,
+                AttemptState::Submitting | AttemptState::Submitted
+            )
+        });
+        !quiz.sources.is_empty() || mutation_authorized
+    });
+}
+
+struct DetectionContext<'a> {
+    accounts: &'a HashMap<String, Arc<Account>>,
+    tx: &'a UnboundedSender<MonitorMsg>,
+    group: &'a TaskGroup,
+    cb: EventCb,
+    cfg: &'a MonitorConfig,
+    plan: &'a MonitorPlan,
 }
 
 fn on_detected(
     activities: &mut HashMap<ActivityKey, Activity>,
-    accounts: &HashMap<String, Arc<Account>>,
-    tx: &UnboundedSender<MonitorMsg>,
-    group: &TaskGroup,
-    cb: EventCb,
-    cfg: &MonitorConfig,
-    d: Detected,
+    context: DetectionContext<'_>,
+    detection: Detected,
 ) {
+    let DetectionContext {
+        accounts,
+        tx,
+        group,
+        cb,
+        cfg,
+        plan,
+    } = context;
+    let matching: Vec<&MonitorRoute> = plan
+        .routes
+        .iter()
+        .filter(|route| {
+            route.detector_account_id == detection.account_id
+                && (route.course_ids.is_empty()
+                    || detection
+                        .course_id
+                        .as_ref()
+                        .is_some_and(|course_id| route.course_ids.contains(course_id)))
+        })
+        .collect();
+    if matching.is_empty() {
+        return;
+    }
+    let participants: HashSet<String> = matching
+        .iter()
+        .flat_map(|route| route.participant_account_ids.iter())
+        .cloned()
+        .collect();
+    if participants.is_empty() {
+        return;
+    }
+    let sources: HashSet<TargetId> = matching
+        .iter()
+        .flat_map(|route| route.source_targets.iter().cloned())
+        .collect();
     let key = (
-        d.base_url.clone(),
-        d.kind.as_str().to_string(),
-        d.rollcall_id.clone(),
+        detection.base_url.clone(),
+        detection.kind.as_str().to_string(),
+        detection.rollcall_id.clone(),
     );
-    let is_new_participant = {
+    let mut newly_added = Vec::new();
+    {
         let entry = activities.entry(key.clone()).or_insert_with(|| Activity {
             activity_token: crate::config::new_id(),
-            kind: d.kind,
-            course: d.course.clone(),
+            kind: detection.kind,
+            course: detection.course.clone(),
             participants: HashSet::new(),
             attendance_rate: None,
             number_code: None,
@@ -1345,53 +1774,53 @@ fn on_detected(
             gate_next_check: None,
             countdown_deadline: None,
             acted: false,
+            mutation_blocked: false,
             sign_pending: false,
             signed: HashSet::new(),
             sign_failed: HashSet::new(),
             needs_resign: HashSet::new(),
             resign_attempts: HashMap::new(),
+            sources: HashSet::new(),
+            plan_generation: detection.generation,
         });
-        let is_new = entry.participants.insert(d.account_id.clone());
-        if is_new {
-            emit_rollcall_detected(cb, &d.rollcall_id, &d.base_url, entry);
+        entry.sources.extend(sources);
+        if !entry.acted {
+            entry.plan_generation = detection.generation;
         }
-        is_new
-    };
-    if is_new_participant {
-        // A participant detected AFTER the activity was already dispatched still needs ITS OWN sign —
-        // dispatch ONLY that account (a full re-dispatch would re-sign every participant; `signed` is
-        // the guard, so an already-signed late account is never re-dispatched).
-        if activities
+        for participant in participants {
+            if entry.participants.insert(participant.clone()) {
+                newly_added.push(participant);
+            }
+        }
+        if !newly_added.is_empty() {
+            emit_rollcall_detected(cb, &detection.rollcall_id, &detection.base_url, entry);
+        }
+    }
+    if newly_added.is_empty() {
+        return;
+    }
+    let acted = activities.get(&key).is_some_and(|activity| activity.acted);
+    if acted {
+        let eligible: Vec<String> = newly_added
+            .into_iter()
+            .filter(|account_id| {
+                activities
+                    .get(&key)
+                    .is_some_and(|activity| !activity.signed.contains(account_id))
+            })
+            .collect();
+        let qr_without_teacher = activities
             .get(&key)
-            .is_some_and(|a| a.acted && !a.signed.contains(&d.account_id))
+            .is_some_and(|activity| activity.kind == RollcallKind::Qr)
+            && !accounts.values().any(|account| account.is_teacher);
+        if !eligible.is_empty() && !qr_without_teacher {
+            dispatch_signs_for(activities, accounts, tx, group, cfg, cb, &key, eligible);
+        }
+    } else if let Some(entry) = activities.get_mut(&key) {
+        if gate_check_due(entry, Instant::now())
+            && spawn_gate_check(accounts, tx, group, &key, &detection.account_id)
         {
-            // QR without a teacher cannot dispatch anything (dispatch_signs_for would reset the
-            // activity to un-acted and re-open a full re-dispatch window) — keep the activity acted
-            // and leave the late participant for a later AuthRestored / manual path.
-            let qr_without_teacher = activities
-                .get(&key)
-                .is_some_and(|a| a.kind == RollcallKind::Qr)
-                && !accounts.values().any(|account| account.is_teacher);
-            if !qr_without_teacher {
-                dispatch_signs_for(
-                    activities,
-                    accounts,
-                    tx,
-                    group,
-                    cfg,
-                    cb,
-                    &key,
-                    vec![d.account_id],
-                );
-            }
-        } else if let Some(entry) = activities.get_mut(&key) {
-            // Kick a gate check the first time this activity is seen (one in flight max; a held
-            // activity keeps its own cadence — a late participant does not burst an extra request).
-            if gate_check_due(entry, Instant::now())
-                && spawn_gate_check(accounts, tx, group, &key, &d.account_id)
-            {
-                entry.gate_in_flight = true;
-            }
+            entry.gate_in_flight = true;
         }
     }
 }
@@ -1528,6 +1957,9 @@ fn on_sign_now(
                     .into(),
             );
         }
+        if !a.acted && a.mutation_blocked {
+            return Err("definition_change_in_progress".to_string());
+        }
         if !a.acted {
             if a.kind == RollcallKind::Number && a.number_code.is_none() {
                 // Held number without its code: read it, then sign on CodeRead (see the CodeRead arm).
@@ -1585,6 +2017,9 @@ fn dispatch_signs_for(
     let Some(a) = activities.get_mut(key) else {
         return;
     };
+    if !a.acted && a.mutation_blocked {
+        return;
+    }
     a.acted = true;
     a.countdown_deadline = None;
     let kind = a.kind;
@@ -1935,11 +2370,9 @@ fn spawn_sign(
 /// Teacher opens its OWN qr rollcall as the rotating-`data` source; each student then signs THEIR own
 /// rollcall id on THEIR own endpoint with that data (docs 32). Because the token is valid only ~1–4 s,
 /// this re-sources and re-sends every ~1.5 s for up to ~12 s until each student confirms. A session lost
-/// mid-flight is recovered once (teacher and per-student). When monitoring stops, the task-group cancel
-/// aborts this task at its next await point — the abort-safe `QrCleanupGuard` still closes the teacher's
-/// data source (bounded), so a StopMonitoring never leaves an open rollcall on the teacher's real course.
-/// (On a full `core_free` the runtime is torn down and the final cleanup may not complete — same
-/// terminal-shutdown caveat as the pollers/actor, which are aborted too.)
+/// mid-flight is recovered once (teacher and per-student). Actor shutdown aborts this task at its
+/// next await point; the bounded abort-safe `QrCleanupGuard` still closes the teacher's data source.
+/// Full `core_free` retains the same terminal-shutdown caveat as other runtime tasks.
 fn spawn_qr_teacher_assist(
     teacher: Arc<Account>,
     students: Vec<Arc<Account>>,
@@ -2042,12 +2475,10 @@ fn spawn_qr_teacher_assist(
     });
 }
 
-/// Abort-safe best-effort close of the teacher's QR data source. The task group aborts the assist task
-/// at its next await point when StopMonitoring runs; a plain trailing cleanup would then be skipped and
-/// the teacher's real course would keep an open rollcall. This guard runs the same bounded cleanup from
-/// `Drop` when the future is dropped mid-flight (abort). Detached on purpose — the task-group cancel
-/// must not skip cleanup — and bounded: `cleanup_teacher_source` caps each stop at 2 s with at most one
-/// re-login. This is the one sanctioned exception to "no HTTP after StopMonitoring returns".
+/// Abort-safe best-effort close of the teacher's QR data source. If actor shutdown drops the assist
+/// future, a plain trailing cleanup would be skipped and leave a teacher rollcall open. This guard
+/// starts the same bounded cleanup from `Drop`; `cleanup_teacher_source` caps each stop at 2 seconds
+/// with at most one re-login.
 struct QrCleanupGuard {
     teacher: Arc<Account>,
     source: Option<teacher_qr::Source>,
@@ -2209,6 +2640,19 @@ fn extract_rollcalls(v: &Value) -> Vec<Value> {
         .cloned()
         .unwrap_or_default()
 }
+fn rollcall_course_id(rollcall: &Value) -> Option<String> {
+    ["course_id", "courseId", "cid"]
+        .iter()
+        .find_map(|key| {
+            rollcall.get(*key).and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| value.as_i64().map(|number| number.to_string()))
+            })
+        })
+        .or_else(|| rollcall.get("course").and_then(course_id_of))
+}
 
 fn rollcall_id(rc: &Value) -> Option<String> {
     rc.get("rollcall_id")
@@ -2230,10 +2674,6 @@ fn course_name(rc: &Value) -> String {
 
 // ================= quiz (slice 3) =================
 
-/// How long a finished quiz's heavy state (subjects + answers) is kept for UI visibility before the
-/// actor prunes it. The poller `seen` set is NOT TTL'd, so pruning can never cause re-detection.
-const QUIZ_TERMINAL_RETENTION_SECS: u64 = 600;
-
 struct QuizActivity {
     activity_token: String,
     source: Source,
@@ -2245,9 +2685,9 @@ struct QuizActivity {
     countdown_deadline: Option<Instant>,
     held: bool,
     discarded: bool,
-    /// When the whole quiz became terminal (every attempt Submitted/Gone/Failed, or discarded), for
-    /// pruning after `QUIZ_TERMINAL_RETENTION_SECS`. None while any attempt is still live.
-    terminal_at: Option<Instant>,
+    sources: HashSet<TargetId>,
+    plan_generation: u64,
+    mutation_blocked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2332,33 +2772,67 @@ struct PriorAnswers {
 #[allow(clippy::too_many_arguments)]
 fn on_quiz_detected(
     quizzes: &mut HashMap<ActivityKey, QuizActivity>,
+    plan: &MonitorPlan,
+    generation: u64,
     base_url: String,
     source: String,
     course: String,
     course_id: String,
     activity_id: String,
-    account_id: String,
+    detector_account_id: String,
     stem: String,
 ) {
+    let matching: Vec<&MonitorRoute> = plan
+        .routes
+        .iter()
+        .filter(|route| {
+            route.detector_account_id == detector_account_id
+                && (route.course_ids.is_empty() || route.course_ids.contains(&course_id))
+        })
+        .collect();
+    if matching.is_empty() {
+        return;
+    }
+    let participants: HashSet<String> = matching
+        .iter()
+        .flat_map(|route| route.participant_account_ids.iter())
+        .cloned()
+        .collect();
+    let sources: HashSet<TargetId> = matching
+        .iter()
+        .flat_map(|route| route.source_targets.iter().cloned())
+        .collect();
     let key = (base_url, format!("quiz:{source}"), activity_id.clone());
-    let q = quizzes.entry(key.clone()).or_insert_with(|| QuizActivity {
+    let quiz = quizzes.entry(key).or_insert_with(|| QuizActivity {
         activity_token: crate::config::new_id(),
         source: Source::parse(&source),
         course,
         course_id,
-        activity_id: activity_id.clone(),
+        activity_id,
         stem,
         attempts: HashMap::new(),
         countdown_deadline: None,
         held: false,
         discarded: false,
-        terminal_at: None,
+        sources: HashSet::new(),
+        plan_generation: generation,
+        mutation_blocked: false,
     });
-    if !q.discarded && !q.attempts.contains_key(&account_id) {
-        q.attempts
-            .insert(account_id, PerAccountAttempt::waiting(Instant::now()));
-        // A late participant invalidates a running countdown until its own paper and conflicts are known.
-        q.countdown_deadline = None;
+    quiz.sources.extend(sources);
+    if !quiz.attempts.values().any(|attempt| {
+        matches!(
+            attempt.state,
+            AttemptState::Submitting | AttemptState::Submitted
+        )
+    }) {
+        quiz.plan_generation = generation;
+    }
+    for participant in participants {
+        if !quiz.discarded && !quiz.attempts.contains_key(&participant) {
+            quiz.attempts
+                .insert(participant, PerAccountAttempt::waiting(Instant::now()));
+            quiz.countdown_deadline = None;
+        }
     }
 }
 
@@ -2620,31 +3094,6 @@ fn on_quiz_set_answer(
     Ok(())
 }
 
-/// Drop quizzes whose whole state is terminal (every attempt Submitted/Gone/Failed, or discarded)
-/// and stayed so for the retention window. The poller's `seen` set still blocks re-detection, so
-/// pruning the actor-side heavy state (subjects + answers) can never re-trigger a prepare/submit.
-fn prune_terminal_quizzes(quizzes: &mut HashMap<ActivityKey, QuizActivity>, now: Instant) {
-    for q in quizzes.values_mut() {
-        let terminal = q.discarded
-            || q.attempts.values().all(|a| {
-                matches!(
-                    a.state,
-                    AttemptState::Submitted | AttemptState::Gone | AttemptState::Failed
-                )
-            });
-        match (terminal, q.terminal_at) {
-            (true, None) => q.terminal_at = Some(now),
-            (false, _) => q.terminal_at = None, // a late participant or re-armed attempt revives it
-            _ => {}
-        }
-    }
-    let retention = Duration::from_secs(QUIZ_TERMINAL_RETENTION_SECS);
-    quizzes.retain(|_, q| {
-        q.terminal_at
-            .is_none_or(|at| now.duration_since(at) < retention)
-    });
-}
-
 fn on_quiz_tick(
     quizzes: &mut HashMap<ActivityKey, QuizActivity>,
     accounts: &HashMap<String, Arc<Account>>,
@@ -2654,7 +3103,6 @@ fn on_quiz_tick(
     cb: EventCb,
 ) {
     let now = Instant::now();
-    prune_terminal_quizzes(quizzes, now);
     let keys: Vec<ActivityKey> = quizzes.keys().cloned().collect();
     for key in keys {
         let Some(q) = quizzes.get_mut(&key) else {
@@ -2800,6 +3248,9 @@ fn dispatch_quiz_submits(
     let Some(q) = quizzes.get_mut(key) else {
         return Err("unknown quiz activity".to_string());
     };
+    if q.mutation_blocked {
+        return Err("definition_change_in_progress".to_string());
+    }
     if q.discarded {
         return Err("quiz was discarded".to_string());
     }
@@ -3634,7 +4085,9 @@ mod tests {
             countdown_deadline: None,
             held: false,
             discarded: false,
-            terminal_at: None,
+            sources: HashSet::new(),
+            plan_generation: 0,
+            mutation_blocked: false,
         };
         let emitted = quiz_prepared_event(&activity);
         for field in [
@@ -3788,8 +4241,6 @@ mod tests {
             number_max_cooldowns: 0,
             poll_idle_secs: 5,
             quiz_detect_secs: 45,
-            operating: crate::config::Operating::default(),
-            tz_offset_minutes: 0,
         }
     }
 
@@ -3828,7 +4279,9 @@ mod tests {
             countdown_deadline: None,
             held: false,
             discarded: false,
-            terminal_at: None,
+            sources: HashSet::new(),
+            plan_generation: 0,
+            mutation_blocked: false,
         };
         let mut quizzes = HashMap::new();
         quizzes.insert(key.clone(), q);
@@ -3919,6 +4372,8 @@ mod tests {
 
         on_quiz_detected(
             &mut quizzes,
+            &plan_for("acc2", &["acc2"]),
+            1,
             "http://x".to_string(),
             "exam".to_string(),
             String::new(),
@@ -4155,40 +4610,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_quizzes_prune_after_retention_but_live_ones_never() {
-        // terminal for longer than the retention window → pruned (the poller seen set still blocks
-        // re-detection, so this cannot re-trigger a submit).
-        let (mut quizzes, key) = quiz_with_conflict();
-        let q = quizzes.get_mut(&key).unwrap();
-        q.attempts.get_mut("acc1").unwrap().state = AttemptState::Submitted;
-        q.terminal_at =
-            Some(Instant::now() - Duration::from_secs(QUIZ_TERMINAL_RETENTION_SECS + 1));
-        prune_terminal_quizzes(&mut quizzes, Instant::now());
-        assert!(quizzes.is_empty());
-
-        // just-turned-terminal → kept within the retention window.
-        let (mut quizzes, key) = quiz_with_conflict();
-        quizzes
-            .get_mut(&key)
-            .unwrap()
-            .attempts
-            .get_mut("acc1")
-            .unwrap()
-            .state = AttemptState::Gone;
-        prune_terminal_quizzes(&mut quizzes, Instant::now());
-        assert!(quizzes.contains_key(&key));
-
-        // a live (Ready) quiz is never pruned and carries no terminal timestamp.
-        let (mut quizzes, key) = quiz_with_conflict();
-        let q = quizzes.get_mut(&key).unwrap();
-        q.terminal_at =
-            Some(Instant::now() - Duration::from_secs(QUIZ_TERMINAL_RETENTION_SECS + 1));
-        prune_terminal_quizzes(&mut quizzes, Instant::now());
-        assert!(quizzes.contains_key(&key));
-        assert!(quizzes[&key].terminal_at.is_none());
-    }
-
-    #[test]
     fn quiz_seen_key_includes_source_course_and_activity() {
         // The same activity id must not collide across families or courses.
         assert_ne!(
@@ -4224,28 +4645,37 @@ mod tests {
             &tx,
             &account,
             &mut seen,
-            "exam",
-            "c1",
-            &json!({"id": "42"}),
-            "",
+            QuizDetection {
+                source: "exam",
+                course_id: "c1",
+                activity: &json!({"id": "42"}),
+                stem: "",
+                generation: 1,
+            },
         );
         emit_quiz(
             &tx,
             &account,
             &mut seen,
-            "courseware-quiz",
-            "c1",
-            &json!({"id": "42"}),
-            "",
+            QuizDetection {
+                source: "courseware-quiz",
+                course_id: "c1",
+                activity: &json!({"id": "42"}),
+                stem: "",
+                generation: 1,
+            },
         );
         emit_quiz(
             &tx,
             &account,
             &mut seen,
-            "exam",
-            "c1",
-            &json!({"id": "42"}),
-            "",
+            QuizDetection {
+                source: "exam",
+                course_id: "c1",
+                activity: &json!({"id": "42"}),
+                stem: "",
+                generation: 1,
+            },
         ); // duplicate
 
         let first = rx.try_recv().expect("exam detected");
@@ -4328,11 +4758,28 @@ mod tests {
 
     fn detected_for(account: &str, rollcall: &str) -> Detected {
         Detected {
+            generation: 1,
             account_id: account.to_string(),
             base_url: "http://x".to_string(),
             rollcall_id: rollcall.to_string(),
             kind: RollcallKind::Number,
             course: String::new(),
+            course_id: None,
+        }
+    }
+
+    fn plan_for(detector: &str, participants: &[&str]) -> MonitorPlan {
+        MonitorPlan {
+            generation: 1,
+            routes: vec![MonitorRoute {
+                source_targets: vec![TargetId::account(detector)],
+                detector_account_id: detector.to_string(),
+                participant_account_ids: participants
+                    .iter()
+                    .map(|participant| (*participant).to_string())
+                    .collect(),
+                course_ids: Vec::new(),
+            }],
         }
     }
 
@@ -4355,6 +4802,9 @@ mod tests {
             sign_failed: HashSet::new(),
             needs_resign: HashSet::new(),
             resign_attempts: HashMap::new(),
+            sources: HashSet::new(),
+            plan_generation: 1,
+            mutation_blocked: false,
         }
     }
 
@@ -4407,11 +4857,14 @@ mod tests {
         // in-flight request by setting the flag the way a successful spawn would).
         on_detected(
             &mut activities,
-            &accounts,
-            &tx,
-            &group,
-            noop_cb,
-            &cfg,
+            DetectionContext {
+                accounts: &accounts,
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan_for("acc1", &["acc1"]),
+            },
             detected_for("acc1", "rc1"),
         );
         let key = (
@@ -4510,11 +4963,14 @@ mod tests {
         let mut activities = HashMap::new();
         on_detected(
             &mut activities,
-            &accounts,
-            &tx,
-            &group,
-            noop_cb,
-            &cfg,
+            DetectionContext {
+                accounts: &accounts,
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan_for("acc1", &["acc1"]),
+            },
             detected_for("acc1", "rc1"),
         );
         let key = (
@@ -4559,11 +5015,14 @@ mod tests {
         let mut activities = HashMap::new();
         on_detected(
             &mut activities,
-            &accounts,
-            &tx,
-            &group,
-            noop_cb,
-            &cfg,
+            DetectionContext {
+                accounts: &accounts,
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan_for("acc1", &["acc1"]),
+            },
             detected_for("acc1", "rc1"),
         );
         let key = (
@@ -5043,17 +5502,22 @@ mod tests {
         // acc2 detects the SAME already-acted rollcall after the dispatch.
         on_detected(
             &mut activities,
-            &accounts,
-            &tx,
-            &group,
-            noop_cb,
-            &cfg,
+            DetectionContext {
+                accounts: &accounts,
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan_for("acc2", &["acc2"]),
+            },
             Detected {
+                generation: 1,
                 account_id: "acc2".to_string(),
                 base_url: "http://127.0.0.1:1".to_string(),
                 rollcall_id: "rc1".to_string(),
                 kind: RollcallKind::Number,
                 course: String::new(),
+                course_id: None,
             },
         );
 
@@ -5214,6 +5678,127 @@ mod tests {
         assert!(
             !ran_after_drop.load(Ordering::SeqCst),
             "dropping the handle must cancel every tracked child"
+        );
+    }
+    #[test]
+    fn overlapping_group_routes_fan_out_once_and_union_sources() {
+        let cfg = cfg_countdown(15);
+        let (tx, _rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let plan = MonitorPlan {
+            generation: 9,
+            routes: vec![
+                MonitorRoute {
+                    source_targets: vec![TargetId::group("g1")],
+                    detector_account_id: "detector".into(),
+                    participant_account_ids: vec!["a".into(), "b".into()],
+                    course_ids: Vec::new(),
+                },
+                MonitorRoute {
+                    source_targets: vec![TargetId::group("g2")],
+                    detector_account_id: "detector".into(),
+                    participant_account_ids: vec!["b".into(), "c".into()],
+                    course_ids: Vec::new(),
+                },
+            ],
+        };
+        let detection = Detected {
+            generation: 9,
+            account_id: "detector".into(),
+            base_url: "https://example.test".into(),
+            rollcall_id: "rollcall".into(),
+            kind: RollcallKind::Number,
+            course: "共同課程".into(),
+            course_id: Some("course".into()),
+        };
+        let mut activities = HashMap::new();
+        on_detected(
+            &mut activities,
+            DetectionContext {
+                accounts: &HashMap::new(),
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan,
+            },
+            detection,
+        );
+        let activity = activities.values().next().unwrap();
+        assert_eq!(
+            activity.participants,
+            HashSet::from(["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
+            activity.sources,
+            HashSet::from([TargetId::group("g1"), TargetId::group("g2")])
+        );
+    }
+
+    #[test]
+    fn removing_last_source_cancels_pending_but_retains_authorized_execution() {
+        let mut pending = gate_activity(&["a"]);
+        pending.sources.insert(TargetId::account("a"));
+        let mut authorized = gate_activity(&["b"]);
+        authorized.sources.insert(TargetId::account("b"));
+        authorized.acted = true;
+        let mut activities = HashMap::from([
+            (("x".into(), "number".into(), "pending".into()), pending),
+            (
+                ("x".into(), "number".into(), "authorized".into()),
+                authorized,
+            ),
+        ]);
+        cancel_removed_sources(
+            &mut activities,
+            &mut HashMap::new(),
+            &MonitorPlan {
+                generation: 2,
+                routes: Vec::new(),
+            },
+        );
+        assert!(!activities.keys().any(|key| key.2 == "pending"));
+        assert!(activities.keys().any(|key| key.2 == "authorized"));
+    }
+
+    #[test]
+    fn definition_barrier_denies_mutation_until_rollback() {
+        let cfg = cfg_countdown(15);
+        let (tx, _rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let key = ("x".into(), "number".into(), "rollcall".into());
+        let mut activity = gate_activity(&["a"]);
+        activity.sources.insert(TargetId::account("a"));
+        activity.mutation_blocked = true;
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+        dispatch_signs(
+            &mut activities,
+            &HashMap::new(),
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            &key,
+        );
+        assert!(
+            !activities[&key].acted,
+            "barrier must deny the mutation permit"
+        );
+        activities.get_mut(&key).unwrap().mutation_blocked = false;
+        dispatch_signs(
+            &mut activities,
+            &HashMap::new(),
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            &key,
+        );
+        assert!(
+            activities[&key].acted,
+            "rollback re-enables the pending permit"
         );
     }
 }

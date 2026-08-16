@@ -109,18 +109,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"]
-                .as_array()?
-                .iter()
-                .find(|a| a["label"] == label)
-            {
-                return a["id"].as_str().map(str::to_string);
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -198,10 +187,7 @@ fn boot(tag: &str) -> (Harness, String, String) {
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     let i = hz.next();
     send(
@@ -212,11 +198,13 @@ fn boot(tag: &str) -> (Harness, String, String) {
     );
     wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let dave = account_id("dave").unwrap();
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
+    let clock_id = hz.next();
+    let start_id = hz.next();
+    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
+    wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
         10,
     )
     .expect("帳號未上線");

@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "config_revision": 12,
+  "schedule_revision": 7,
+  "plan_revision": 31,
+  "clock_revision": 9,
+  "session_state": "running",
+  "all_suspended": false,
+  "platform_block": null,
+  "can_stop_all": true,
+  "can_resume": false,
+  "global_disabled_reason": null,
+  "global_schedule": {
+    "monday": [{ "start_minute": 480, "end_minute": 720 }],
+    "tuesday": [],
+    "wednesday": [],
+    "thursday": [],
+    "friday": [],
+    "saturday": [],
+    "sunday": [{ "start_minute": 1380, "end_minute": 60 }]
+  },
+  "time_zone": { "kind": "named", "iana_id": "Asia/Taipei" },
+  "wake_mode": "foreground_only",
+  "accounts": [
+    {
+      "account_id": "student-a",
+      "label": "學生甲",
+      "school_ref": "thu",
+      "username": "s-a",
+      "role": "student",
+      "teacher_course_id": null,
+      "login_state": "online",
+      "login_error": null,
+      "login_in_flight": false,
+      "in_use_targets": [
+        { "target": { "kind": "group", "group_id": "group-a" }, "name": "東海中文課" }
+      ]
+    },
+    {
+      "account_id": "student-b",
+      "label": "學生乙",
+      "school_ref": "thu",
+      "username": "s-b",
+      "role": "student",
+      "teacher_course_id": null,
+      "login_state": "error",
+      "login_error": { "code": "login_failed", "message": "密碼錯誤" },
+      "login_in_flight": false,
+      "in_use_targets": [
+        { "target": { "kind": "group", "group_id": "group-a" }, "name": "東海中文課" }
+      ]
+    },
+    {
+      "account_id": "teacher-a",
+      "label": "教師輔助",
+      "school_ref": "thu",
+      "username": "t-a",
+      "role": "teacher",
+      "teacher_course_id": "course-zh",
+      "login_state": "stored",
+      "login_error": null,
+      "login_in_flight": false,
+      "in_use_targets": []
+    }
+  ],
+  "targets": [
+    {
+      "target": { "kind": "account", "account_id": "student-a" },
+      "name": "學生甲",
+      "runtime_state": "suppressed_by_group",
+      "schedule": { "kind": "custom", "weekly": {
+        "monday": [{ "start_minute": 540, "end_minute": 600 }],
+        "tuesday": [], "wednesday": [], "thursday": [], "friday": [],
+        "saturday": [], "sunday": []
+      } },
+      "schedule_open": true,
+      "next_boundary_utc": "2026-08-17T02:00:00Z",
+      "manual_override": { "force_open": false, "expires_at_utc": "2026-08-17T02:00:00Z" },
+      "detector": null,
+      "group_definition": null,
+      "courses": [],
+      "in_use_account_ids": [],
+      "account_results": [],
+      "can_start": true,
+      "can_stop": true,
+      "can_edit_schedule": true,
+      "disabled_reason": "已在群組中監控；個人調整會在群組結束後生效",
+      "error": null
+    },
+    {
+      "target": { "kind": "account", "account_id": "student-b" },
+      "name": "學生乙",
+      "runtime_state": "scheduled_off",
+      "schedule": { "kind": "disabled" },
+      "schedule_open": false,
+      "next_boundary_utc": null,
+      "manual_override": null,
+      "detector": null,
+      "group_definition": null,
+      "courses": [],
+      "in_use_account_ids": [],
+      "account_results": [],
+      "can_start": true,
+      "can_stop": false,
+      "can_edit_schedule": true,
+      "disabled_reason": null,
+      "error": null
+    },
+    {
+      "target": { "kind": "group", "group_id": "group-a" },
+      "name": "東海中文課",
+      "runtime_state": "monitoring",
+      "schedule": { "kind": "inherit_global" },
+      "schedule_open": true,
+      "next_boundary_utc": "2026-08-17T04:00:00Z",
+      "manual_override": null,
+      "detector": { "account_id": "student-a", "is_fallback": true },
+      "group_definition": {
+        "member_account_ids": ["student-a", "student-b"],
+        "course_ids": ["course-zh"],
+        "detector_selection": { "kind": "preferred", "account_id": "student-b" }
+      },
+      "courses": [{ "course_id": "course-zh", "name": "大學中文" }],
+      "in_use_account_ids": ["student-a", "student-b"],
+      "account_results": [
+        {
+          "account_id": "student-a",
+          "phase": "succeeded",
+          "activity_kind": "number",
+          "course_name": "大學中文",
+          "updated_at_utc": "2026-08-17T01:20:00Z",
+          "error": null
+        },
+        {
+          "account_id": "student-b",
+          "phase": "failed",
+          "activity_kind": "exam",
+          "course_name": "大學中文",
+          "updated_at_utc": "2026-08-17T01:21:00Z",
+          "error": { "code": "mutation_failed", "message": "session expired" }
+        }
+      ],
+      "can_start": false,
+      "can_stop": true,
+      "can_edit_schedule": true,
+      "disabled_reason": null,
+      "error": null
+    },
+    {
+      "target": { "kind": "group", "group_id": "group-b" },
+      "name": "跨課程群組",
+      "runtime_state": "monitoring",
+      "schedule": { "kind": "custom", "weekly": {
+        "monday": [{ "start_minute": 600, "end_minute": 660 }],
+        "tuesday": [], "wednesday": [], "thursday": [], "friday": [],
+        "saturday": [], "sunday": []
+      } },
+      "schedule_open": true,
+      "next_boundary_utc": "2026-08-17T03:00:00Z",
+      "manual_override": { "force_open": true, "expires_at_utc": null },
+      "detector": { "account_id": "student-a", "is_fallback": false },
+      "group_definition": {
+        "member_account_ids": ["student-a"],
+        "course_ids": [],
+        "detector_selection": { "kind": "auto" }
+      },
+      "courses": [],
+      "in_use_account_ids": ["student-a"],
+      "account_results": [
+        {
+          "account_id": "student-a",
+          "phase": "unknown_after_restart",
+          "activity_kind": "questionnaire",
+          "course_name": null,
+          "updated_at_utc": null,
+          "error": { "code": "unknown_after_restart", "message": "無法確認上次請求結果" }
+        }
+      ],
+      "can_start": false,
+      "can_stop": true,
+      "can_edit_schedule": true,
+      "disabled_reason": null,
+      "error": null
+    }
+  ],
+  "merge_prompts": [
+    {
+      "component_id": "component-single",
+      "group_ids": ["group-a", "group-b"],
+      "coverage": "single_detector",
+      "detector_account_id": "student-a",
+      "detector_count": 1,
+      "warning": null,
+      "acknowledged": false
+    },
+    {
+      "component_id": "component-multiple",
+      "group_ids": ["group-c", "group-d"],
+      "coverage": "multiple_detectors_required",
+      "detector_account_id": null,
+      "detector_count": 2,
+      "warning": "無單一帳號可完整涵蓋課程，目前保留 2 支監控帳號",
+      "acknowledged": true
+    }
+  ],
+  "config_notice": {
+    "code": "config_reset",
+    "message": "舊版設定已備份；帳號、群組與時間表已重設",
+    "backup_path": "config.json.pre-groups-1786870000.bak"
+  }
+}

@@ -70,18 +70,7 @@ fn send(handle: *mut std::ffi::c_void, json: &str) {
 }
 
 fn account_id_by_label(label: &str) -> Option<String> {
-    let accounts = snapshot();
-    // Scan Accounts events newest-last for the account with this label.
-    for ev in accounts.iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(list) = ev["accounts"].as_array() {
-                if let Some(a) = list.iter().find(|a| a["label"] == label) {
-                    return a["id"].as_str().map(str::to_string);
-                }
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 
 #[test]
@@ -99,10 +88,7 @@ fn seam_login_flow_end_to_end() {
     );
     assert!(wait_for(reply_ok(1), 10).is_some(), "Init should reply");
 
-    send(
-        handle,
-        r#"{"id":2,"cmd":"CreateVault","master_password":"pw"}"#,
-    );
+    send(handle, r#"{"id":2,"cmd":"CreateVault"}"#);
     assert!(
         wait_for(reply_ok(2), 10).unwrap()["ok"] == true,
         "CreateVault ok"
@@ -159,8 +145,10 @@ fn seam_login_flow_end_to_end() {
         "heartbeat ticks"
     );
     assert!(
-        snapshot().iter().any(|v| v["event"] == "StateChanged"),
-        "unsolicited StateChanged"
+        snapshot()
+            .iter()
+            .any(|v| v["event"] == "MonitoringSnapshot"),
+        "unsolicited authoritative MonitoringSnapshot"
     );
 
     unsafe { crate::core_free(handle) };

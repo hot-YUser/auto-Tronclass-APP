@@ -170,7 +170,7 @@ async fn live_school_probe() {
 }
 
 // ---- Phase 6: full monitor pipeline via the engine FFI (poll → detect → gate → sign → SignedIn) ----
-// Drives the REAL engine (Init/AddAccount/StartMonitoring) against a teacher-seeded RADAR rollcall
+// Drives the REAL engine (Init/AddAccount/ApplyScheduleClock/StartTarget) against a teacher-seeded RADAR rollcall
 // (radar signs with an empty body — no brute force). 需先以 TRON_TEACHER_* 帳號在 TRON_BASE_URL 手動開啟
 // 一筆 radar rollcall（本 repo 不含 seed/cleanup 腳本），本測試以 TRON_USER/TRON_PASS 執行簽到。
 
@@ -232,21 +232,34 @@ fn live_monitor_pipeline() {
         &serde_json::json!({"id":2,"cmd":"UpdateConfig","patch":{"attendance_gate_percent":0.0,"countdown_secs":2}}),
     );
     mon_wait(mon_reply_ok(2), 5).expect("UpdateConfig 未回覆 ok");
-    mon_send(
-        h,
-        &serde_json::json!({"id":3,"cmd":"CreateVault","master_password":"pw"}),
-    );
+    mon_send(h, &serde_json::json!({"id":3,"cmd":"CreateVault"}));
     mon_wait(mon_reply_ok(3), 5).expect("CreateVault 未回覆 ok");
     mon_send(
         h,
         &serde_json::json!({"id":4,"cmd":"AddAccount","label":"stu","school":base,"username":user,"password":pass}),
     );
     mon_wait(mon_reply_ok(4), 5).expect("AddAccount 未回覆 ok");
-    mon_send(h, &serde_json::json!({"id":5,"cmd":"StartMonitoring"}));
-    mon_wait(mon_reply_ok(5), 15).expect("StartMonitoring 未回覆 ok");
+    let events = mon_events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|raw| serde_json::from_str(raw).ok())
+        .collect::<Vec<_>>();
+    let account = crate::test_support::account_id(&events, "stu").expect("student account id");
+    let clock: serde_json::Value = serde_json::from_str(&crate::test_support::apply_clock_command(
+        5,
+        crate::test_support::latest_monitoring_snapshot(&events).unwrap(),
+    ))
+    .unwrap();
+    mon_send(h, &clock);
+    mon_wait(mon_reply_ok(5), 5).expect("ApplyScheduleClock 未回覆 ok");
+    let start: serde_json::Value =
+        serde_json::from_str(&crate::test_support::start_account_command(6, &account)).unwrap();
+    mon_send(h, &start);
+    mon_wait(mon_reply_ok(6), 15).expect("StartTarget 未回覆 ok");
 
     let online = mon_wait(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        |v| crate::test_support::event_account_login_state(v, &account, "online"),
         25,
     )
     .expect("帳號未上線");

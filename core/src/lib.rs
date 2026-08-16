@@ -8,6 +8,7 @@ mod answer;
 mod atomic_file;
 mod config;
 mod course_context;
+mod courses;
 mod engine;
 mod http;
 mod llm;
@@ -21,10 +22,14 @@ mod radar;
 mod redaction;
 mod rollcall;
 mod secrets;
+mod supervisor;
 mod teacher_qr;
 
 #[cfg(any(test, feature = "fakeserver"))]
 pub mod fake;
+
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod seam_test;

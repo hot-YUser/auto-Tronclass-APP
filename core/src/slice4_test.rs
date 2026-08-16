@@ -1,9 +1,7 @@
-//! Slice-4 tests (headless). Pure gates (scheduling / max_tokens / redaction / vault key-unlock) plus
-//! e2e over the FFI: settings persist, captcha login (challenge → submit → success), SSO→cookie
-//! fallback routing, an operating-hours-closed schedule suppressing detection, and platform-key
-//! unlock. The e2e tests share one global event sink, so they serialize via `SEQ`.
+//! Slice-4 tests (headless). Pure gates plus e2e over the FFI: settings persistence, captcha
+//! login, SSO→cookie fallback routing, and platform-key unlock.
 
-use crate::config::{new_id, Operating, Settings};
+use crate::config::{new_id, Settings};
 use crate::fake;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -12,73 +10,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ===================== pure unit tests (no FFI, run in parallel) =====================
-
-#[test]
-fn operating_gate_open_and_closed() {
-    // Empty schedule → always open.
-    assert!(Operating::default().is_open(0, 0));
-
-    // epoch 0 = 1970-01-01 00:00 UTC = Thursday (weekday 3 with Mon=0), minute 0.
-    let sched: Operating = serde_json::from_value(json!({
-        "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "00:00", "end": "01:00" }] }]
-    }))
-    .unwrap();
-    assert!(sched.is_open(0, 0), "00:00 Thu is inside 00:00–01:00");
-    assert!(sched.is_open(59 * 60, 0), "00:59 still inside");
-    assert!(
-        sched.is_open(60 * 60, 0),
-        "01:00 is the INCLUSIVE end → open (v1: start <= t <= end)"
-    );
-    assert!(!sched.is_open(61 * 60, 0), "01:01 past the window → closed");
-    assert!(!sched.is_open(2 * 3600, 0), "02:00 outside the window");
-
-    // start==end means ALL DAY (v1 default 24/7 config); any minute is open.
-    let allday: Operating = serde_json::from_value(json!({
-        "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "00:00", "end": "00:00" }] }]
-    }))
-    .unwrap();
-    assert!(
-        allday.is_open(0, 0) && allday.is_open(13 * 3600, 0),
-        "00:00–00:00 = all day open"
-    );
-
-    // A different weekday (Friday = epoch + 1 day) is not listed → inherits always-on.
-    assert!(
-        sched.is_open(86400 + 2 * 3600, 0),
-        "Friday not listed → open"
-    );
-
-    // Listed but disabled → closed even inside a would-be window.
-    let disabled: Operating = serde_json::from_value(json!({
-        "days": [{ "weekday": 3, "enabled": false, "windows": [{ "start": "00:00", "end": "23:59" }] }]
-    }))
-    .unwrap();
-    assert!(!disabled.is_open(0, 0), "disabled Thursday → closed");
-
-    // tz offset shifts the local weekday/time: +480 min pushes epoch 0 into Thursday 08:00.
-    let morning: Operating = serde_json::from_value(json!({
-        "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "07:00", "end": "09:00" }] }]
-    }))
-    .unwrap();
-    assert!(
-        morning.is_open(0, 480),
-        "UTC 00:00 + 8h = 08:00 local, inside 07:00–09:00"
-    );
-    assert!(
-        !morning.is_open(0, 0),
-        "without the offset it is 00:00, outside"
-    );
-
-    // A window that wraps past midnight.
-    let overnight: Operating = serde_json::from_value(json!({
-        "days": [{ "weekday": 3, "enabled": true, "windows": [{ "start": "22:00", "end": "02:00" }] }]
-    }))
-    .unwrap();
-    assert!(
-        overnight.is_open(30 * 60, 0),
-        "00:30 is inside a 22:00→02:00 wrap"
-    );
-}
 
 #[test]
 fn max_tokens_default_and_zero_resolve_to_16384() {
@@ -224,18 +155,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    for ev in snapshot().iter().rev() {
-        if ev["event"] == "Accounts" {
-            if let Some(a) = ev["accounts"]
-                .as_array()?
-                .iter()
-                .find(|a| a["label"] == label)
-            {
-                return a["id"].as_str().map(str::to_string);
-            }
-        }
-    }
-    None
+    crate::test_support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -309,9 +229,7 @@ fn settings_persist_over_the_seam() {
     let i = hz.next();
     let patch = r#"{"llm_max_tokens":32000,"radar_strategy":["empty_answer","global_wgs84"],
         "number_concurrency":4,"number_min_concurrency":4,"number_cooldown_ms":500,
-        "poll_idle_secs":9,"quiz_detect_secs":30,"log_level":"debug","max_answer_reask":7,
-        "tz_offset_minutes":540,
-        "operating":{"days":[{"weekday":2,"enabled":true,"windows":[{"start":"08:30","end":"17:00"}]}]}}"#;
+        "poll_idle_secs":9,"quiz_detect_secs":30,"log_level":"debug","max_answer_reask":7}"#;
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{patch}}}"#),
@@ -329,9 +247,6 @@ fn settings_persist_over_the_seam() {
     assert_eq!(s.quiz_detect_secs, 30);
     assert_eq!(s.log_level, "debug");
     assert_eq!(s.max_answer_reask, 7);
-    assert_eq!(s.tz_offset_minutes, 540);
-    assert_eq!(s.operating.days.len(), 1);
-    assert_eq!(s.operating.days[0].windows[0].start, "08:30");
     crate::redaction::set_level("normal"); // Init/UpdateConfig flipped the global level
 }
 
@@ -349,10 +264,7 @@ fn captcha_login_challenge_and_submit() {
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
 
     // Turn on the fake's captcha login page.
@@ -423,10 +335,7 @@ fn captcha_wrong_answer_fails() {
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     post(
         &base,
@@ -473,10 +382,7 @@ fn sso_login_routes_to_cookie_fallback() {
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     post(&base, "/_test/sso", r#"{"enabled":true}"#);
 
@@ -514,11 +420,11 @@ fn sso_login_routes_to_cookie_fallback() {
     wait_for(reply_ok(i), 5);
     assert!(
         wait_for(
-            |v| v["event"] == "AccountStatus" && v["account_id"].as_str() == Some(&carol),
+            |v| crate::test_support::event_account_login_state(v, &carol, "error"),
             5
         )
         .is_some(),
-        "ImportCookies reports an AccountStatus"
+        "ImportCookies 以完整 MonitoringSnapshot 回報錯誤"
     );
 }
 
@@ -536,26 +442,16 @@ fn schedule_closed_suppresses_monitoring() {
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
 
-    // All seven weekdays enabled but with no windows → closed all the time, whatever today is.
-    let days: Vec<String> = (0..7)
-        .map(|w| format!(r#"{{"weekday":{w},"enabled":true,"windows":[]}}"#))
-        .collect();
     let i = hz.next();
-    // poll_idle_secs=1：absence 窗口 5s ≥ 3× poll cadence；預設 5s 會使窗口與 cadence 相等而變飄。
+    // poll_idle_secs=1：absence 窗口 5s ≥ 3× poll cadence。
     send(
         hz.h,
-        &format!(
-            r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"poll_idle_secs":1,"operating":{{"days":[{}]}}}}}}"#,
-            days.join(",")
-        ),
+        &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{{"poll_idle_secs":1}}}}"#),
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
 
     let i = hz.next();
-    send(
-        hz.h,
-        &format!(r#"{{"id":{i},"cmd":"CreateVault","master_password":"pw"}}"#),
-    );
+    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
     wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     let i = hz.next();
     send(
@@ -565,11 +461,21 @@ fn schedule_closed_suppresses_monitoring() {
         ),
     );
     wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
+    let frank = account_id("frank").unwrap();
+    let clock_id = hz.next();
+    let clock = crate::test_support::apply_clock_command(
+        clock_id,
+        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
+    );
+    send(hz.h, &clock);
+    wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
+    let login_id = hz.next();
+    send(
+        hz.h,
+        &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{frank}"}}"#),
+    );
     wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        |v| crate::test_support::event_account_login_state(v, &frank, "online"),
         10,
     )
     .expect("帳號未上線");
@@ -589,7 +495,7 @@ fn schedule_closed_suppresses_monitoring() {
     );
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StopMonitoring"}}"#));
+    send(hz.h, &crate::test_support::stop_all_command(i));
     wait_for(reply_ok(i), 5);
 }
 
@@ -650,20 +556,21 @@ fn boot_monitoring(tag: &str, gate: f64) -> (Harness, String) {
         ),
     );
     wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"StartMonitoring"}}"#));
-    wait_for(ok_reply(i), 15).expect("StartMonitoring 未回覆 ok");
+    let eve = account_id("eve").unwrap();
+    let clock_id = hz.next();
+    let start_id = hz.next();
+    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &eve);
+    wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
+    wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     wait_for(
-        |v| v["event"] == "AccountStatus" && v["state"] == "online",
+        |v| crate::test_support::event_account_login_state(v, &eve, "online"),
         10,
     )
     .expect("帳號未上線");
     (hz, base)
 }
 
-/// A settings change must reach the RUNNING monitor. The actor owns a `MonitorConfig` snapshot and each
-/// poller a `PollTuning` clone, so before this they only ever saw the values captured at `StartMonitoring`
-/// — the user had to stop and restart monitoring for any change to bite.
+/// A settings change must reach the long-lived actor and its pollers without target restart.
 #[test]
 fn config_update_applies_to_a_running_monitor() {
     let _g = SEQ.lock().unwrap();
