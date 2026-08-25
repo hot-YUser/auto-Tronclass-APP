@@ -8,7 +8,7 @@
 
 use crate::config::{
     canonical_tenant, new_id, AccountGroup, AccountMeta, Config, DetectorSelection,
-    ScheduleBinding, Settings, TargetId, AUTOANSWER_TYPES, LOG_LEVELS, RADAR_STRATEGIES,
+    ScheduleBinding, Settings, TargetId,
 };
 use crate::login;
 use crate::login::LoginOutcome;
@@ -1540,7 +1540,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             if let Err(error) = apply_config_patch(&mut next.settings, &patch) {
                 return reply(cb, id, false, Some(error));
             }
-            if let Err(error) = validate_config(&next.settings) {
+            if let Err(error) = next.settings.validate() {
                 return reply(cb, id, false, Some(error));
             }
             if let Err(error) = next.save(&st.config_path()) {
@@ -3010,133 +3010,6 @@ fn str_vec_field(key: &str, value: &Value) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("{key} 必須全是字串"))
         })
         .collect()
-}
-
-fn validate_closed_unique(
-    name: &str,
-    values: &[String],
-    allowed: &[&str],
-    allow_empty: bool,
-) -> Result<(), String> {
-    if values.is_empty() && !allow_empty {
-        return Err(format!("{name} 不得為空"));
-    }
-    let mut seen = HashSet::with_capacity(values.len());
-    for value in values {
-        if value.is_empty() {
-            return Err(format!("{name} 不得包含空值"));
-        }
-        if !allowed.contains(&value.as_str()) {
-            return Err(format!("{name} 包含未實作值: {value}"));
-        }
-        if !seen.insert(value.as_str()) {
-            return Err(format!("{name} 不得包含重複值: {value}"));
-        }
-    }
-    Ok(())
-}
-
-/// Validate the COMPLETE post-patch settings — every range, the cross-field min<=max invariant,
-/// closed string sets, and the LLM endpoint URL shape — on the clone before anything is saved.
-/// Patch-only checks are not enough: a one-field patch must not be able to push
-/// `number_min_concurrency` above the CURRENT `number_concurrency`.
-fn validate_config(settings: &Settings) -> Result<(), String> {
-    let range = |name: &str, value: u64, min: u64, max: u64| -> Result<(), String> {
-        if !(min..=max).contains(&value) {
-            return Err(format!("{name} 必須介於 {min} 與 {max}"));
-        }
-        Ok(())
-    };
-    range("countdown_secs", settings.countdown_secs, 1, 86_400)?;
-    if !settings.attendance_gate_percent.is_finite()
-        || !(0.0..=100.0).contains(&settings.attendance_gate_percent)
-    {
-        return Err("attendance_gate_percent 必須介於 0 與 100".to_string());
-    }
-    if !valid_http_url(&settings.llm_endpoint) {
-        return Err("llm_endpoint 必須是有效的 http(s) URL".to_string());
-    }
-    if settings.llm_model.trim().is_empty() {
-        return Err("llm_model 不得為空".to_string());
-    }
-    range(
-        "llm_max_tokens",
-        u64::from(settings.llm_max_tokens),
-        0,
-        1_000_000,
-    )?;
-    validate_closed_unique(
-        "autoanswer_types",
-        &settings.autoanswer_types,
-        AUTOANSWER_TYPES,
-        true,
-    )?;
-    validate_closed_unique(
-        "radar_strategy",
-        &settings.radar_strategy,
-        RADAR_STRATEGIES,
-        false,
-    )?;
-    if !LOG_LEVELS.contains(&settings.log_level.as_str()) {
-        return Err("log_level 必須是 normal 或 debug".to_string());
-    }
-    range(
-        "max_answer_reask",
-        u64::from(settings.max_answer_reask),
-        1,
-        100,
-    )?;
-    range(
-        "prepare_retry_budget_secs",
-        settings.prepare_retry_budget_secs,
-        1,
-        86_400,
-    )?;
-    range(
-        "max_tool_iterations",
-        u64::from(settings.max_tool_iterations),
-        0,
-        100,
-    )?;
-    range(
-        "number_concurrency",
-        u64::from(settings.number_concurrency),
-        1,
-        256,
-    )?;
-    range(
-        "number_min_concurrency",
-        u64::from(settings.number_min_concurrency),
-        1,
-        256,
-    )?;
-    if settings.number_min_concurrency > settings.number_concurrency {
-        return Err("number_min_concurrency 不得大於 number_concurrency".to_string());
-    }
-    range(
-        "number_cooldown_ms",
-        settings.number_cooldown_ms,
-        1,
-        3_600_000,
-    )?;
-    range(
-        "number_max_cooldowns",
-        u64::from(settings.number_max_cooldowns),
-        0,
-        1_000,
-    )?;
-    range("poll_idle_secs", settings.poll_idle_secs, 1, 86_400)?;
-    range("quiz_detect_secs", settings.quiz_detect_secs, 1, 86_400)?;
-
-    Ok(())
-}
-
-/// Minimal URL sanity for the LLM endpoint: an http(s) scheme with a non-empty, whitespace-free
-/// target. Plain `http://` is allowed (local LLM servers); only the scheme/shape is enforced.
-fn valid_http_url(url: &str) -> bool {
-    url.strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .is_some_and(|rest| !rest.is_empty() && !rest.chars().any(char::is_whitespace))
 }
 
 /// Re-lock and cache a refreshed session — but only while the account still exists in config. The

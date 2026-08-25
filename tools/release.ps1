@@ -102,7 +102,9 @@ if (-not $PlanOnly) {
     }
 }
 if ($RequireTaggedHead) {
-    $tagCommit = [string](& git rev-parse --verify --quiet "$Tag^{commit}" 2>$null)
+    # Resolve the tag namespace explicitly: a same-named branch must never satisfy this release gate.
+    $tagRef = "refs/tags/$Tag"
+    $tagCommit = [string](& git rev-parse --verify --quiet "$tagRef^{commit}" 2>$null)
     if ($LASTEXITCODE -ne 0) { throw "找不到 git tag $Tag（-RequireTaggedHead 要求 tag 已存在）。" }
     if ($tagCommit.Trim() -ne $headSha) {
         throw "git tag $Tag 指向 $($tagCommit.Trim())，不是 HEAD $headSha（-RequireTaggedHead）。"
@@ -689,6 +691,24 @@ if (-not $SkipAndroid) {
     }
     Write-Host ("  ✓ APK versionCode=$($vcMatch.Groups[1].Value) versionName=$($vnMatch.Groups[1].Value)") -ForegroundColor Green
     Write-Host ("  ✓ dist\$apkName ({0:N0} MB)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB)) -ForegroundColor Green
+}
+
+# 長時間雙平台建置期間若 HEAD、tracked source 或要求的 tag 被移動，先前記下的 SHA 已不再
+# 能代表實際產物；在寫 metadata／發布計畫前再次 fail closed。
+$finalHeadSha = [string](& git rev-parse HEAD 2>$null)
+if ($LASTEXITCODE -ne 0 -or $finalHeadSha.Trim() -ne $headSha) {
+    throw "建置期間 HEAD 已變更；起始 $headSha，現在 $($finalHeadSha.Trim())。"
+}
+$finalGitStatus = @(& git status --porcelain 2>$null)
+if ($LASTEXITCODE -ne 0) { throw "建置完成後無法執行 git status。" }
+if ($finalGitStatus.Count -gt 0) {
+    throw "建置期間工作樹出現 $($finalGitStatus.Count) 筆變更；拒絕產生來源不明的 release metadata。"
+}
+if ($RequireTaggedHead) {
+    $finalTagCommit = [string](& git rev-parse --verify --quiet "refs/tags/$Tag^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $finalTagCommit.Trim() -ne $headSha) {
+        throw "建置期間 git tag $Tag 已消失或移動；拒絕產生 release metadata。"
+    }
 }
 
 Step "資產備妥於 dist\（尚未發布）"

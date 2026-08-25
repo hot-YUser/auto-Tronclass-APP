@@ -77,6 +77,22 @@ jobs:
           Assert-Fails {
             ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -SkipAndroid -PlanOnly
           } "不能同時跳過 Windows 與 Android"
+
+          # A branch named like a release must not satisfy -RequireTaggedHead; only refs/tags/* counts.
+          $spoof = "v0.0.0-alpha.999"
+          git branch $spoof HEAD
+          try {
+            Assert-Fails {
+              ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly
+            } "找不到 git tag"
+            git tag $spoof HEAD
+            $tagged = ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly | ConvertFrom-Json
+            if ($tagged.target -ne $headSha) { throw "真 tag plan 未綁定 exact HEAD" }
+          }
+          finally {
+            git tag -d $spoof 2>$null
+            git branch -D $spoof 2>$null
+          }
       # 工具鏈單一真理：tools/toolchain.json；版本寫入 GITHUB_ENV 供 shell 步驟使用。
       - name: Load toolchain pins
         id: load-toolchain
