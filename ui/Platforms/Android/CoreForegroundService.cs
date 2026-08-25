@@ -17,91 +17,120 @@ public sealed class CoreForegroundService : Service
     const string ChannelId = "tronclass_monitor";
     const int NotificationId = 1;
     const int DiagnosticNotificationId = 2;
+    readonly ForegroundServiceHandshakeState _handshake = new();
     ICore? _core;
-    ScheduleCoordinator? _schedule;
+    Action<JsonElement>? _coreEventHandler;
     string _status = "正在初始化排程…";
-    int _handshakeGeneration;
-    int _stopping;
-    int _handshakeReady;
 
     public override IBinder? OnBind(Intent? intent) => null;
 
     public override StartCommandResult OnStartCommand(Intent? intent, StartCommandFlags flags, int startId)
     {
-        CreateChannel();
-        var notification = BuildNotification(_status);
-        if (OperatingSystem.IsAndroidVersionAtLeast(29))
-            StartForeground(
-                NotificationId,
-                notification,
-                global::Android.Content.PM.ForegroundService.TypeDataSync);
-        else
-            StartForeground(NotificationId, notification);
-
-        _core = IPlatformApplication.Current?.Services.GetService<ICore>();
-        _schedule = IPlatformApplication.Current?.Services.GetService<ScheduleCoordinator>();
-        if (_core is null || _schedule is null)
+        // Claim the new generation before publishing anything. This cancels every old continuation and
+        // makes already-queued old event callbacks fail their lease check.
+        var generation = _handshake.Begin();
+        if (!_handshake.TryRun(generation, () =>
         {
-            FailAndStop(startId, "無法取得核心服務。");
+            _status = "正在初始化排程…";
+            CreateChannel();
+            var notification = BuildNotification(_status);
+            if (OperatingSystem.IsAndroidVersionAtLeast(29))
+                StartForeground(
+                    NotificationId,
+                    notification,
+                    global::Android.Content.PM.ForegroundService.TypeDataSync);
+            else
+                StartForeground(NotificationId, notification);
+        })) return StartCommandResult.NotSticky;
+
+        if (_core is not null && _coreEventHandler is not null)
+            _core.EventReceived -= _coreEventHandler;
+        _coreEventHandler = null;
+
+        var core = IPlatformApplication.Current?.Services.GetService<ICore>();
+        var schedule = IPlatformApplication.Current?.Services.GetService<ScheduleCoordinator>();
+        _core = core;
+        if (core is null || schedule is null)
+        {
+            FailAndStop(generation, startId, "無法取得核心服務。");
             return StartCommandResult.NotSticky;
         }
-        _core.EventReceived -= OnCoreEvent;
-        _core.EventReceived += OnCoreEvent;
-        Volatile.Write(ref _handshakeReady, 0);
-        Volatile.Write(ref _stopping, 0);
+
+        // NativeCore drains events on the ThreadPool. Capture this generation so an invocation list
+        // copied before unsubscribe still cannot mutate a newer service start.
+        _coreEventHandler = coreEvent => OnCoreEvent(generation, coreEvent);
+        core.EventReceived += _coreEventHandler;
+
         var scheduled = intent is null || intent.Action == AndroidScheduleAlarms.ServiceAction;
-        var generation = Interlocked.Increment(ref _handshakeGeneration);
-        _ = HandshakeAsync(startId, generation, scheduled);
+        _ = HandshakeAsync(startId, generation, scheduled, core, schedule);
         return scheduled ? StartCommandResult.Sticky : StartCommandResult.NotSticky;
     }
 
-    async Task HandshakeAsync(int startId, int generation, bool scheduled)
+    async Task HandshakeAsync(
+        int startId,
+        ForegroundServiceHandshakeState.Lease generation,
+        bool scheduled,
+        ICore core,
+        ScheduleCoordinator schedule)
     {
         try
         {
-            await _schedule!.BootAsync(DataPaths.Resolve());
-            await _schedule.OnResumeAsync();
-            var snapshot = await GetSnapshotAsync();
+            await _handshake.RunAsync(generation, () => schedule.BootAsync(DataPaths.Resolve()));
+            await _handshake.RunAsync(generation, schedule.OnResumeAsync);
+            var snapshot = await GetSnapshotAsync(generation, core);
             if (snapshot.PlatformBlock is { } block)
             {
-                var clear = await _core!.SendAsync(
-                    "ClearPlatformLimit",
-                    ("reason", block.Reason));
+                var clear = await _handshake.RunAsync(
+                    generation,
+                    () => core.SendAsync("ClearPlatformLimit", ("reason", block.Reason)));
                 if (!ReplyOk(clear)) throw new InvalidOperationException(ReplyError(clear));
             }
-            var mode = AndroidScheduleAlarms.CurrentWakeMode(this);
-            var modeReply = await _core!.SendAsync(
-                "ClearPlatformLimit",
-                ("reason", $"wake_mode:{mode}"));
-            if (!ReplyOk(modeReply)) throw new InvalidOperationException(ReplyError(modeReply));
-            snapshot = await GetSnapshotAsync();
-            if (generation != Volatile.Read(ref _handshakeGeneration)) return;
 
+            var mode = AndroidScheduleAlarms.CurrentWakeMode(this);
+            var modeReply = await _handshake.RunAsync(
+                generation,
+                () => core.SendAsync("ClearPlatformLimit", ("reason", $"wake_mode:{mode}")));
+            if (!ReplyOk(modeReply)) throw new InvalidOperationException(ReplyError(modeReply));
+
+            snapshot = await GetSnapshotAsync(generation, core);
             if (!scheduled && !NeedsForegroundService(snapshot))
             {
                 // StartTarget 緊接在使用者授權的 FGS start 後送出；給該命令一個有界交會窗，
                 // 避免 handshake 比命令快而先自停，卻不把空服務長期留著消耗配額。
-                await Task.Delay(TimeSpan.FromSeconds(3));
-                snapshot = await GetSnapshotAsync();
+                await _handshake.DelayAsync(generation, TimeSpan.FromSeconds(3));
+                snapshot = await GetSnapshotAsync(generation, core);
             }
-            Volatile.Write(ref _handshakeReady, 1);
+
             if (!NeedsForegroundService(snapshot))
             {
-                StopForegroundAndSelf(startId);
+                _handshake.TryStop(generation, () => StopForegroundAndSelf(startId));
                 return;
             }
-            _status = scheduled ? "排程監控中" : "監控中";
-            UpdateNotification();
+
+            _handshake.TrySucceed(generation, () =>
+            {
+                _status = scheduled ? "排程監控中" : "監控中";
+                UpdateNotification();
+            });
+        }
+        catch (System.OperationCanceledException) when (
+            generation.Cancellation.IsCancellationRequested || !_handshake.IsCurrent(generation))
+        {
+            // A newer start, timeout, stop, or destroy owns the service now. Cancellation is not failure.
         }
         catch (Exception error)
         {
-            FailAndStop(startId, $"排程啟動失敗：{error.Message}");
+            FailAndStop(generation, startId, $"排程啟動失敗：{error.Message}");
         }
     }
 
-    async Task<MonitoringSnapshotContract> GetSnapshotAsync()
+    async Task<MonitoringSnapshotContract> GetSnapshotAsync(
+        ForegroundServiceHandshakeState.Lease generation,
+        ICore core)
     {
-        var reply = await _core!.SendAsync("GetMonitoringSnapshot");
+        var reply = await _handshake.RunAsync(
+            generation,
+            () => core.SendAsync("GetMonitoringSnapshot"));
         if (!ReplyOk(reply)) throw new InvalidOperationException(ReplyError(reply));
         return MonitoringSnapshotContract.Parse(
             WireShape.Required(WireShape.Required(reply, "data"), "snapshot"));
@@ -119,40 +148,50 @@ public sealed class CoreForegroundService : Service
         global::Android.Content.PM.ForegroundService fgsType)
     {
         _core ??= IPlatformApplication.Current?.Services.GetService<ICore>();
-        if (_core is not null)
+        _handshake.TryStopCurrent(() =>
         {
-            var suspend = _core.SendAsync(
-                "SuspendForPlatformLimit",
-                ("reason", "android_data_sync_timeout"));
-            _ = suspend.ContinueWith(
-                static task => _ = task.Exception,
-                CancellationToken.None,
-                TaskContinuationOptions.OnlyOnFaulted,
-                TaskScheduler.Default);
-        }
-        try
-        {
-            ShowDiagnostic(
-                "背景監控已由 Android 暫停",
-                "已達 dataSync 背景時數；只停止新偵測，不會假裝撤回已送出的請求。請開啟 App 恢復。");
-        }
-        finally
-        {
-            StopForegroundAndSelf(startId);
-        }
+            if (_core is not null)
+            {
+                var suspend = _core.SendAsync(
+                    "SuspendForPlatformLimit",
+                    ("reason", "android_data_sync_timeout"));
+                _ = suspend.ContinueWith(
+                    static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+            }
+            try
+            {
+                ShowDiagnostic(
+                    "背景監控已由 Android 暫停",
+                    "已達 dataSync 背景時數；只停止新偵測，不會假裝撤回已送出的請求。請開啟 App 恢復。");
+            }
+            finally
+            {
+                StopForegroundAndSelf(startId);
+            }
+        });
     }
 
     public override void OnDestroy()
     {
-        if (_core is not null) _core.EventReceived -= OnCoreEvent;
-        Interlocked.Increment(ref _handshakeGeneration);
+        _handshake.Destroy();
+        if (_core is not null && _coreEventHandler is not null)
+            _core.EventReceived -= _coreEventHandler;
+        _coreEventHandler = null;
+        _core = null;
         StopForeground(StopForegroundFlags.Remove);
         base.OnDestroy();
     }
 
-    void OnCoreEvent(JsonElement coreEvent)
+    void OnCoreEvent(
+        ForegroundServiceHandshakeState.Lease generation,
+        JsonElement coreEvent)
     {
-        if (!coreEvent.TryGetProperty("event", out var eventName)) return;
+        if (!_handshake.IsCurrent(generation) ||
+            !coreEvent.TryGetProperty("event", out var eventName)) return;
+
         switch (eventName.GetString())
         {
             case "MonitoringSnapshot":
@@ -160,47 +199,51 @@ public sealed class CoreForegroundService : Service
                 {
                     var snapshot = MonitoringSnapshotContract.Parse(
                         WireShape.Required(coreEvent, "snapshot"));
-                    if (Volatile.Read(ref _handshakeReady) != 0 &&
+                    if (_handshake.IsReady(generation) &&
                         !NeedsForegroundService(snapshot))
                     {
-                        StopForegroundAndSelf();
+                        _handshake.TryStop(generation, () => StopForegroundAndSelf());
                         return;
                     }
-                    _status = snapshot.SessionState switch
+                    _handshake.TryRun(generation, () =>
                     {
-                        "starting" => "正在準備監控…",
-                        "stopping" => "正在完成已授權工作…",
-                        "platform_blocked" => "平台限制已暫停新偵測",
-                        _ => $"監控中 · {snapshot.Targets.Count(target => target.RuntimeState == "monitoring")} 個目標",
-                    };
-                    UpdateNotification();
+                        _status = snapshot.SessionState switch
+                        {
+                            "starting" => "正在準備監控…",
+                            "stopping" => "正在完成已授權工作…",
+                            "platform_blocked" => "平台限制已暫停新偵測",
+                            _ => $"監控中 · {snapshot.Targets.Count(target => target.RuntimeState == "monitoring")} 個目標",
+                        };
+                        UpdateNotification();
+                    });
                 }
                 catch (FormatException error)
                 {
-                    FailAndStop(null, $"核心快照無效：{error.Message}");
+                    FailAndStop(generation, null, $"核心快照無效：{error.Message}");
                 }
                 break;
             case "RollcallDetected":
-                SetStatus("偵測到點名，處理中…");
+                SetStatus(generation, "偵測到點名，處理中…");
                 break;
             case "SignedIn":
-                SetStatus("已簽到，繼續監控中");
+                SetStatus(generation, "已簽到，繼續監控中");
                 break;
             case "QuizPrepared":
-                SetStatus("偵測到測驗，備答中…");
+                SetStatus(generation, "偵測到測驗，備答中…");
                 break;
             case "QuizSubmitted":
-                SetStatus("已送出測驗，繼續監控中");
+                SetStatus(generation, "已送出測驗，繼續監控中");
                 break;
         }
     }
 
-    void SetStatus(string status)
-    {
-        if (_status == status) return;
-        _status = status;
-        UpdateNotification();
-    }
+    void SetStatus(ForegroundServiceHandshakeState.Lease generation, string status) =>
+        _handshake.TryRun(generation, () =>
+        {
+            if (_status == status) return;
+            _status = status;
+            UpdateNotification();
+        });
 
     void UpdateNotification()
     {
@@ -208,22 +251,25 @@ public sealed class CoreForegroundService : Service
         manager?.Notify(NotificationId, BuildNotification(_status));
     }
 
-    void FailAndStop(int? startId, string message)
-    {
-        global::Android.Util.Log.Warn(nameof(CoreForegroundService), message);
-        try
+    void FailAndStop(
+        ForegroundServiceHandshakeState.Lease generation,
+        int? startId,
+        string message) =>
+        _handshake.TryStop(generation, () =>
         {
-            ShowDiagnostic("無法啟動排程監控", message);
-        }
-        finally
-        {
-            StopForegroundAndSelf(startId);
-        }
-    }
+            global::Android.Util.Log.Warn(nameof(CoreForegroundService), message);
+            try
+            {
+                ShowDiagnostic("無法啟動排程監控", message);
+            }
+            finally
+            {
+                StopForegroundAndSelf(startId);
+            }
+        });
 
     void StopForegroundAndSelf(int? startId = null)
     {
-        if (Interlocked.Exchange(ref _stopping, 1) != 0) return;
         StopForeground(StopForegroundFlags.Remove);
         if (startId is { } id) StopSelf(id);
         else StopSelf();

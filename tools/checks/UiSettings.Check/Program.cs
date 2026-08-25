@@ -115,11 +115,74 @@ Assert(
     "inexact_user_action_required",
     "拒絕 exact access 時 wake_mode 必須 fail closed");
 
+var handshakes = new ForegroundServiceHandshakeState();
+var handshakeEffects = new List<string>();
+var generation1 = handshakes.Begin();
+var generation2 = handshakes.Begin();
+Assert(generation2.Generation > generation1.Generation, "新 start 必須取得較新的 generation");
+Assert(generation1.Cancellation.IsCancellationRequested, "gen2 必須取消 gen1");
+Assert(!handshakes.TryStop(generation1, () => handshakeEffects.Add("gen1-fail-stop")),
+    "gen1 fail/catch 不得停止 gen2");
+Assert(!handshakes.TryRun(generation1, () => handshakeEffects.Add("gen1-notification")),
+    "gen1 callback 不得更新 gen2 notification");
+await AssertCanceled(
+    () => handshakes.RunAsync(generation1, () =>
+    {
+        handshakeEffects.Add("gen1-platform-clear");
+        return Task.CompletedTask;
+    }),
+    "gen1 stale platform-block command 必須在派送前取消");
+Assert(handshakes.TrySucceed(generation2, () =>
+{
+    handshakeEffects.Add("gen2-success");
+    handshakeEffects.Add("gen2-notification");
+}), "gen2 success 必須可提交");
+Assert(handshakes.IsReady(generation2), "gen2 success 後必須 ready");
+Assert(handshakeEffects.SequenceEqual(["gen2-success", "gen2-notification"]),
+    "gen1 fail/platform/notification 副作用必須全數無效，只有 gen2 success 可見");
+
+var staleSuccess = handshakes.Begin();
+var currentSuccess = handshakes.Begin();
+Assert(!handshakes.TrySucceed(staleSuccess, () => handshakeEffects.Add("stale-success")),
+    "stale success 不得標記新版 ready");
+Assert(!handshakes.IsReady(currentSuccess), "stale success 後新版仍不得 ready");
+Assert(handshakes.TrySucceed(currentSuccess, () => handshakeEffects.Add("current-success")),
+    "current success 必須仍可提交");
+
+var destroyed = handshakes.Begin();
+handshakes.Destroy();
+Assert(destroyed.Cancellation.IsCancellationRequested, "destroy 必須取消 current handshake");
+Assert(!handshakes.IsCurrent(destroyed) && !handshakes.IsReady(destroyed),
+    "destroy 後舊 lease 不得 current/ready");
+Assert(!handshakes.TryRun(destroyed, () => handshakeEffects.Add("destroy-notification")) &&
+       !handshakes.TryStop(destroyed, () => handshakeEffects.Add("destroy-stop")),
+    "destroy 後排隊中的 notification/stop 必須無效");
+
+var timedOut = handshakes.Begin();
+var timeoutStops = 0;
+Assert(handshakes.TryStopCurrent(() => timeoutStops++), "timeout 必須可 claim current stop");
+Assert(timedOut.Cancellation.IsCancellationRequested, "timeout stop 必須先取消 handshake");
+Assert(!handshakes.TryStopCurrent(() => timeoutStops++) && timeoutStops == 1,
+    "同一代 stop 副作用只能執行一次");
+
 Console.WriteLine("UiSettings.Check：全部通過");
 
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException($"設定邏輯檢查失敗：{message}");
+}
+
+static async Task AssertCanceled(Func<Task> action, string message)
+{
+    try
+    {
+        await action();
+    }
+    catch (OperationCanceledException)
+    {
+        return;
+    }
+    throw new InvalidOperationException($"設定邏輯檢查失敗：{message}");
 }
 
 sealed class ScheduleCoreFake : ICore
