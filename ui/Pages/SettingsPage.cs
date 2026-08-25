@@ -63,7 +63,7 @@ public sealed class SettingsPage : ContentPage
                 SettingRow("啟用門檻", "關閉後任何點名都會處理", _thresholdOn),
                 Theme.Primary("儲存監控設定", async () =>
                 {
-                    if (!int.TryParse(_countdown.Text, out var secs) || secs < 0 ||
+                    if (!SettingsSync.TryParseCountdown(_countdown.Text, out var secs) ||
                         !double.TryParse(_threshold.Text, out var pct) || pct is < 0 or > 100)
                     {
                         state.Notify("error", "數值格式不正確");

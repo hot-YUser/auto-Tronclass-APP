@@ -3,6 +3,10 @@ namespace Ui;
 /// <summary>設定頁的純邏輯；無 MAUI 相依，可由 console contract check 直接編譯。</summary>
 internal static class SettingsSync
 {
+    /// <summary>倒數必須落在 core 的 1..=86400 秒契約內。</summary>
+    public static bool TryParseCountdown(string? text, out int seconds) =>
+        int.TryParse(text, out seconds) && seconds is >= 1 and <= 86_400;
+
     /// <summary>門檻停用(core 存 0)時畫面顯示的預設值。</summary>
     public static string CanonicalGateText(double attendanceGatePercent) =>
         (attendanceGatePercent > 0 ? attendanceGatePercent : 15).ToString("0.#");

@@ -7,6 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_SCHEMA_VERSION: u8 = 1;
+pub(crate) const AUTOANSWER_TYPES: &[&str] = &[
+    "exam",
+    "questionnaire",
+    "homework",
+    "vote",
+    "classroom",
+    "courseware",
+];
+pub(crate) const RADAR_STRATEGIES: &[&str] = &["empty_answer", "global_wgs84"];
+pub(crate) const LOG_LEVELS: &[&str] = &["normal", "debug"];
 const MINUTES_PER_DAY: u16 = 1_440;
 const MINUTES_PER_WEEK: u32 = 7 * MINUTES_PER_DAY as u32;
 
@@ -630,20 +640,16 @@ fn default_tool_iterations() -> u32 {
     3
 }
 fn default_autoanswer_types() -> Vec<String> {
-    [
-        "exam",
-        "questionnaire",
-        "homework",
-        "vote",
-        "classroom",
-        "courseware",
-    ]
-    .iter()
-    .map(|value| (*value).to_string())
-    .collect()
+    AUTOANSWER_TYPES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
 }
 fn default_radar_strategy() -> Vec<String> {
-    vec!["empty_answer".to_string(), "global_wgs84".to_string()]
+    RADAR_STRATEGIES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
 }
 fn default_number_concurrency() -> u32 {
     100

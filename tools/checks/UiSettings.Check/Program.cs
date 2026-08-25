@@ -2,7 +2,16 @@ using System.Text.Json;
 using TronClass.Interop;
 using Ui;
 
-// 設定頁未儲存編輯保護的純邏輯(SettingsPage 共用)。
+// 設定頁未儲存編輯保護與輸入契約的純邏輯(SettingsPage 共用)。
+
+Assert(SettingsSync.TryParseCountdown("1", out var oneSecond) && oneSecond == 1,
+    "countdown 1 必須接受");
+Assert(SettingsSync.TryParseCountdown("86400", out var oneDay) && oneDay == 86_400,
+    "countdown 86400 必須接受");
+Assert(!SettingsSync.TryParseCountdown("0", out _), "countdown 0 必須拒絕");
+Assert(!SettingsSync.TryParseCountdown("-1", out _), "countdown 負數必須拒絕");
+Assert(!SettingsSync.TryParseCountdown("86401", out _), "countdown 超過一天必須拒絕");
+Assert(!SettingsSync.TryParseCountdown("fast", out _), "countdown 非整數必須拒絕");
 
 Assert(SettingsSync.CanonicalGateText(0) == "15", "gate 0 → 顯示 15");
 Assert(SettingsSync.CanonicalGateText(15.0) == "15", "gate 15 → 15");

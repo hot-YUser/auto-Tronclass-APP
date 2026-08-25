@@ -8,7 +8,7 @@
 
 use crate::config::{
     canonical_tenant, new_id, AccountGroup, AccountMeta, Config, DetectorSelection,
-    ScheduleBinding, Settings, TargetId,
+    ScheduleBinding, Settings, TargetId, AUTOANSWER_TYPES, LOG_LEVELS, RADAR_STRATEGIES,
 };
 use crate::login;
 use crate::login::LoginOutcome;
@@ -3012,10 +3012,34 @@ fn str_vec_field(key: &str, value: &Value) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// Validate the COMPLETE post-patch settings — every range, the cross-field min<=max invariant, and
-/// the LLM endpoint URL shape — on the clone before anything is saved. Patch-only checks are not
-/// enough: a one-field patch must not be able to push `number_min_concurrency` above the CURRENT
-/// `number_concurrency`.
+fn validate_closed_unique(
+    name: &str,
+    values: &[String],
+    allowed: &[&str],
+    allow_empty: bool,
+) -> Result<(), String> {
+    if values.is_empty() && !allow_empty {
+        return Err(format!("{name} 不得為空"));
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() {
+            return Err(format!("{name} 不得包含空值"));
+        }
+        if !allowed.contains(&value.as_str()) {
+            return Err(format!("{name} 包含未實作值: {value}"));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(format!("{name} 不得包含重複值: {value}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the COMPLETE post-patch settings — every range, the cross-field min<=max invariant,
+/// closed string sets, and the LLM endpoint URL shape — on the clone before anything is saved.
+/// Patch-only checks are not enough: a one-field patch must not be able to push
+/// `number_min_concurrency` above the CURRENT `number_concurrency`.
 fn validate_config(settings: &Settings) -> Result<(), String> {
     let range = |name: &str, value: u64, min: u64, max: u64| -> Result<(), String> {
         if !(min..=max).contains(&value) {
@@ -3032,12 +3056,30 @@ fn validate_config(settings: &Settings) -> Result<(), String> {
     if !valid_http_url(&settings.llm_endpoint) {
         return Err("llm_endpoint 必須是有效的 http(s) URL".to_string());
     }
+    if settings.llm_model.trim().is_empty() {
+        return Err("llm_model 不得為空".to_string());
+    }
     range(
         "llm_max_tokens",
         u64::from(settings.llm_max_tokens),
-        1,
+        0,
         1_000_000,
     )?;
+    validate_closed_unique(
+        "autoanswer_types",
+        &settings.autoanswer_types,
+        AUTOANSWER_TYPES,
+        true,
+    )?;
+    validate_closed_unique(
+        "radar_strategy",
+        &settings.radar_strategy,
+        RADAR_STRATEGIES,
+        false,
+    )?;
+    if !LOG_LEVELS.contains(&settings.log_level.as_str()) {
+        return Err("log_level 必須是 normal 或 debug".to_string());
+    }
     range(
         "max_answer_reask",
         u64::from(settings.max_answer_reask),
@@ -4345,9 +4387,17 @@ mod tests {
             r#"{"countdown_secs":"fast"}"#,
             r#"{"countdown_secs":true}"#,
             r#"{"autoanswer_types":["exam",5]}"#,
+            r#"{"autoanswer_types":["exam","exam"]}"#,
+            r#"{"autoanswer_types":["exam","future_kind"]}"#,
+            r#"{"radar_strategy":[]}"#,
+            r#"{"radar_strategy":["empty_answer",""]}"#,
+            r#"{"radar_strategy":["global_wgs84","global_wgs84"]}"#,
+            r#"{"radar_strategy":["future_strategy"]}"#,
             r#"{"llm_endpoint":"not-a-url"}"#,
             r#"{"llm_endpoint":"ftp://example.com/v1"}"#,
             r#"{"llm_endpoint":""}"#,
+            r#"{"llm_model":"   "}"#,
+            r#"{"log_level":"verbose"}"#,
             r#"{"attendance_gate_percent":150}"#,
         ];
         for (index, patch) in bad_patches.iter().enumerate() {
@@ -4384,16 +4434,39 @@ mod tests {
             before,
             "unknown key must not touch the file"
         );
-        // ...and a valid patch still applies afterwards.
+        // ...and a valid patch still applies afterwards. Because validation covers the complete clone,
+        // this also proves none of the failed semantic patches leaked into memory. Zero max_tokens is
+        // a supported persisted sentinel; llm::resolve_max_tokens keeps resolving it to 16384.
         send(
             &core,
-            r#"{"id":100,"cmd":"UpdateConfig","patch":{"poll_idle_secs":7}}"#.as_bytes(),
+            r#"{"id":100,"cmd":"UpdateConfig","patch":{"poll_idle_secs":7,"llm_max_tokens":0}}"#
+                .as_bytes(),
         );
         assert!(wait_for(
             |v| v["event"] == "Reply" && v["id"] == 100 && v["ok"] == true,
             5
         )
         .is_some());
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(on_disk["settings"]["poll_idle_secs"], 7);
+        assert_eq!(on_disk["settings"]["llm_max_tokens"], 0);
+        assert_eq!(
+            on_disk["settings"]["llm_model"],
+            Settings::default().llm_model
+        );
+        assert_eq!(
+            on_disk["settings"]["autoanswer_types"],
+            json!(Settings::default().autoanswer_types)
+        );
+        assert_eq!(
+            on_disk["settings"]["radar_strategy"],
+            json!(Settings::default().radar_strategy)
+        );
+        assert_eq!(
+            on_disk["settings"]["log_level"],
+            Settings::default().log_level
+        );
     }
 
     // ===================== async panic backstop / monitor watchdog =====================
