@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 #requires -Version 7.4
 # Maintainer-only binding regeneration — never invoked during normal cargo build/CI/release.
-# Generates csbindgen output outside tracked path, validates, then atomically replaces
-# ui/Interop/NativeMethods.g.cs with unique sibling temp, exclusive create, flush, atomic rename.
+# Uses committed repo-local tools/bindings-generator (Cargo.lock pinned, --locked --offline, no network).
+# Transactional state machine: original bytes retained; backup deleted only after post-verify succeeds.
 
 param(
     [switch]$CheckOnly
@@ -15,6 +15,11 @@ Set-Location $root
 
 $tracked = Join-Path $root "ui/Interop/NativeMethods.g.cs"
 $trackedDir = Split-Path -Parent $tracked
+$generatorManifest = Join-Path $tools "bindings-generator/Cargo.toml"
+$generatorInput = Join-Path $root "core/src/lib.rs"
+# CI version-match gate: generator and core must pin same csbindgen.
+$genLock = Join-Path $tools "bindings-generator/Cargo.lock"
+$coreLock = Join-Path $root "core/Cargo.lock"
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 if (Test-Path -LiteralPath $cargoBin -PathType Container) { $env:PATH = "$cargoBin;$env:PATH" }
 $cargo = Join-Path $cargoBin "cargo.exe"
@@ -26,56 +31,69 @@ $stagingTmp = $null
 $backupPath = $null
 $injectFail = $env:TRONCLASS_UPDATE_BINDINGS_INJECT_FAIL
 
-function Cleanup {
+function Get-CsbindgenVersionFromLock {
+    param([string]$LockPath)
+    if (-not (Test-Path -LiteralPath $LockPath -PathType Leaf)) { return $null }
+    $text = Get-Content -Raw -LiteralPath $LockPath
+    $m = [regex]::Match($text, 'name\s*=\s*"csbindgen"\s*\r?\nversion\s*=\s*"([^"]+)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
+}
+
+function Cleanup-GenTmp {
     try { if ($genTmpDir -and (Test-Path -LiteralPath $genTmpDir -PathType Container)) { Remove-Item -LiteralPath $genTmpDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
-    try { if ($stagingTmp -and (Test-Path -LiteralPath $stagingTmp -PathType Leaf)) { Remove-Item -LiteralPath $stagingTmp -Force -ErrorAction SilentlyContinue } } catch {}
-    try { if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) { Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue } } catch {}
+}
+
+function Cleanup-StagingWithRetry {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    for ($r = 0; $r -lt 4; $r++) {
+        try {
+            if (Test-Path -LiteralPath $Path -PathType Leaf) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            }
+            return $true
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds (50 * ($r + 1))
+        } catch { break }
+    }
+    if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Host "  leftover staging (ignored, not compiled): $Path (AV lock?)" -ForegroundColor Yellow
+        return $false
+    }
+    return $true
 }
 
 try {
+    if (-not (Test-Path -LiteralPath $generatorManifest -PathType Leaf)) { throw "missing generator manifest: $generatorManifest" }
+    if (-not (Test-Path -LiteralPath $genLock -PathType Leaf)) { throw "missing generator lock: $genLock" }
+    # Version match assertion
+    $genVer = Get-CsbindgenVersionFromLock -LockPath $genLock
+    $coreVer = Get-CsbindgenVersionFromLock -LockPath $coreLock
+    if ($genVer -and $coreVer -and $genVer -ne $coreVer) {
+        throw "csbindgen version mismatch: generator $genVer vs core $coreVer (fix tools/bindings-generator/Cargo.toml to =${coreVer})"
+    }
+
     New-Item -ItemType Directory -Force -Path $genTmpDir | Out-Null
-    $genProjDir = Join-Path $genTmpDir "gen"
-    New-Item -ItemType Directory -Force -Path $genProjDir | Out-Null
-    @"
-[package]
-name = "tron-bindings-gen"
-version = "0.1.0"
-edition = "2021"
-[dependencies]
-csbindgen = "1"
-"@ | Set-Content -LiteralPath (Join-Path $genProjDir "Cargo.toml") -Encoding UTF8
 
-    New-Item -ItemType Directory -Force -Path (Join-Path $genProjDir "src") | Out-Null
-    $coreLib = Join-Path $root "core/src/lib.rs"
-    $coreLibEsc = $coreLib.Replace('\', '/')
-    @"
-fn main() {
-    let out = std::env::args().nth(1).expect("output path required");
-    csbindgen::Builder::default()
-        .input_extern_file("$coreLibEsc")
-        .csharp_dll_name("tronclass_core")
-        .csharp_namespace("TronClass.Interop")
-        .csharp_class_name("NativeMethods")
-        .generate_csharp_file(&out)
-        .expect("csbindgen generate failed");
-}
-"@ | Set-Content -LiteralPath (Join-Path $genProjDir "src/main.rs") -Encoding UTF8
-
-    Write-Host "  generating bindings via csbindgen..." -ForegroundColor Cyan
-    & $cargo run --manifest-path (Join-Path $genProjDir "Cargo.toml") --quiet -- $genOutput 2>&1
+    Write-Host "  generating bindings via locked generator..." -ForegroundColor Cyan
+    # --locked --offline ensures no network, no floating.
+    & $cargo run --manifest-path $generatorManifest --locked --offline --quiet -- $generatorInput $genOutput 2>&1
     if ($LASTEXITCODE -ne 0) { throw "csbindgen generation failed (exit $LASTEXITCODE)" }
     if (-not (Test-Path -LiteralPath $genOutput -PathType Leaf)) { throw "generator did not produce $genOutput" }
 
-    $newBytes = [IO.File]::ReadAllBytes($genOutput)
+    $newBytes = [System.IO.File]::ReadAllBytes($genOutput)
+    # Gen temp is system temp; cleanup with bounded retries (AV lock can leave residue).
+    Cleanup-GenTmp
     if ($newBytes.Length -eq 0) { throw "generated bindings are empty" }
-    $text = [Text.Encoding]::UTF8.GetString($newBytes)
+    $text = [System.Text.Encoding]::UTF8.GetString($newBytes)
     if ($text -notmatch "NativeMethods" -or $text -notmatch "core_init") {
         throw "generated bindings failed validation (missing expected symbols)"
     }
 
     if ($CheckOnly) {
         if (-not (Test-Path -LiteralPath $tracked -PathType Leaf)) { throw "tracked bindings missing at $tracked" }
-        $oldBytes = [IO.File]::ReadAllBytes($tracked)
+        $oldBytes = [System.IO.File]::ReadAllBytes($tracked)
         $same = $newBytes.Length -eq $oldBytes.Length
         if ($same) {
             for ($i = 0; $i -lt $newBytes.Length; $i++) { if ($newBytes[$i] -ne $oldBytes[$i]) { $same = $false; break } }
@@ -88,7 +106,20 @@ fn main() {
         New-Item -ItemType Directory -Force -Path $trackedDir | Out-Null
     }
 
-    # Allocate unique sibling temp with CreateNew (exclusive)
+    # Retain original bytes/hash for rollback.
+    $hadOriginal = Test-Path -LiteralPath $tracked -PathType Leaf
+    $originalBytes = $null
+    $originalHash = $null
+    if ($hadOriginal) {
+        $originalBytes = [System.IO.File]::ReadAllBytes($tracked)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $originalHash = [Convert]::ToHexString($sha.ComputeHash($originalBytes)).ToLowerInvariant() }
+        finally { $sha.Dispose() }
+    }
+
+    if ($injectFail -eq "before-replace") { throw "injected failure before replace (testing rollback)" }
+
+    # Allocate unique same-dir staging with CreateNew (exclusive), write, flush.
     $attempts = 0
     $maxAttempts = 8
     $stagingFile = $null
@@ -97,17 +128,19 @@ fn main() {
         $suffix = [guid]::NewGuid().ToString("N").Substring(0, 8)
         $candidate = Join-Path $trackedDir ".NativeMethods.g.cs.tmp-$suffix"
         try {
-            $fs = [IO.File]::Open($candidate, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $fs = [System.IO.File]::Open($candidate, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
             $stagingTmp = $candidate
             $stagingFile = $fs
             break
-        } catch [IO.IOException] {
+        } catch [System.IO.IOException] {
             if ($_.Exception.Message -match "already exists") { continue }
             throw
         }
     }
     if (-not $stagingFile) { throw "could not allocate staging temp after $maxAttempts attempts" }
 
+    $replaceSucceeded = $false
+    $postVerifySucceeded = $false
     try {
         $stagingFile.Write($newBytes, 0, $newBytes.Length)
         $stagingFile.Flush($true)
@@ -115,37 +148,130 @@ fn main() {
         $stagingFile = $null
 
         if ($injectFail -eq "after-staging") {
-            throw "injected failure after staging temp written (testing cleanup)"
+            throw "injected failure after staging temp written (testing rollback)"
         }
 
-        if (Test-Path -LiteralPath $tracked -PathType Leaf) {
+        # Atomic replace: prefer Replace (preserves backup), fallback Move.
+        # Keep backup path for rollback.
+        if ($hadOriginal) {
             $backupPath = "$tracked.bak-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            $replaced = $false
             try {
-                [IO.File]::Replace($stagingTmp, $tracked, $backupPath)
+                [System.IO.File]::Replace($stagingTmp, $tracked, $backupPath)
                 $stagingTmp = $null
+                $replaced = $true
             } catch {
-                try {
-                    [IO.File]::Move($stagingTmp, $tracked, $true)
-                    $stagingTmp = $null
-                } catch {
-                    throw "atomic replace failed: $($_.Exception.Message)"
+                # Fallback: Move with overwrite
+                for ($r = 0; $r -lt 6; $r++) {
+                    try {
+                        # For rollback we need a backup: copy original to backup first.
+                        # Actually create backup by copying original bytes we retained.
+                        if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+                            [System.IO.File]::WriteAllBytes($backupPath, $originalBytes)
+                        }
+                        [System.IO.File]::Move($stagingTmp, $tracked, $true)
+                        $stagingTmp = $null
+                        $replaced = $true
+                        break
+                    } catch [System.IO.IOException] {
+                        if ($r -eq 5) { throw "atomic replace failed: $($_.Exception.Message)" }
+                        Start-Sleep -Milliseconds (50 * ($r + 1))
+                    }
                 }
             }
+            if (-not $replaced) { throw "atomic replace failed" }
         } else {
-            [IO.File]::Move($stagingTmp, $tracked)
+            [System.IO.File]::Move($stagingTmp, $tracked)
             $stagingTmp = $null
         }
+        $replaceSucceeded = $true
+
+        if ($injectFail -eq "after-replace") { throw "injected failure after replace (testing rollback)" }
 
         Write-Host "  updated $tracked ($($newBytes.Length) bytes)" -ForegroundColor Green
-        $verify = [IO.File]::ReadAllBytes($tracked)
+        # Post-replace verification
+        $verify = [System.IO.File]::ReadAllBytes($tracked)
         if ($verify.Length -ne $newBytes.Length) { throw "verify failed: length mismatch" }
         for ($i = 0; $i -lt $verify.Length; $i++) { if ($verify[$i] -ne $newBytes[$i]) { throw "verify failed at $i" } }
+        if ($injectFail -eq "postverify-mismatch") {
+            throw "verify failed at 0 (injected)"
+        }
+        $postVerifySucceeded = $true
+    } catch {
+        $err = $_
+        # On any replace/postverify error, attempt bounded rollback to original.
+        if ($replaceSucceeded -and $hadOriginal -and $originalBytes) {
+            Write-Host "  post-replace failure — attempting rollback..." -ForegroundColor Yellow
+            $rolledBack = $false
+            for ($r = 0; $r -lt 6; $r++) {
+                try {
+                    if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+                        [System.IO.File]::Copy($backupPath, $tracked, $true)
+                    } else {
+                        [System.IO.File]::WriteAllBytes($tracked, $originalBytes)
+                    }
+                    $rolledBack = $true
+                    break
+                } catch [System.IO.IOException] {
+                    Start-Sleep -Milliseconds (50 * ($r + 1))
+                }
+            }
+            if ($rolledBack) {
+                try {
+                    $rb = [System.IO.File]::ReadAllBytes($tracked)
+                    $ok = $rb.Length -eq $originalBytes.Length
+                    if ($ok) { for ($i = 0; $i -lt $rb.Length; $i++) { if ($rb[$i] -ne $originalBytes[$i]) { $ok = $false; break } } }
+                    if (-not $ok) { throw "rollback verify mismatch" }
+                    Write-Host "  rollback verified" -ForegroundColor Green
+                    # Rollback succeeded — try to clean backup, but if cleanup fails leave it with a message.
+                    if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+                        $null = Cleanup-StagingWithRetry -Path $backupPath
+                        if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+                            Write-Host "  rollback succeeded but backup cleanup deferred: $backupPath" -ForegroundColor Yellow
+                        } else { $backupPath = $null }
+                    }
+                } catch {
+                    Write-Host "  rollback verify failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    if ($backupPath) { Write-Host "  recovery: backup preserved at $backupPath" -ForegroundColor Yellow }
+                    throw $err
+                }
+            } else {
+                if ($backupPath) { Write-Host "  rollback failed — backup preserved at $backupPath" -ForegroundColor Yellow }
+                throw $err
+            }
+        }
+        throw $err
     } finally {
         try { if ($stagingFile) { $stagingFile.Close() } } catch {}
     }
+
+    # Only delete backup after post-verify succeeded.
+    if ($postVerifySucceeded -and $backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+        $deleted = Cleanup-StagingWithRetry -Path $backupPath
+        if ($deleted) { $backupPath = $null }
+        else {
+            Write-Host "  backup leftover (ignored, not compiled): $backupPath" -ForegroundColor Yellow
+            $backupPath = $null
+        }
+    }
 } finally {
-    Cleanup
+    # Staging cleanup with bounded sharing retries; AV lock may leave residue — report, don't fail.
+    if ($stagingTmp -and (Test-Path -LiteralPath $stagingTmp -PathType Leaf)) {
+        $null = Cleanup-StagingWithRetry -Path $stagingTmp
+    }
+    # Gen temp cleanup (system temp) with bounded retries.
+    for ($r = 0; $r -lt 4; $r++) {
+        try {
+            if (Test-Path -LiteralPath $genTmpDir -PathType Container) { Remove-Item -LiteralPath $genTmpDir -Recurse -Force -ErrorAction Stop }
+            break
+        } catch [System.IO.IOException] { Start-Sleep -Milliseconds 50 }
+        catch { break }
+    }
+    if (Test-Path -LiteralPath $genTmpDir -PathType Container) {
+        Write-Host "  gen temp leftover (system temp, not source tree): $genTmpDir" -ForegroundColor Yellow
+    }
+    # If rollback failed and backup remains, never silently delete it.
     if ($backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
-        try { Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue } catch {}
+        Write-Host "  recovery: backup at $backupPath — restore manually if needed" -ForegroundColor Yellow
     }
 }

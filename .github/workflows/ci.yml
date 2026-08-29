@@ -153,6 +153,16 @@ jobs:
       - name: Run UI settings check
         shell: pwsh
         run: dotnet run --project tools/checks/UiSettings.Check/UiSettings.Check.csproj -c Release
+      - name: Assert csbindgen version match (generator vs core)
+        shell: pwsh
+        run: |
+          $genLock = Get-Content -Raw tools/bindings-generator/Cargo.lock
+          $coreLock = Get-Content -Raw core/Cargo.lock
+          $genVer = ([regex]::Match($genLock, 'name\s*=\s*"csbindgen"\s*\r?\nversion\s*=\s*"([^"]+)"')).Groups[1].Value
+          $coreVer = ([regex]::Match($coreLock, 'name\s*=\s*"csbindgen"\s*\r?\nversion\s*=\s*"([^"]+)"')).Groups[1].Value
+          if (-not $genVer -or -not $coreVer) { throw "missing csbindgen in lockfiles" }
+          if ($genVer -ne $coreVer) { throw "csbindgen mismatch generator $genVer vs core $coreVer" }
+          Write-Host "  csbindgen $genVer OK"
       - name: Raw-byte exact-source guard before release
         shell: pwsh
         run: ./tools/check-crlf.ps1

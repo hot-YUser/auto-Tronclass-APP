@@ -17,6 +17,9 @@ fn main() {
     // The entire src tree influences the FFI surface; watching the directory covers all
     // Rust sources, assets that could affect codegen, and future files without enumeration drift.
     println!("cargo:rerun-if-changed=src");
+    // The committed binding itself must be watched so an edit-only binding change retriggers verification.
+    // Path is relative to the core package directory (core/../ui/...).
+    println!("cargo:rerun-if-changed=../ui/Interop/NativeMethods.g.cs");
     // If maintainers use an explicit update env to control generation, changes must rerun.
     println!("cargo:rerun-if-env-changed=TRONCLASS_UPDATE_BINDINGS");
     println!("cargo:rerun-if-env-changed=TRONCLASS_BINDINGS_UPDATE");

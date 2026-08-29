@@ -18,6 +18,7 @@
 ui/Interop/NativeMethods.g.cs text eol=lf
 core/src/** text eol=lf
 *.ps1 text eol=lf
+*.psm1 text eol=lf
 *.cs text eol=lf
 *.rs text eol=lf
 LICENSE text eol=lf

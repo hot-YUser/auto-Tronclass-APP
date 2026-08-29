@@ -91,54 +91,27 @@ if ($ValidateOnly) {
 
 # ── 來源／計畫閘：記下 exact HEAD；真正建置另要求乾淨工作樹。 ──
 
+Import-Module (Join-Path $tools "GitRawHelper.psm1") -Force
+
 function Assert-RawBytesExact {
     param([string]$Phase)
     $maxPrint = 20
     $failures = [System.Collections.Generic.List[string]]::new()
-    $modeFailures = [System.Collections.Generic.List[string]]::new()
-    $names = @(git ls-tree -r --name-only HEAD)
-    if ($LASTEXITCODE -ne 0) { throw "[$Phase] git ls-tree failed" }
-    $count = 0
-    foreach ($name in $names) {
-        $count++
-        $line = git ls-tree HEAD -- $name 2>$null
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($line)) {
-            $failures.Add("$name (missing in HEAD)")
+    # Get-GitHeadEntries is fail-closed on unsupported modes/types and NUL/UTF-8/parse errors.
+    $entries = Get-GitHeadEntries -RepoRoot $root
+    $count = $entries.Count
+    foreach ($e in $entries) {
+        $rel = $e.Path
+        $esc = Escape-GitPath $rel
+        $abs = Join-Path $root $rel
+        if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) {
+            $failures.Add("$esc (missing on disk)")
             continue
         }
-        $m = [regex]::Match($line, '^([0-9]+)\s+(\S+)\s+([0-9a-f]+)\s+')
-        if (-not $m.Success) { $failures.Add("$name (unparseable ls-tree)"); continue }
-        $mode = $m.Groups[1].Value
-        $type = $m.Groups[2].Value
-        $blob = $m.Groups[3].Value
-        if ($mode -eq "120000" -or $type -eq "commit") {
-            $modeFailures.Add("$name (unsupported mode $mode type $type)")
-            continue
-        }
-        if ($mode -ne "100644" -and $mode -ne "100755") {
-            $modeFailures.Add("$name (unexpected mode $mode)")
-            continue
-        }
-        if (-not (Test-Path -LiteralPath $name -PathType Leaf)) {
-            $failures.Add("$name (missing on disk)")
-            continue
-        }
-        $raw = (git hash-object --no-filters -- $name 2>$null)
-        if ($LASTEXITCODE -ne 0) {
-            $failures.Add("$name (hash-object failed)")
-            continue
-        }
-        $raw = $raw.Trim()
-        if ($raw -ne $blob) {
-            $failures.Add($name)
-        }
-        if ($failures.Count -ge $maxPrint -and $modeFailures.Count -ge $maxPrint) { break }
-    }
-    if ($modeFailures.Count -gt 0) {
-        $show = @($modeFailures | Select-Object -First $maxPrint)
-        foreach ($p in $show) { Write-Host "  ! [$Phase] $p" -ForegroundColor Yellow }
-        if ($modeFailures.Count -gt $maxPrint) { Write-Host "  ... and $($modeFailures.Count - $maxPrint) more" -ForegroundColor Yellow }
-        throw "[$Phase] raw-byte guard: unsupported mode ($($modeFailures.Count))"
+        try { $raw = Get-FileGitBlobHash -LiteralPath $abs }
+        catch { throw "[$Phase] raw-byte guard: hash failed for $esc : $($_.Exception.Message)" }
+        if ($raw -ne $e.Sha) { $failures.Add($esc) }
+        if ($failures.Count -ge $maxPrint) { break }
     }
     if ($failures.Count -gt 0) {
         $show = @($failures | Select-Object -First $maxPrint)
