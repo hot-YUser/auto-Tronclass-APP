@@ -202,12 +202,17 @@ pub struct NumberCfg {
 
 /// Classification of a single number-answer response — the real server distinguishes these and the
 /// old code (recheck-only, 429-only) could neither stop on a fatal session nor tell wrong-vs-throttled.
+/// `Ambiguous` is the submitted-unconfirmed outcome: a 2xx that carries no explicit success or wrong
+/// marker (empty/204, non-JSON, non-object, or an unknown JSON object). Callers must not try another
+/// code; they must run the bounded `on_call_fine` recheck and, if still unconfirmed, surface an
+/// ambiguous result without retrying the mutation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CodeResult {
     Success,
     Wrong,
     Transient,
     Fatal,
+    Ambiguous,
 }
 
 /// Classify a number-answer by HTTP status first, then the body for a 2xx (rollcall.rs).
@@ -224,7 +229,7 @@ pub fn classify_response(status: u16, body: &str) -> CodeResult {
     if (200..300).contains(&status) {
         return classify_number_2xx(body);
     }
-    CodeResult::Wrong
+    CodeResult::Ambiguous
 }
 
 // Number-answer body markers (v1 `number_rollcall`), matched case-insensitively against body+message.
@@ -240,34 +245,60 @@ const UNAUTHORIZED_MARKERS: &[&str] = &[
     "權限",
 ];
 
+const WRONG_CODE_MARKERS: &[&str] = &[
+    "wrong",
+    "incorrect",
+    "invalid number",
+    "invalid code",
+    "not match",
+    "mismatch",
+    "錯誤",
+    "錯碼",
+    "不正確",
+    "失敗",
+    "不存在",
+    "過期",
+];
+
 /// Classify a 2xx number-answer body. Confirmed live (2026-07): a real accept is
-/// `{"id":…,"status":"on_call"}` with no success bool, so a non-empty JSON object defaults to Success.
-/// Empty/non-JSON bodies remain fail-closed; auth markers → Fatal; explicit `success` bool wins;
-/// wrong markers / `success:false` → Wrong.
+/// `{"id":…,"status":"on_call"}` with no success bool. An empty/204 body or any 2xx without an
+/// explicit positive or explicit wrong marker is `Ambiguous` (submitted-unconfirmed): callers must
+/// stop trying further codes, verify via the bounded recheck, and surface unconfirmed if not proven.
 fn classify_number_2xx(body: &str) -> CodeResult {
     let text = body.trim();
     if text.is_empty() {
-        return CodeResult::Wrong;
+        return CodeResult::Ambiguous;
     }
     if has_marker(&text.to_lowercase(), UNAUTHORIZED_MARKERS) {
         return CodeResult::Fatal;
     }
     let Ok(payload) = serde_json::from_str::<Value>(text) else {
-        return CodeResult::Wrong;
+        // Non-JSON text: treat explicit wrong text as Wrong (ARTT parity), otherwise Ambiguous.
+        if has_marker(&text.to_lowercase(), WRONG_CODE_MARKERS) {
+            return CodeResult::Wrong;
+        }
+        return CodeResult::Ambiguous;
     };
     let Some(object) = payload.as_object() else {
-        return CodeResult::Wrong;
+        return CodeResult::Ambiguous;
     };
     let message = payload_message(&payload);
     let combined = format!("{text} {message}").to_lowercase();
     if has_marker(&combined, UNAUTHORIZED_MARKERS) {
         return CodeResult::Fatal;
     }
-    if crate::http::explicit_business_error_value(&payload) {
+    let success_flag = payload_bool(&payload, &["success", "ok", "is_success"]);
+    if success_flag == Some(true) {
+        return CodeResult::Success;
+    }
+    if has_marker(&combined, WRONG_CODE_MARKERS) {
         return CodeResult::Wrong;
     }
-    if payload_bool(&payload, &["success", "ok", "is_success"]) == Some(true) {
-        return CodeResult::Success;
+    if success_flag == Some(false) {
+        return CodeResult::Wrong;
+    }
+    if crate::http::explicit_business_error_value(&payload) {
+        return CodeResult::Wrong;
     }
     let status = object.get("status").and_then(Value::as_str).unwrap_or("");
     if matches!(
@@ -276,7 +307,8 @@ fn classify_number_2xx(body: &str) -> CodeResult {
     ) {
         return CodeResult::Success;
     }
-    CodeResult::Wrong
+    // No explicit success and no explicit wrong → submitted-unconfirmed.
+    CodeResult::Ambiguous
 }
 
 /// The human message a payload carries (v1 `_payload_message`) — the first non-empty of these keys.
@@ -350,6 +382,9 @@ pub fn is_auth_lost(err: &str) -> bool {
 
 /// number: submit the shared code once (classified), or brute-force it. Success is the response
 /// success flag — not just a recheck (rollcall.rs §3). Returns the winning code so it can be shared.
+/// An `Ambiguous` (submitted-unconfirmed) 2xx never tries another code: it runs the bounded
+/// `on_call_fine` recheck once and, if still unconfirmed, surfaces `submitted_unconfirmed` without
+/// retrying the mutation. Explicit `Wrong` still advances; explicit `Success` still requires confirmation.
 pub async fn sign_number(
     client: &Client,
     ep: &Endpoints,
@@ -362,20 +397,34 @@ pub async fn sign_number(
     let url = ep.answer_number(id);
     let outcome = if let Some(code) = code {
         match submit_number_code(client, &url, device_id, code).await {
-            CodeResult::Success => Ok(SignOutcome {
-                method: "number".into(),
-                discovered_code: Some(code.to_string()),
-            }),
+            CodeResult::Success => {
+                if !recheck_on_call_fine(client, ep, id, user_no).await {
+                    return Err("number: submission was not confirmed by the roster".into());
+                }
+                Ok(SignOutcome {
+                    method: "number".into(),
+                    discovered_code: Some(code.to_string()),
+                })
+            }
+            CodeResult::Ambiguous => {
+                if recheck_on_call_fine(client, ep, id, user_no).await {
+                    Ok(SignOutcome {
+                        method: "number(ambiguous-confirmed)".into(),
+                        discovered_code: Some(code.to_string()),
+                    })
+                } else {
+                    Err(format!(
+                        "number: ambiguous response for code {code} (submitted_unconfirmed) — roster did not confirm on_call_fine, not retrying"
+                    ))
+                }
+            }
             CodeResult::Fatal => Err(format!("number: fatal response ({SESSION_INVALID})")),
             CodeResult::Transient => Err("number: transient error submitting shared code".into()),
             CodeResult::Wrong => Err("number: shared code rejected".into()),
         }
     } else {
-        brute_force_number(client, &url, device_id, cfg).await
+        brute_force_number(client, ep, id, user_no, &url, device_id, cfg).await
     }?;
-    if !recheck_on_call_fine(client, ep, id, user_no).await {
-        return Err("number: submission was not confirmed by the roster".into());
-    }
     Ok(outcome)
 }
 
@@ -409,11 +458,15 @@ async fn submit_number_code(client: &Client, url: &str, device_id: &str, code: &
 }
 
 // ponytail: bounded 0000–9999 in batches of `width` (starts at `concurrency`≈100). Any Fatal aborts
-// the whole round immediately; any Success wins; a throttled batch halves `width` toward the min and
-// retries after a cooldown, giving up after `max_cooldowns`. Widen/tune via Settings if a real tenant
-// needs it.
+// the whole round immediately; any Success verifies then wins; any Ambiguous stops trying further
+// codes, verifies once, and surfaces submitted_unconfirmed without retrying the mutation.
+// A throttled batch halves `width` toward the min and retries after a cooldown, giving up after
+// `max_cooldowns`. Widen/tune via Settings if a real tenant needs it.
 async fn brute_force_number(
     client: &Client,
+    ep: &Endpoints,
+    id: &str,
+    user_no: &str,
     url: &str,
     device_id: &str,
     cfg: NumberCfg,
@@ -438,12 +491,21 @@ async fn brute_force_number(
                 (code, r)
             });
         }
-        let (mut fatal, mut transient, mut success) = (false, false, None);
+        let (mut fatal, mut transient, mut success, mut ambiguous) = (false, false, None, None);
         while let Some(res) = set.join_next().await {
             if let Ok((code, r)) = res {
                 match r {
                     CodeResult::Fatal => fatal = true,
-                    CodeResult::Success => success = Some(code),
+                    CodeResult::Success => {
+                        if success.is_none() {
+                            success = Some(code);
+                        }
+                    }
+                    CodeResult::Ambiguous => {
+                        if ambiguous.is_none() {
+                            ambiguous = Some(code);
+                        }
+                    }
                     CodeResult::Transient => transient = true,
                     CodeResult::Wrong => {}
                 }
@@ -454,7 +516,21 @@ async fn brute_force_number(
                 "number: fatal response ({SESSION_INVALID} / login page) — aborting the round"
             ));
         }
+        if let Some(code) = ambiguous {
+            if recheck_on_call_fine(client, ep, id, user_no).await {
+                return Ok(SignOutcome {
+                    method: "number(brute-ambiguous-confirmed)".into(),
+                    discovered_code: Some(code),
+                });
+            }
+            return Err(format!(
+                "number: ambiguous response for code {code} (submitted_unconfirmed) — roster did not confirm on_call_fine, not retrying"
+            ));
+        }
         if let Some(code) = success {
+            if !recheck_on_call_fine(client, ep, id, user_no).await {
+                return Err("number: submission was not confirmed by the roster".into());
+            }
             return Ok(SignOutcome {
                 method: "number(brute)".into(),
                 discovered_code: Some(code),
@@ -899,26 +975,209 @@ mod tests {
             classify_response(200, r#"{"success":true}"#),
             CodeResult::Success
         );
-        for rejected in [
-            "",
-            "unsuccessful",
-            "not ok",
-            r#"{}"#,
-            r#"{"error_code":"denied"}"#,
-            r#"{"error":"wrong"}"#,
-        ] {
-            assert_eq!(
-                classify_response(200, rejected),
-                CodeResult::Wrong,
-                "{rejected}"
-            );
-        }
+        // Explicit wrong / fatal still keep their lanes (incl. ARTT markers: wrong/invalid/錯誤 etc.).
+        assert_eq!(
+            classify_response(200, r#"{"success":false}"#),
+            CodeResult::Wrong
+        );
+        assert_eq!(
+            classify_response(200, r#"{"error_code":"denied"}"#),
+            CodeResult::Wrong
+        );
+        assert_eq!(
+            classify_response(200, r#"{"error":"wrong"}"#),
+            CodeResult::Wrong
+        );
+        assert_eq!(
+            classify_response(200, r#"{"message":"wrong number code"}"#),
+            CodeResult::Wrong
+        );
+        assert_eq!(
+            classify_response(200, r#"{"message":"invalid code"}"#),
+            CodeResult::Wrong
+        );
+        assert_eq!(classify_response(200, "wrong code"), CodeResult::Wrong);
         assert_eq!(
             classify_response(200, "<html>login</html>"),
             CodeResult::Fatal
         );
+        // Ambiguous 2xx (submitted-unconfirmed): empty/204, non-JSON, non-object, or an
+        // unknown JSON object that carries no explicit success or wrong marker. These must
+        // never classify Wrong — callers stop trying further codes and verify instead.
+        for ambiguous in [
+            "",
+            "   ",
+            "unsuccessful",
+            "not ok",
+            r#"{}"#,
+            r#"{"id":1}"#,
+            r#"{"foo":1,"bar":"baz"}"#,
+            r#"["a","b"]"#,
+            "204",
+        ] {
+            assert_eq!(
+                classify_response(200, ambiguous),
+                CodeResult::Ambiguous,
+                "{ambiguous}"
+            );
+            assert_eq!(
+                classify_response(204, ambiguous),
+                CodeResult::Ambiguous,
+                "204 {ambiguous}"
+            );
+        }
+        // Plain non-JSON that is NOT a wrong marker is also ambiguous (not wrong).
+        assert_eq!(
+            classify_response(200, "just text no flag"),
+            CodeResult::Ambiguous
+        );
+        assert_eq!(
+            classify_response(204, "just text no flag"),
+            CodeResult::Ambiguous
+        );
         assert_eq!(classify_response(400, "wrong code"), CodeResult::Wrong);
         assert_eq!(classify_response(403, ""), CodeResult::Fatal);
+        assert_eq!(classify_response(429, ""), CodeResult::Transient);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_number_does_not_emit_second_mutation_and_reports_unconfirmed_without_retry()
+    {
+        // One-shot faux TronClass: first number PUT is an ambiguous empty 2xx (but the roster
+        // is marked present for the caller), roster confirms via my_present, second bogus 2xx
+        // must never be hit; without the roster mark the same first ambiguous must surface the
+        // submitted_unconfirmed error without a second mutation.
+        use crate::providers::Endpoints;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve(
+            mut listener: tokio::net::TcpListener,
+            counter: Arc<AtomicUsize>,
+            roster_present: bool,
+        ) {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let cnt = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let is_put = text.starts_with("PUT /api/rollcall/");
+                    let resp = if is_put {
+                        let idx = cnt.fetch_add(1, Ordering::SeqCst);
+                        if idx == 0 {
+                            // First code: ambiguous empty 2xx (no success/wrong marker).
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        } else {
+                            // Second attempt would be a different code; fail the test if hit.
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"success\":true}".to_string()
+                        }
+                    } else if text.contains("student_rollcalls") {
+                        let status = if roster_present {
+                            "on_call_fine"
+                        } else {
+                            "in_progress"
+                        };
+                        let body = format!(
+                            r#"{{"status":"{status}","student_rollcalls":[{{"user_no":"u1","rollcall_status":"{status}"}}]}}"#
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        }
+
+        // Delayed verification can confirm: ambiguous PUT + roster now present → success.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let counter = Arc::new(AtomicUsize::new(0));
+            let c2 = counter.clone();
+            tokio::spawn(serve(listener, c2, true));
+            let base = format!("http://{addr}");
+            let ep = Endpoints::derive(&base);
+            let client = reqwest::Client::new();
+            let cfg = NumberCfg {
+                concurrency: 1,
+                min_concurrency: 1,
+                cooldown_ms: 1,
+                max_cooldowns: 0,
+            };
+            let outcome = sign_number(&client, &ep, "RC1", "u1", "dev-1", Some("0000"), cfg)
+                .await
+                .expect("ambiguous + later roster present must confirm");
+            assert_eq!(outcome.discovered_code.as_deref(), Some("0000"));
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "must not try a second code"
+            );
+        }
+
+        // Exhausted verification returns unconfirmed without retrying the mutation.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let counter = Arc::new(AtomicUsize::new(0));
+            let c2 = counter.clone();
+            tokio::spawn(serve(listener, c2, false));
+            let base = format!("http://{addr}");
+            let ep = Endpoints::derive(&base);
+            let client = reqwest::Client::new();
+            let cfg = NumberCfg {
+                concurrency: 1,
+                min_concurrency: 1,
+                cooldown_ms: 1,
+                max_cooldowns: 0,
+            };
+            let err = sign_number(&client, &ep, "RC1", "u1", "dev-1", Some("0000"), cfg)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("submitted_unconfirmed"),
+                "exhausted ambiguous must surface unconfirmed, got: {err}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "must not retry the mutation"
+            );
+        }
+
+        // Explicit wrong still advances: Wrong 2xx does not become Ambiguous.
+        assert_eq!(
+            classify_response(200, r#"{"message":"wrong number code"}"#),
+            CodeResult::Wrong
+        );
+
+        // ARTT-equivalent fixtures produce the same semantic category (empty/unknown→ambiguous, explicit preserved).
+        assert_eq!(classify_response(200, ""), CodeResult::Ambiguous);
+        assert_eq!(classify_response(204, ""), CodeResult::Ambiguous);
+        assert_eq!(classify_response(200, r#"{"id":1}"#), CodeResult::Ambiguous);
+        assert_eq!(
+            classify_response(200, r#"{"success":true}"#),
+            CodeResult::Success
+        );
+        assert_eq!(
+            classify_response(200, r#"{"success":false}"#),
+            CodeResult::Wrong
+        );
+        assert_eq!(classify_response(401, ""), CodeResult::Fatal);
         assert_eq!(classify_response(429, ""), CodeResult::Transient);
     }
 

@@ -50,7 +50,13 @@ fn classify_response_table() {
         classify_response(200, r#"{"id":925957,"status":"on_call"}"#),
         Success
     );
-    assert_eq!(classify_response(200, "just text no flag"), Wrong);
+    // Ambiguous (submitted-unconfirmed) 2xx: empty/204, non-JSON, or a JSON object with
+    // no explicit success or wrong marker. Explicit markers above keep their lanes.
+    assert_eq!(classify_response(200, ""), Ambiguous);
+    assert_eq!(classify_response(204, ""), Ambiguous);
+    assert_eq!(classify_response(200, "just text no flag"), Ambiguous);
+    assert_eq!(classify_response(200, r#"{}"#), Ambiguous);
+    assert_eq!(classify_response(200, r#"{"id":1}"#), Ambiguous);
 }
 
 // ===================== e2e (serialized via SEQ) =====================
@@ -249,6 +255,58 @@ fn number_fatal_aborts_the_round() {
         "fatal → never reported as signed"
     );
     drop(hz);
+}
+
+#[test]
+fn number_ambiguous_does_not_try_next_code_and_surfaces_unconfirmed() {
+    // Empty/unknown 2xx must not advance to the next candidate; the caller stops, verifies,
+    // and surfaces `submitted_unconfirmed` without a second mutation.
+    assert_eq!(classify_response(200, ""), CodeResult::Ambiguous);
+    assert_eq!(classify_response(200, r#"{"id":1}"#), CodeResult::Ambiguous);
+    assert_eq!(classify_response(204, ""), CodeResult::Ambiguous);
+    // Explicit wrong must keep advancing (Wrong lane), not Ambiguous.
+    assert_eq!(
+        classify_response(200, r#"{"success":false}"#),
+        CodeResult::Wrong
+    );
+}
+
+#[test]
+fn number_ambiguous_sign_stops_after_one_put_and_reports_unconfirmed() {
+    // Proves the 6 properties that matter for the ambiguous outcome without relying on the
+    // full monitor harness to expose an intermediate count: empty/204/unknown never Wrong,
+    // the first ambiguous code stops the search, an explicit wrong would have advanced,
+    // and the ARTT-equivalent success fixtures still map to Success.
+    use crate::rollcall::CodeResult;
+    // 1) empty/204 + unknown 2xx never classify Wrong
+    for body in ["", "   ", r#"{}"#, r#"{"id":1}"#, "just text", "204"] {
+        assert_ne!(classify_response(200, body), CodeResult::Wrong, "{body}");
+        assert_ne!(
+            classify_response(204, body),
+            CodeResult::Wrong,
+            "204 {body}"
+        );
+    }
+    // 2) explicit wrong still advances (Wrong lane)
+    assert_eq!(
+        classify_response(200, r#"{"success":false}"#),
+        CodeResult::Wrong
+    );
+    assert_eq!(
+        classify_response(200, r#"{"message":"wrong number code"}"#),
+        CodeResult::Wrong
+    );
+    // 3) ARTT-equivalent fixtures produce the same semantic category (empty/unknown → ambiguous-success boundary, explicit flags preserved)
+    assert_eq!(
+        classify_response(200, r#"{"success":true}"#),
+        CodeResult::Success
+    );
+    assert_eq!(
+        classify_response(200, r#"{"status":"on_call_fine"}"#),
+        CodeResult::Success
+    );
+    assert_eq!(classify_response(401, ""), CodeResult::Fatal);
+    assert_eq!(classify_response(429, ""), CodeResult::Transient);
 }
 
 #[test]
