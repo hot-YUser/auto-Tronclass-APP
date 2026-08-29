@@ -153,16 +153,43 @@ jobs:
       - name: Run UI settings check
         shell: pwsh
         run: dotnet run --project tools/checks/UiSettings.Check/UiSettings.Check.csproj -c Release
-      - name: Assert csbindgen version match (generator vs core)
+      - name: Assert csbindgen toolchain (canonical registry source, offline)
         shell: pwsh
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: |
-          $genLock = Get-Content -Raw tools/bindings-generator/Cargo.lock
-          $coreLock = Get-Content -Raw core/Cargo.lock
-          $genVer = ([regex]::Match($genLock, 'name\s*=\s*"csbindgen"\s*\r?\nversion\s*=\s*"([^"]+)"')).Groups[1].Value
-          $coreVer = ([regex]::Match($coreLock, 'name\s*=\s*"csbindgen"\s*\r?\nversion\s*=\s*"([^"]+)"')).Groups[1].Value
-          if (-not $genVer -or -not $coreVer) { throw "missing csbindgen in lockfiles" }
-          if ($genVer -ne $coreVer) { throw "csbindgen mismatch generator $genVer vs core $coreVer" }
-          Write-Host "  csbindgen $genVer OK"
+          # Single source of truth: tools/update-bindings.ps1 -VerifyToolchainOnly (cargo metadata --locked --offline)
+          # Asserts porcelain/raw bytes/NativeMethods mtime unchanged (side-effect-free verify mode).
+          $porcelainBefore = @(git status --porcelain)
+          $rawBefore = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          $mtimeBefore = $null
+          if (Test-Path -LiteralPath "ui/Interop/NativeMethods.g.cs" -PathType Leaf) {
+            $mtimeBefore = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+          }
+          $tmpBefore = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter "tron-bindings-gen-*" -Directory -ErrorAction SilentlyContinue)
+          $stagingBefore = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter ".NativeMethods.g.cs.tmp-*" -File -ErrorAction SilentlyContinue)
+          $backupBefore = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter "NativeMethods.g.cs.bak-*" -File -ErrorAction SilentlyContinue)
+          pwsh ./tools/update-bindings.ps1 -VerifyToolchainOnly
+          if ($LASTEXITCODE -ne 0) { throw "update-bindings -VerifyToolchainOnly failed (exit $LASTEXITCODE)" }
+          $porcelainAfter = @(git status --porcelain)
+          if (@($porcelainBefore).Count -ne @($porcelainAfter).Count -or (($porcelainBefore -join "`n") -ne ($porcelainAfter -join "`n"))) {
+            $redacted = @($porcelainAfter | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+            foreach ($pp in $redacted) { Write-Host "  after-verify porcelain: $pp" }
+            throw "CI regression: -VerifyToolchainOnly mutated git porcelain (must be side-effect-free)"
+          }
+          $rawAfter = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          if ("$rawBefore" -ne "$rawAfter") { throw "CI regression: -VerifyToolchainOnly mutated git raw bytes for NativeMethods.g.cs" }
+          if ($null -ne $mtimeBefore) {
+            if (-not (Test-Path -LiteralPath "ui/Interop/NativeMethods.g.cs" -PathType Leaf)) { throw "CI regression: NativeMethods.g.cs vanished after verify" }
+            $mtimeAfter = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+            if ($mtimeAfter -ne $mtimeBefore) { throw "CI regression: -VerifyToolchainOnly mutated NativeMethods.g.cs mtime (must be side-effect-free)" }
+          }
+          $tmpAfter = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter "tron-bindings-gen-*" -Directory -ErrorAction SilentlyContinue)
+          $stagingAfter = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter ".NativeMethods.g.cs.tmp-*" -File -ErrorAction SilentlyContinue)
+          $backupAfter = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter "NativeMethods.g.cs.bak-*" -File -ErrorAction SilentlyContinue)
+          if (@($tmpAfter).Count -ne @($tmpBefore).Count) { throw "CI regression: -VerifyToolchainOnly leaked system temp tron-bindings-gen-* (must be side-effect-free)" }
+          if (@($stagingAfter).Count -ne @($stagingBefore).Count) { throw "CI regression: -VerifyToolchainOnly leaked staging .NativeMethods.g.cs.tmp-*" }
+          if (@($backupAfter).Count -ne @($backupBefore).Count) { throw "CI regression: -VerifyToolchainOnly leaked backup NativeMethods.g.cs.bak-*" }
       - name: Raw-byte exact-source guard before release
         shell: pwsh
         run: ./tools/check-crlf.ps1

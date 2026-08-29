@@ -5,10 +5,13 @@
 # Transactional state machine: original bytes retained; backup deleted only after post-verify succeeds.
 
 param(
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$VerifyToolchainOnly
 )
 
 $ErrorActionPreference = "Stop"
+# Fail-closed switch combinations: exactly zero or one of -CheckOnly / -VerifyToolchainOnly may be set.
+if ($VerifyToolchainOnly -and $CheckOnly) { throw "cannot combine -VerifyToolchainOnly and -CheckOnly (fail-closed)" }
 $tools = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $tools
 Set-Location $root
@@ -24,6 +27,12 @@ $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 if (Test-Path -LiteralPath $cargoBin -PathType Container) { $env:PATH = "$cargoBin;$env:PATH" }
 $cargo = Join-Path $cargoBin "cargo.exe"
 if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) { $cargo = "cargo" }
+
+# Canonical crates.io registry source as observed via `cargo metadata --locked --offline --format-version 1`
+# for the pinned csbindgen version. Must match exactly; vendor/source-replacement that retains the
+# canonical package source (e.g. cargo vendor with [source."crates-io"] replace-with) keeps this value
+# and therefore remains offline-compatible. Any git/path/alternate registry or null/empty source fails.
+$ExpectedCsbindgenSource = "registry+https://github.com/rust-lang/crates.io-index"
 
 $genTmpDir = Join-Path ([IO.Path]::GetTempPath()) ("tron-bindings-gen-" + [guid]::NewGuid().ToString("N"))
 $genOutput = Join-Path $genTmpDir "NativeMethods.g.cs"
@@ -62,6 +71,24 @@ function Invoke-CargoMetadataLockedOffline {
     return $json
 }
 
+function Get-ExpectedCsbindgenPin {
+    # Derive single fail-closed expected version from the two committed Cargo.toml pins.
+    # Requires exactly one `csbindgen = "=x.y.z"` (or `{ version = "=x.y.z" }`) per manifest and equality.
+    $coreManifest = Join-Path $root "core/Cargo.toml"
+    $re = 'csbindgen\s*=\s*(?:\"=([^\"]+)\"|\{[^\}]*version\s*=\s*\"=([^\"]+)\"[^\}]*\})'
+    $genRaw = Get-Content -Raw -LiteralPath $generatorManifest
+    $coreRaw = Get-Content -Raw -LiteralPath $coreManifest
+    $genMatches = [regex]::Matches($genRaw, $re)
+    $coreMatches = [regex]::Matches($coreRaw, $re)
+    if ($genMatches.Count -ne 1) { throw "expected exactly one csbindgen = pin in $generatorManifest (found $($genMatches.Count))" }
+    if ($coreMatches.Count -ne 1) { throw "expected exactly one csbindgen = pin in $coreManifest (found $($coreMatches.Count))" }
+    $genVer = if (-not [string]::IsNullOrWhiteSpace($genMatches[0].Groups[1].Value)) { $genMatches[0].Groups[1].Value } else { $genMatches[0].Groups[2].Value }
+    $coreVer = if (-not [string]::IsNullOrWhiteSpace($coreMatches[0].Groups[1].Value)) { $coreMatches[0].Groups[1].Value } else { $coreMatches[0].Groups[2].Value }
+    if ([string]::IsNullOrWhiteSpace($genVer) -or [string]::IsNullOrWhiteSpace($coreVer)) { throw "csbindgen pin version empty in manifests" }
+    if ($genVer -ne $coreVer) { throw "csbindgen pin mismatch: generator $genVer vs core $coreVer (fix Cargo.toml to same =version)" }
+    return $genVer
+}
+
 function Get-CsbindgenVersionFromMetadata {
     param([Parameter(Mandatory)][object]$Metadata)
     $pkgs = @($Metadata.packages | Where-Object { $_.name -eq "csbindgen" })
@@ -73,19 +100,47 @@ function Get-CsbindgenVersionFromMetadata {
     return $v
 }
 
+function Get-CsbindgenPackage {
+    param(
+        [Parameter(Mandatory)][object]$Metadata,
+        [Parameter(Mandatory)][string]$ManifestPath
+    )
+    if ($null -eq $Metadata -or $null -eq $Metadata.packages) { throw "cargo metadata missing packages for $ManifestPath" }
+    $pkgs = @($Metadata.packages | Where-Object { $_.name -eq "csbindgen" })
+    if ($pkgs.Count -eq 0) { throw "csbindgen not found in cargo metadata for $ManifestPath (missing lockfile or dependency)" }
+    if ($pkgs.Count -ne 1) { throw "csbindgen has $($pkgs.Count) packages in metadata for $ManifestPath (expected exactly 1; distinct versions/sources must be exactly one)" }
+    $pkg = $pkgs[0]
+    if ([string]::IsNullOrWhiteSpace([string]$pkg.name)) { throw "csbindgen name empty in metadata for $ManifestPath" }
+    if ([string]::IsNullOrWhiteSpace([string]$pkg.version)) { throw "csbindgen version empty in metadata for $ManifestPath" }
+    if ($null -eq $pkg.source -or [string]::IsNullOrWhiteSpace([string]$pkg.source)) { throw "csbindgen source missing/empty in metadata for $ManifestPath (expected canonical registry source $ExpectedCsbindgenSource)" }
+    if ($null -eq $pkg.id -or [string]::IsNullOrWhiteSpace([string]$pkg.id)) { throw "csbindgen id missing/empty in metadata for $ManifestPath" }
+    return $pkg
+}
+
 function Assert-CsbindgenVersionGate {
     if (-not (Test-Path -LiteralPath $generatorManifest -PathType Leaf)) { throw "missing generator manifest: $generatorManifest" }
     if (-not (Test-Path -LiteralPath $genLock -PathType Leaf)) { throw "missing generator lock: $genLock" }
     if (-not (Test-Path -LiteralPath $coreLock -PathType Leaf)) { throw "missing core lock: $coreLock" }
     $coreManifest = Join-Path $root "core/Cargo.toml"
     if (-not (Test-Path -LiteralPath $coreManifest -PathType Leaf)) { throw "missing core manifest: $coreManifest" }
+    $expectedVer = Get-ExpectedCsbindgenPin
+    $expectedId = "$ExpectedCsbindgenSource#csbindgen@$expectedVer"
     $genMeta = Invoke-CargoMetadataLockedOffline -ManifestPath $generatorManifest
     $coreMeta = Invoke-CargoMetadataLockedOffline -ManifestPath $coreManifest
-    $genVer = Get-CsbindgenVersionFromMetadata -Metadata $genMeta
-    $coreVer = Get-CsbindgenVersionFromMetadata -Metadata $coreMeta
-    if ($genVer -ne $coreVer) { throw "csbindgen version mismatch: generator $genVer vs core $coreVer (fix tools/bindings-generator/Cargo.toml to =${coreVer})" }
-    Write-Host "  csbindgen $genVer OK (generator == core, locked offline)" -ForegroundColor Green
-    return $genVer
+    if ($null -eq $genMeta.packages -or $null -eq $coreMeta.packages) { throw "cargo metadata missing packages array" }
+    $genPkg = Get-CsbindgenPackage -Metadata $genMeta -ManifestPath $generatorManifest
+    $corePkg = Get-CsbindgenPackage -Metadata $coreMeta -ManifestPath $coreManifest
+    if ($genPkg.version -ne $expectedVer) { throw "csbindgen version mismatch generator $($genPkg.version) != expected $expectedVer (fix Cargo.toml pin to =$expectedVer)" }
+    if ($corePkg.version -ne $expectedVer) { throw "csbindgen version mismatch core $($corePkg.version) != expected $expectedVer (fix Cargo.toml pin to =$expectedVer)" }
+    if ($genPkg.source -ne $ExpectedCsbindgenSource) { throw "csbindgen source not canonical for generator: $($genPkg.source) != $ExpectedCsbindgenSource (git/path/alternate registry not allowed)" }
+    if ($corePkg.source -ne $ExpectedCsbindgenSource) { throw "csbindgen source not canonical for core: $($corePkg.source) != $ExpectedCsbindgenSource (git/path/alternate registry not allowed)" }
+    if ($genPkg.id -ne $expectedId) { throw "csbindgen id not canonical for generator: $($genPkg.id) != $expectedId" }
+    if ($corePkg.id -ne $expectedId) { throw "csbindgen id not canonical for core: $($corePkg.id) != $expectedId" }
+    if ($genPkg.name -ne $corePkg.name -or $genPkg.version -ne $corePkg.version -or $genPkg.source -ne $corePkg.source -or $genPkg.id -ne $corePkg.id) {
+        throw "csbindgen triple mismatch: generator $($genPkg.name) $($genPkg.version) $($genPkg.source) $($genPkg.id) vs core $($corePkg.name) $($corePkg.version) $($corePkg.source) $($corePkg.id) (must be identical)"
+    }
+    Write-Host "  csbindgen $expectedVer OK (generator == core, locked offline, source $ExpectedCsbindgenSource)" -ForegroundColor Green
+    return $expectedVer
 }
 
 
@@ -114,7 +169,14 @@ function Cleanup-StagingWithRetry {
 }
 
 try {
-    # Fail-closed version gate: cargo metadata --locked --offline --format-version 1, exactly one version each, equality required.
+    # VerifyToolchainOnly: side-effect-free gate identical to pre-generation gate, no temp/staging/backup/target writes or mtime changes.
+    if ($VerifyToolchainOnly) {
+        $null = Assert-CsbindgenVersionGate
+        Write-Host "  verify toolchain only: OK" -ForegroundColor Green
+        exit 0
+    }
+
+    # Fail-closed version+source gate: cargo metadata --locked --offline --format-version 1, exactly one package each, pin equality, canonical source, triple identical.
     # Must run before generation or any tracked-file staging.
     $null = Assert-CsbindgenVersionGate
 
