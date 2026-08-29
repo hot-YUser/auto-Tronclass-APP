@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <!-- Checks target net10 LTS; host is net11 preview (toolchain.json). RollForward Major makes
+         the runtime host roll forward to the installed net11 runtime (11.0) without extra env.
+         Both CI and release rely on this project-declared policy — no DOTNET_ROLL_FORWARD env. -->
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+</Project>

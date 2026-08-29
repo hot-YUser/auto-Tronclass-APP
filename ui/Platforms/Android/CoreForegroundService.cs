@@ -21,6 +21,7 @@ public sealed class CoreForegroundService : Service
     ICore? _core;
     Action<JsonElement>? _coreEventHandler;
     string _status = "正在初始化排程…";
+    int _currentStartId;
 
     public override IBinder? OnBind(Intent? intent) => null;
 
@@ -29,6 +30,7 @@ public sealed class CoreForegroundService : Service
         // Claim the new generation before publishing anything. This cancels every old continuation and
         // makes already-queued old event callbacks fail their lease check.
         var generation = _handshake.Begin();
+        _currentStartId = startId;
         if (!_handshake.TryRun(generation, () =>
         {
             _status = "正在初始化排程…";
@@ -75,30 +77,36 @@ public sealed class CoreForegroundService : Service
     {
         try
         {
-            await _handshake.RunAsync(generation, () => schedule.BootAsync(DataPaths.Resolve()));
-            await _handshake.RunAsync(generation, schedule.OnResumeAsync);
+            await _handshake.RunAsync(generation, token => schedule.BootAsync(DataPaths.Resolve()).WaitAsync(token));
+            tokenThrow(generation);
+            await _handshake.RunAsync(generation, token => schedule.OnResumeAsync().WaitAsync(token));
+            tokenThrow(generation);
             var snapshot = await GetSnapshotAsync(generation, core);
+            tokenThrow(generation);
             if (snapshot.PlatformBlock is { } block)
             {
                 var clear = await _handshake.RunAsync(
                     generation,
-                    () => core.SendAsync("ClearPlatformLimit", ("reason", block.Reason)));
+                    token => core.SendAsync("ClearPlatformLimit", ("reason", block.Reason)).WaitAsync(token));
                 if (!ReplyOk(clear)) throw new InvalidOperationException(ReplyError(clear));
+                tokenThrow(generation);
             }
 
             var mode = AndroidScheduleAlarms.CurrentWakeMode(this);
             var modeReply = await _handshake.RunAsync(
                 generation,
-                () => core.SendAsync("ClearPlatformLimit", ("reason", $"wake_mode:{mode}")));
+                token => core.SendAsync("ClearPlatformLimit", ("reason", $"wake_mode:{mode}")).WaitAsync(token));
             if (!ReplyOk(modeReply)) throw new InvalidOperationException(ReplyError(modeReply));
+            tokenThrow(generation);
 
             snapshot = await GetSnapshotAsync(generation, core);
+            tokenThrow(generation);
             if (!scheduled && !NeedsForegroundService(snapshot))
             {
-                // StartTarget 緊接在使用者授權的 FGS start 後送出；給該命令一個有界交會窗，
-                // 避免 handshake 比命令快而先自停，卻不把空服務長期留著消耗配額。
                 await _handshake.DelayAsync(generation, TimeSpan.FromSeconds(3));
+                tokenThrow(generation);
                 snapshot = await GetSnapshotAsync(generation, core);
+                tokenThrow(generation);
             }
 
             if (!NeedsForegroundService(snapshot))
@@ -124,13 +132,16 @@ public sealed class CoreForegroundService : Service
         }
     }
 
+    static void tokenThrow(ForegroundServiceHandshakeState.Lease generation) =>
+        generation.Cancellation.ThrowIfCancellationRequested();
+
     async Task<MonitoringSnapshotContract> GetSnapshotAsync(
         ForegroundServiceHandshakeState.Lease generation,
         ICore core)
     {
         var reply = await _handshake.RunAsync(
             generation,
-            () => core.SendAsync("GetMonitoringSnapshot"));
+            token => core.SendAsync("GetMonitoringSnapshot").WaitAsync(token));
         if (!ReplyOk(reply)) throw new InvalidOperationException(ReplyError(reply));
         return MonitoringSnapshotContract.Parse(
             WireShape.Required(WireShape.Required(reply, "data"), "snapshot"));
@@ -147,6 +158,8 @@ public sealed class CoreForegroundService : Service
         int startId,
         global::Android.Content.PM.ForegroundService fgsType)
     {
+        // Stale timeout for an older startId must not kill a newer generation.
+        if (startId != _currentStartId) return;
         _core ??= IPlatformApplication.Current?.Services.GetService<ICore>();
         _handshake.TryStopCurrent(() =>
         {

@@ -477,13 +477,9 @@ foreach ($check in $csharpChecks) {
         throw "缺少 $($check.Name) 可執行檢查：$($check.Path)"
     }
     Step "$($check.Name) 可執行檢查"
-    # 檢查以已發布的 net10 LTS API 面建置；發行機只有 net11 preview 時允許向前執行。
-    $oldRollForward = $env:DOTNET_ROLL_FORWARD
-    $env:DOTNET_ROLL_FORWARD = "Major"
-    try {
-        Invoke-Native -FilePath $dotnet -Arguments @("run", "--project", $check.Path, "-c", "Release") -FailureMessage "$($check.Name) 可執行檢查失敗"
-    }
-    finally { $env:DOTNET_ROLL_FORWARD = $oldRollForward }
+    # Checks declare RollForward Major via tools/checks/Directory.Build.props so both CI and
+    # release share the same project-declared runtime policy (no env duplication).
+    Invoke-Native -FilePath $dotnet -Arguments @("run", "--project", $check.Path, "-c", "Release") -FailureMessage "$($check.Name) 可執行檢查失敗"
 }
 
 # ── 原生核心：build-core 會先刪除精確輸出，並寫 hash/mtime/build marker ──

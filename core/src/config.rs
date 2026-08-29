@@ -1065,6 +1065,66 @@ mod tests {
     }
 
     #[test]
+    fn persisted_settings_reject_unknown_fields_without_silent_rewrite() {
+        let path = temporary_path("settings-unknown-reject");
+        let config = Config::default();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["settings"]["bogus_future_field"] = json!("unexpected");
+        let invalid_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &invalid_bytes).unwrap();
+        // Startup/load must reject unknown settings fields, not silently accept and rewrite.
+        assert!(matches!(
+            Config::initialize_at(&path, 7),
+            Err(ConfigLoadError::UnsupportedOrCorrupt)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
+        // Unknown fields must stay rejected on direct load as well.
+        assert!(Config::load(&path).is_err());
+        let _ = fs::remove_file(&path);
+        // Direct parse of Settings with deny_unknown_fields.
+        let known: Settings = serde_json::from_value(json!({
+            "countdown_secs": 30,
+            "attendance_gate_percent": 12.5,
+            "llm_endpoint": "https://example.test",
+            "llm_model": "m",
+            "llm_max_tokens": 0,
+        }))
+        .unwrap();
+        assert_eq!(known.countdown_secs, 30);
+        assert!(serde_json::from_value::<Settings>(json!({
+            "countdown_secs": 30,
+            "unknown_key": 1,
+        }))
+        .is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_settings_known_schemas_accepted_save_failure_does_not_alter_disk() {
+        let path = temporary_path("settings-known-and-save-fail");
+        // Known current schema (partial with defaults) must be accepted at load.
+        let partial = json!({
+            "schema_version": 1,
+            "config_revision": 0,
+            "schedule_revision": 0,
+            "accounts": [],
+            "settings": { "countdown_secs": 30 },
+            "groups": [],
+            "monitoring": { "global_schedule": { "monday": [], "tuesday": [], "wednesday": [], "thursday": [], "friday": [], "saturday": [], "sunday": [] }, "time_zone": { "kind": "device" }, "all_suspended": false },
+            "runtime": { "manual_overrides": [], "group_rotation": {}, "platform_block": null }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&partial).unwrap()).unwrap();
+        assert!(Config::initialize_at(&path, 7).is_ok());
+        // UpdateConfig/save failure must not alter memory/disk: patch with invalid range.
+        let before = fs::read(&path).unwrap();
+        let mut loaded = Config::load(&path).unwrap();
+        loaded.settings.countdown_secs = 0; // invalid
+        assert!(loaded.save(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn target_and_sum_type_wire_names_are_stable() {
         assert_eq!(
             serde_json::to_value(TargetId::group("g")).unwrap(),
