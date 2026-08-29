@@ -31,14 +31,63 @@ $stagingTmp = $null
 $backupPath = $null
 $injectFail = $env:TRONCLASS_UPDATE_BINDINGS_INJECT_FAIL
 
-function Get-CsbindgenVersionFromLock {
-    param([string]$LockPath)
-    if (-not (Test-Path -LiteralPath $LockPath -PathType Leaf)) { return $null }
-    $text = Get-Content -Raw -LiteralPath $LockPath
-    $m = [regex]::Match($text, 'name\s*=\s*"csbindgen"\s*\r?\nversion\s*=\s*"([^"]+)"')
-    if ($m.Success) { return $m.Groups[1].Value }
-    return $null
+function Invoke-CargoMetadataLockedOffline {
+    param([Parameter(Mandatory)][string]$ManifestPath)
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "missing manifest: $ManifestPath" }
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $cargo
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    foreach ($a in @("metadata","--manifest-path",$ManifestPath,"--locked","--offline","--format-version","1")) { $null = $psi.ArgumentList.Add($a) }
+    $proc = [Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    $out = ""
+    $err = ""
+    try {
+        if (-not $proc.Start()) { throw "failed to start cargo metadata for $ManifestPath" }
+        $out = $proc.StandardOutput.ReadToEnd()
+        $err = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) {
+            $msg = "cargo metadata failed for $ManifestPath (exit $($proc.ExitCode))"
+            if (-not [string]::IsNullOrWhiteSpace($err)) { $msg += ": $($err.Trim())" }
+            throw $msg
+        }
+    } finally { $proc.Dispose() }
+    if ([string]::IsNullOrWhiteSpace($out)) { throw "cargo metadata empty output for $ManifestPath" }
+    try { $json = $out | ConvertFrom-Json }
+    catch { throw "cargo metadata malformed JSON for $ManifestPath : $($_.Exception.Message)" }
+    return $json
 }
+
+function Get-CsbindgenVersionFromMetadata {
+    param([Parameter(Mandatory)][object]$Metadata)
+    $pkgs = @($Metadata.packages | Where-Object { $_.name -eq "csbindgen" })
+    if ($pkgs.Count -eq 0) { throw "csbindgen not found in cargo metadata (missing lockfile or dependency)" }
+    $vers = @($pkgs | ForEach-Object { $_.version } | Sort-Object -Unique)
+    if ($vers.Count -ne 1) { throw "csbindgen has $($vers.Count) distinct versions in metadata: $($vers -join ', ') (expected exactly 1)" }
+    $v = $vers[0]
+    if ([string]::IsNullOrWhiteSpace($v)) { throw "csbindgen version empty in metadata" }
+    return $v
+}
+
+function Assert-CsbindgenVersionGate {
+    if (-not (Test-Path -LiteralPath $generatorManifest -PathType Leaf)) { throw "missing generator manifest: $generatorManifest" }
+    if (-not (Test-Path -LiteralPath $genLock -PathType Leaf)) { throw "missing generator lock: $genLock" }
+    if (-not (Test-Path -LiteralPath $coreLock -PathType Leaf)) { throw "missing core lock: $coreLock" }
+    $coreManifest = Join-Path $root "core/Cargo.toml"
+    if (-not (Test-Path -LiteralPath $coreManifest -PathType Leaf)) { throw "missing core manifest: $coreManifest" }
+    $genMeta = Invoke-CargoMetadataLockedOffline -ManifestPath $generatorManifest
+    $coreMeta = Invoke-CargoMetadataLockedOffline -ManifestPath $coreManifest
+    $genVer = Get-CsbindgenVersionFromMetadata -Metadata $genMeta
+    $coreVer = Get-CsbindgenVersionFromMetadata -Metadata $coreMeta
+    if ($genVer -ne $coreVer) { throw "csbindgen version mismatch: generator $genVer vs core $coreVer (fix tools/bindings-generator/Cargo.toml to =${coreVer})" }
+    Write-Host "  csbindgen $genVer OK (generator == core, locked offline)" -ForegroundColor Green
+    return $genVer
+}
+
 
 function Cleanup-GenTmp {
     try { if ($genTmpDir -and (Test-Path -LiteralPath $genTmpDir -PathType Container)) { Remove-Item -LiteralPath $genTmpDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
@@ -65,14 +114,9 @@ function Cleanup-StagingWithRetry {
 }
 
 try {
-    if (-not (Test-Path -LiteralPath $generatorManifest -PathType Leaf)) { throw "missing generator manifest: $generatorManifest" }
-    if (-not (Test-Path -LiteralPath $genLock -PathType Leaf)) { throw "missing generator lock: $genLock" }
-    # Version match assertion
-    $genVer = Get-CsbindgenVersionFromLock -LockPath $genLock
-    $coreVer = Get-CsbindgenVersionFromLock -LockPath $coreLock
-    if ($genVer -and $coreVer -and $genVer -ne $coreVer) {
-        throw "csbindgen version mismatch: generator $genVer vs core $coreVer (fix tools/bindings-generator/Cargo.toml to =${coreVer})"
-    }
+    # Fail-closed version gate: cargo metadata --locked --offline --format-version 1, exactly one version each, equality required.
+    # Must run before generation or any tracked-file staging.
+    $null = Assert-CsbindgenVersionGate
 
     New-Item -ItemType Directory -Force -Path $genTmpDir | Out-Null
 

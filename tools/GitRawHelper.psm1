@@ -68,7 +68,10 @@ function Invoke-GitRawBytes {
             # But allow warnings? We fail closed: if any stderr, surface.
             # For ls-tree no stderr expected.
         }
-        return $ms.ToArray()
+        $bytes = $ms.ToArray()
+        # PowerShell pipeline unwraps empty arrays to $null -> UTF8.GetString(null) crashes.
+        # Comma ensures single byte[] object even for 0-length, preserving NUL/0xFF order.
+        return ,$bytes
     } finally {
         $proc.Dispose()
     }
@@ -188,7 +191,7 @@ function Get-GitBlobBytes {
     if ($Sha -notmatch '^[0-9a-f]{40}$') { throw "invalid SHA: $Sha" }
     if (-not $RepoRoot) { $RepoRoot = (Get-Location).Path }
     $bytes = Invoke-GitRawBytes -ArgumentList @("cat-file","blob",$Sha) -WorkingDirectory $RepoRoot
-    return $bytes
+    return ,$bytes
 }
 
 Export-ModuleMember -Function Get-GitHeadEntries, Get-FileGitBlobHash, Get-GitBlobBytes, Escape-GitPath, Invoke-GitRawBytes
