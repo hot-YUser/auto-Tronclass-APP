@@ -98,6 +98,11 @@ if (-not $PlanOnly) {
     $gitStatus = @(& git status --porcelain 2>$null)
     if ($LASTEXITCODE -ne 0) { throw "無法執行 git status；請確認在 git 工作樹內執行。" }
     if ($gitStatus.Count -gt 0) {
+        $redacted = @($gitStatus | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+        if ($redacted.Count -gt 0) {
+            Write-Host ("  ! 工作樹不乾淨（節選，最多 20 筆，已去敏僅列路徑）：") -ForegroundColor Yellow
+            foreach ($dirtyPath in $redacted) { Write-Host ("    - $dirtyPath") -ForegroundColor Yellow }
+        }
         throw "git 工作樹不乾淨（$($gitStatus.Count) 筆變更）；發行前請先提交或清除變更。"
     }
 }
@@ -698,6 +703,12 @@ if ($LASTEXITCODE -ne 0 -or $finalHeadSha.Trim() -ne $headSha) {
 $finalGitStatus = @(& git status --porcelain 2>$null)
 if ($LASTEXITCODE -ne 0) { throw "建置完成後無法執行 git status。" }
 if ($finalGitStatus.Count -gt 0) {
+    $redacted = @($finalGitStatus | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+    if ($redacted.Count -gt 0) {
+        Write-Host ("  ! 工作樹變更（節選，最多 20 筆，已去敏僅列路徑）：") -ForegroundColor Yellow
+        foreach ($dirtyPath in $redacted) { Write-Host ("    - $dirtyPath") -ForegroundColor Yellow }
+        try { & git diff --name-only 2>$null | Select-Object -First 20 | ForEach-Object { Write-Host ("    diff: $_") -ForegroundColor Yellow } } catch {}
+    }
     throw "建置期間工作樹出現 $($finalGitStatus.Count) 筆變更；拒絕產生來源不明的 release metadata。"
 }
 if ($RequireTaggedHead) {

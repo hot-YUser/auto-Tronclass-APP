@@ -1,0 +1,8 @@
+# 固定換行，確保跨平台產生器與簽出一致；尤其是 csbindgen 產物在 Windows/Linux/CI 皆 LF。
+* text=auto
+.gitattributes text eol=lf
+ui/Interop/NativeMethods.g.cs text eol=lf
+core/src/** text eol=lf
+*.ps1 text eol=lf
+*.cs text eol=lf
+*.rs text eol=lf

@@ -43,55 +43,72 @@ jobs:
             }
           }
 
-          if (Test-Path -LiteralPath dist) { throw "plan check 前不應存在 dist" }
-          $headSha = (git rev-parse HEAD).Trim()
-          $full = ./tools/release.ps1 -Tag v0.0.0-alpha.0 -PlanOnly | ConvertFrom-Json
-          if ($full.target -ne $headSha) { throw "release target 不是 exact HEAD SHA" }
-          foreach ($check in "Rustfmt", "RustTests", "RustClippy", "ProtocolContract", "CommandWire", "UiSettings", "DeviceKey") {
-            if ($full.checks -notcontains $check) { throw "完整 release plan 缺少 check：$check" }
+          # Preflight must not leave an untracked dirty file that would poison the exact-source guard.
+          $prePorcelain = @(git status --porcelain)
+          if ($prePorcelain.Count -gt 0) {
+            $redacted = @($prePorcelain | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+            foreach ($pp in $redacted) { Write-Host "  preflight 前工作樹不乾淨: $pp" }
+            throw "CI 回歸：preflight 前工作樹不乾淨（$($prePorcelain.Count) 筆）。"
           }
-          $requiredAssets = @(
-            "AutoTronclass-v0.0.0-alpha.0-windows-x64-portable.zip",
-            "AutoTronclass-v0.0.0-alpha.0-windows-x64-setup.exe",
-            "AutoTronclass-v0.0.0-alpha.0-android.apk",
-            "build-metadata.json",
-            "SHA256SUMS.txt"
-          )
-          if (@($full.assets).Count -ne $requiredAssets.Count) { throw "完整 release plan 資產數量錯誤" }
-          foreach ($asset in $requiredAssets) {
-            if ($full.assets -notcontains $asset) { throw "完整 release plan 缺少資產：$asset" }
-          }
-
-          $androidOnly = ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -PlanOnly | ConvertFrom-Json
-          foreach ($check in "ProtocolContract", "CommandWire", "UiSettings") {
-            if ($androidOnly.checks -notcontains $check) { throw "SkipWindows 不應跳過 $check" }
-          }
-          if ($androidOnly.checks -contains "DeviceKey") { throw "SkipWindows 應跳過 Windows-only DeviceKey" }
-          if (@($androidOnly.assets).Count -ne 3) { throw "Android-only plan 資產數量錯誤" }
-          foreach ($asset in "AutoTronclass-v0.0.0-alpha.0-android.apk", "build-metadata.json", "SHA256SUMS.txt") {
-            if ($androidOnly.assets -notcontains $asset) { throw "Android-only plan 缺少資產：$asset" }
-          }
-          if (Test-Path -LiteralPath dist) { throw "-PlanOnly 不得寫入 dist" }
-
-          Assert-Fails { ./tools/release.ps1 -Tag not-semver -ValidateOnly } "Tag 必須是嚴格 SemVer"
-          Assert-Fails {
-            ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -SkipAndroid -PlanOnly
-          } "不能同時跳過 Windows 與 Android"
-
-          # A branch named like a release must not satisfy -RequireTaggedHead; only refs/tags/* counts.
-          $spoof = "v0.0.0-alpha.999"
-          git branch $spoof HEAD
           try {
+            if (Test-Path -LiteralPath dist) { throw "plan check 前不應存在 dist" }
+            $headSha = (git rev-parse HEAD).Trim()
+            $full = ./tools/release.ps1 -Tag v0.0.0-alpha.0 -PlanOnly | ConvertFrom-Json
+            if ($full.target -ne $headSha) { throw "release target 不是 exact HEAD SHA" }
+            foreach ($check in "Rustfmt", "RustTests", "RustClippy", "ProtocolContract", "CommandWire", "UiSettings", "DeviceKey") {
+              if ($full.checks -notcontains $check) { throw "完整 release plan 缺少 check：$check" }
+            }
+            $requiredAssets = @(
+              "AutoTronclass-v0.0.0-alpha.0-windows-x64-portable.zip",
+              "AutoTronclass-v0.0.0-alpha.0-windows-x64-setup.exe",
+              "AutoTronclass-v0.0.0-alpha.0-android.apk",
+              "build-metadata.json",
+              "SHA256SUMS.txt"
+            )
+            if (@($full.assets).Count -ne $requiredAssets.Count) { throw "完整 release plan 資產數量錯誤" }
+            foreach ($asset in $requiredAssets) {
+              if ($full.assets -notcontains $asset) { throw "完整 release plan 缺少資產：$asset" }
+            }
+
+            $androidOnly = ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -PlanOnly | ConvertFrom-Json
+            foreach ($check in "ProtocolContract", "CommandWire", "UiSettings") {
+              if ($androidOnly.checks -notcontains $check) { throw "SkipWindows 不應跳過 $check" }
+            }
+            if ($androidOnly.checks -contains "DeviceKey") { throw "SkipWindows 應跳過 Windows-only DeviceKey" }
+            if (@($androidOnly.assets).Count -ne 3) { throw "Android-only plan 資產數量錯誤" }
+            foreach ($asset in "AutoTronclass-v0.0.0-alpha.0-android.apk", "build-metadata.json", "SHA256SUMS.txt") {
+              if ($androidOnly.assets -notcontains $asset) { throw "Android-only plan 缺少資產：$asset" }
+            }
+            if (Test-Path -LiteralPath dist) { throw "-PlanOnly 不得寫入 dist" }
+
+            Assert-Fails { ./tools/release.ps1 -Tag not-semver -ValidateOnly } "Tag 必須是嚴格 SemVer"
             Assert-Fails {
-              ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly
-            } "找不到 git tag"
-            git tag $spoof HEAD
-            $tagged = ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly | ConvertFrom-Json
-            if ($tagged.target -ne $headSha) { throw "真 tag plan 未綁定 exact HEAD" }
+              ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -SkipAndroid -PlanOnly
+            } "不能同時跳過 Windows 與 Android"
+
+            # A branch named like a release must not satisfy -RequireTaggedHead; only refs/tags/* counts.
+            $spoof = "v0.0.0-alpha.999"
+            git branch $spoof HEAD
+            try {
+              Assert-Fails {
+                ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly
+              } "找不到 git tag"
+              git tag $spoof HEAD
+              $tagged = ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly | ConvertFrom-Json
+              if ($tagged.target -ne $headSha) { throw "真 tag plan 未綁定 exact HEAD" }
+            }
+            finally {
+              git tag -d $spoof 2>$null
+              git branch -D $spoof 2>$null
+            }
           }
           finally {
-            git tag -d $spoof 2>$null
-            git branch -D $spoof 2>$null
+            $postPorcelain = @(git status --porcelain)
+            if ($postPorcelain.Count -gt 0) {
+              $redacted = @($postPorcelain | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+              foreach ($pp in $redacted) { Write-Host "  preflight 後工作樹不乾淨: $pp" }
+              throw "CI 回歸：preflight 後工作樹不乾淨（$($postPorcelain.Count) 筆）；暫存檔未清理或 NativeMethods 漂移。"
+            }
           }
       # 工具鏈單一真理：tools/toolchain.json；版本寫入 GITHUB_ENV 供 shell 步驟使用。
       - name: Load toolchain pins
@@ -142,6 +159,21 @@ jobs:
       - name: Unsigned Windows release dry-run
         shell: pwsh
         run: ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipAndroid -SkipInstaller
+      - name: Assert exact-source guard — working tree still clean after build
+        if: always()
+        shell: pwsh
+        run: |
+          $porcelain = @(git status --porcelain)
+          if ($porcelain.Count -gt 0) {
+            Write-Host "::error::建置後工作樹不乾淨（$($porcelain.Count) 筆）："
+            $redacted = @($porcelain | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+            foreach ($path in $redacted) { Write-Host "  - $path" }
+            try { git diff --name-only 2>$null | Select-Object -First 20 | ForEach-Object { Write-Host "  diff: $_" } } catch {}
+            throw "CI 回歸：release 建置後工作樹不乾淨（$($porcelain.Count) 筆）；NativeMethods 封裝或暫存清理回歸。"
+          }
+          $distCount = @(Get-ChildItem -LiteralPath dist -File -ErrorAction SilentlyContinue).Count
+          if ($distCount -eq 0) { throw "dist 為空 — dry-run 應產出資產。" }
+          Write-Host "  ✓ 工作樹乾淨，dist 內 $distCount 個資產。"
       - name: Upload release dry-run dist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
