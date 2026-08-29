@@ -190,14 +190,26 @@ pub async fn recheck_on_call_fine(
     my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v)
 }
 
-/// Brute-force tuning (rollcall.rs). Concurrency starts high and halves toward `min_concurrency` on
-/// throttling; `cooldown_ms` is the backoff sleep; give up after `max_cooldowns` transient rounds.
+/// Brute-force tuning (rollcall.rs). Kept for backward compatibility — the
+/// runtime clamps effective concurrency to 1 per rollcall/profile (unknown-safe
+/// sequential; see `brute_force_number`).
 #[derive(Clone, Copy)]
 pub struct NumberCfg {
     pub concurrency: u32,
     pub min_concurrency: u32,
     pub cooldown_ms: u64,
     pub max_cooldowns: u32,
+}
+
+impl NumberCfg {
+    /// Retained knobs are clamped to sequential: at most one unresolved number
+    /// mutation per rollcall/profile (ambiguous responses may be successes).
+    pub fn effective_concurrency(self) -> u32 {
+        1
+    }
+    pub fn was_clamped(self) -> bool {
+        self.concurrency.clamp(1, 256) != 1 || self.min_concurrency.clamp(1, 256) != 1
+    }
 }
 
 /// Classification of a single number-answer response — the real server distinguishes these and the
@@ -457,11 +469,18 @@ async fn submit_number_code(client: &Client, url: &str, device_id: &str, code: &
     }
 }
 
-// ponytail: bounded 0000–9999 in batches of `width` (starts at `concurrency`≈100). Any Fatal aborts
-// the whole round immediately; any Success verifies then wins; any Ambiguous stops trying further
-// codes, verifies once, and surfaces submitted_unconfirmed without retrying the mutation.
-// A throttled batch halves `width` toward the min and retries after a cooldown, giving up after
-// `max_cooldowns`. Widen/tune via Settings if a real tenant needs it.
+// Unknown-safe sequential brute-force: at most ONE unresolved number mutation in
+// flight per rollcall/profile at a time. An ambiguous 2xx can be a successful
+// submit whose confirmation has not yet landed on the roster; a concurrent
+// wave (the old width≈100 JoinSet) would let other in-flight candidate PUTs
+// arrive after that success, mutating the rollcall again with an unverified
+// side-effect (the endpoint semantics do not prove wrong-code requests harmless
+// post-attendance). Strict single-flight makes cancellation irrelevant — there
+// is never a second unresolved mutation to cancel — and an already-handed-off
+// request cannot be retracted by aborting a task. Explicit Wrong advances
+// immediately; explicit/ambiguous Success runs the bounded on_call_fine recheck
+// then stops (confirmed/unconfirmed) without trying another code; transport
+// failure follows the bounded transient policy without blind duplicate.
 async fn brute_force_number(
     client: &Client,
     ep: &Endpoints,
@@ -472,80 +491,49 @@ async fn brute_force_number(
     cfg: NumberCfg,
 ) -> Result<SignOutcome, String> {
     let floor = cfg.cooldown_ms.max(1);
-    let min_w = cfg.min_concurrency.clamp(1, 256);
-    let mut width = cfg.concurrency.clamp(min_w, 256);
     let mut cooldowns = 0u32;
     let mut n: u32 = 0;
     while n <= 9999 {
-        let batch_start = n;
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..width {
-            if n > 9999 {
-                break;
+        let code = format!("{n:04}");
+        match submit_number_code(client, url, device_id, &code).await {
+            CodeResult::Fatal => {
+                return Err(format!(
+                    "number: fatal response ({SESSION_INVALID} / login page) — aborting the round"
+                ))
             }
-            let code = format!("{n:04}");
-            n += 1;
-            let (client, url, device_id) = (client.clone(), url.to_string(), device_id.to_string());
-            set.spawn(async move {
-                let r = submit_number_code(&client, &url, &device_id, &code).await;
-                (code, r)
-            });
-        }
-        let (mut fatal, mut transient, mut success, mut ambiguous) = (false, false, None, None);
-        while let Some(res) = set.join_next().await {
-            if let Ok((code, r)) = res {
-                match r {
-                    CodeResult::Fatal => fatal = true,
-                    CodeResult::Success => {
-                        if success.is_none() {
-                            success = Some(code);
-                        }
-                    }
-                    CodeResult::Ambiguous => {
-                        if ambiguous.is_none() {
-                            ambiguous = Some(code);
-                        }
-                    }
-                    CodeResult::Transient => transient = true,
-                    CodeResult::Wrong => {}
+            CodeResult::Success => {
+                if !recheck_on_call_fine(client, ep, id, user_no).await {
+                    return Err("number: submission was not confirmed by the roster".into());
                 }
-            }
-        }
-        if fatal {
-            return Err(format!(
-                "number: fatal response ({SESSION_INVALID} / login page) — aborting the round"
-            ));
-        }
-        if let Some(code) = ambiguous {
-            if recheck_on_call_fine(client, ep, id, user_no).await {
                 return Ok(SignOutcome {
-                    method: "number(brute-ambiguous-confirmed)".into(),
+                    method: "number(brute)".into(),
                     discovered_code: Some(code),
                 });
             }
-            return Err(format!(
-                "number: ambiguous response for code {code} (submitted_unconfirmed) — roster did not confirm on_call_fine, not retrying"
-            ));
-        }
-        if let Some(code) = success {
-            if !recheck_on_call_fine(client, ep, id, user_no).await {
-                return Err("number: submission was not confirmed by the roster".into());
+            CodeResult::Ambiguous => {
+                if recheck_on_call_fine(client, ep, id, user_no).await {
+                    return Ok(SignOutcome {
+                        method: "number(brute-ambiguous-confirmed)".into(),
+                        discovered_code: Some(code),
+                    });
+                }
+                return Err(format!(
+                    "number: ambiguous response for code {code} (submitted_unconfirmed) — roster did not confirm on_call_fine, not retrying"
+                ));
             }
-            return Ok(SignOutcome {
-                method: "number(brute)".into(),
-                discovered_code: Some(code),
-            });
-        }
-        if transient {
-            cooldowns += 1;
-            if cooldowns > cfg.max_cooldowns {
-                return Err("number: too many transient errors, giving up".into());
+            CodeResult::Transient => {
+                cooldowns += 1;
+                if cooldowns > cfg.max_cooldowns {
+                    return Err("number: too many transient errors, giving up".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(floor)).await;
+                // retry the same code without advancing — sequential retry of the throttled code.
+                continue;
             }
-            width = (width / 2).max(min_w); // adaptive: halve toward the floor concurrency
-            tokio::time::sleep(std::time::Duration::from_millis(floor)).await;
-            n = batch_start; // retry the throttled batch
+            CodeResult::Wrong => {
+                n += 1;
+            }
         }
-        // all wrong → n already advanced to the next batch
     }
     Err("number code not found in 0000–9999".into())
 }
@@ -1263,5 +1251,280 @@ mod tests {
         // Genuine responses are NOT session loss.
         assert!(!response_auth_lost(200, &api, r#"{"status":"on_call"}"#));
         assert!(!response_auth_lost(400, &api, r#"{"error":"wrong"}"#));
+    }
+
+    #[test]
+    fn number_cfg_clamps_effective_concurrency_to_one() {
+        let cfg = NumberCfg {
+            concurrency: 100,
+            min_concurrency: 5,
+            cooldown_ms: 5000,
+            max_cooldowns: 3,
+        };
+        assert!(cfg.was_clamped());
+        assert_eq!(cfg.effective_concurrency(), 1);
+        let unitary = NumberCfg {
+            concurrency: 1,
+            min_concurrency: 1,
+            cooldown_ms: 1,
+            max_cooldowns: 0,
+        };
+        assert!(!unitary.was_clamped());
+        assert_eq!(unitary.effective_concurrency(), 1);
+    }
+
+    #[tokio::test]
+    async fn brute_force_number_is_sequential_with_barrier_proof() {
+        use crate::providers::Endpoints;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn barrier_server(
+            expected_concurrency_cfg: u32,
+            handler: impl Fn(String, usize, Arc<AtomicUsize>, Arc<AtomicUsize>) -> String
+                + Send
+                + Sync
+                + 'static,
+        ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            // Only mutation PUTs contend — roster GETs are sequential rechecks, not mutations.
+            let mut_concurrent = Arc::new(AtomicUsize::new(0));
+            let mut_max = Arc::new(AtomicUsize::new(0));
+            let mut_requests = Arc::new(AtomicUsize::new(0));
+            let handler = Arc::new(handler);
+            let c1 = mut_concurrent.clone();
+            let m1 = mut_max.clone();
+            let r1 = mut_requests.clone();
+            tokio::spawn(async move {
+                let _ = expected_concurrency_cfg;
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let h = handler.clone();
+                    let c = c1.clone();
+                    let m = m1.clone();
+                    let r = r1.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let is_put = text.starts_with("PUT /api/rollcall/")
+                            && text.contains("answer_number_rollcall");
+                        let resp = if is_put {
+                            let cur = c.fetch_add(1, Ordering::SeqCst) + 1;
+                            m.fetch_max(cur, Ordering::SeqCst);
+                            let idx = r.fetch_add(1, Ordering::SeqCst);
+                            // Artificial delay to expose concurrency if caller were parallel.
+                            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                            let resp = h(text, idx, c.clone(), m.clone());
+                            c.fetch_sub(1, Ordering::SeqCst);
+                            resp
+                        } else if text.contains("student_rollcalls") {
+                            let body = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(), body
+                            )
+                        } else {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        };
+                        let _ = s.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            (
+                format!("http://{addr}"),
+                mut_concurrent,
+                mut_max,
+                mut_requests,
+            )
+        }
+
+        // 1) Configured concurrency 100 must still max concurrent == 1, ambiguous first emits exactly 1 request.
+        {
+            let (base, _cur, max_c, reqs) = barrier_server(100, |_, idx, _, _| {
+                assert_eq!(idx, 0, "ambiguous first must be the only PUT");
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            })
+            .await;
+            let ep = Endpoints::derive(&base);
+            let client = Client::new();
+            let cfg = NumberCfg {
+                concurrency: 100,
+                min_concurrency: 5,
+                cooldown_ms: 1,
+                max_cooldowns: 0,
+            };
+            let out = brute_force_number(
+                &client,
+                &ep,
+                "RC1",
+                "u1",
+                &ep.answer_number("RC1"),
+                "dev-1",
+                cfg,
+            )
+            .await
+            .expect("ambiguous confirmed");
+            assert_eq!(out.discovered_code.as_deref(), Some("0000"));
+            assert_eq!(
+                max_c.load(Ordering::SeqCst),
+                1,
+                "configured 100 must still be sequential"
+            );
+            assert_eq!(
+                reqs.load(Ordering::SeqCst),
+                1,
+                "ambiguous first emits exactly one request"
+            );
+        }
+
+        // 2) Explicit wrong then next emits exactly two PUTs sequentially, second succeeds (confirmed).
+        {
+            let (base, _cur, max_c, reqs) = barrier_server(100, |text, idx, _, _| {
+                if idx == 0 {
+                    assert!(text.contains("\"0000\""), "first must be 0000");
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"message\":\"wrong number code\"}".to_string()
+                } else if idx == 1 {
+                    assert!(text.contains("\"0001\""), "second must be 0001");
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"success\":true}".to_string()
+                } else {
+                    panic!("must not emit more than two PUTs, idx={idx}");
+                }
+            })
+            .await;
+            let ep = Endpoints::derive(&base);
+            let client = Client::new();
+            let cfg = NumberCfg {
+                concurrency: 64,
+                min_concurrency: 4,
+                cooldown_ms: 1,
+                max_cooldowns: 0,
+            };
+            let out = brute_force_number(
+                &client,
+                &ep,
+                "RC1",
+                "u1",
+                &ep.answer_number("RC1"),
+                "dev-1",
+                cfg,
+            )
+            .await
+            .expect("wrong then success");
+            assert_eq!(out.discovered_code.as_deref(), Some("0001"));
+            assert_eq!(max_c.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                reqs.load(Ordering::SeqCst),
+                2,
+                "wrong advances then next emits exactly two sequentially"
+            );
+        }
+
+        // 3) Transport hang: cancellation/timeout aborts the round without a second mutation.
+        // The server never responds to the first PUT; the client has a short timeout and must not emit a second PUT.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reqs = Arc::new(AtomicUsize::new(0));
+            let r2 = reqs.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let r = r2.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        if text.starts_with("PUT /api/rollcall/") {
+                            r.fetch_add(1, Ordering::SeqCst);
+                            // Hang: never write a response, holding the connection.
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        } else if text.contains("student_rollcalls") {
+                            let body = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                            let _ = s.write_all(resp.as_bytes()).await;
+                        } else {
+                            let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        }
+                    });
+                }
+            });
+            let base = format!("http://{addr}");
+            let ep = Endpoints::derive(&base);
+            let url = ep.answer_number("RC1");
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(200))
+                .build()
+                .unwrap();
+            let cfg = NumberCfg {
+                concurrency: 50,
+                min_concurrency: 5,
+                cooldown_ms: 50,
+                max_cooldowns: 0,
+            };
+            let fut = brute_force_number(&client, &ep, "RC1", "u1", &url, "dev-1", cfg);
+            let res = tokio::time::timeout(std::time::Duration::from_secs(2), fut).await;
+            // Either the round times out or it fails after its transient budget — but it must have emitted exactly one PUT and never a second.
+            assert!(
+                res.is_err() || res.unwrap().is_err(),
+                "hang must not succeed"
+            );
+            // Give the hanging handler a moment to be counted before asserting (it counts on accept).
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                reqs.load(Ordering::SeqCst),
+                1,
+                "timeout/cancel must not emit a second mutation"
+            );
+        }
+
+        // 4) Group scope: two independent rollcall ids each run sequential; barriers isolated per rollcall/profile.
+        {
+            for rid in ["G1", "G2"] {
+                let (base, _cur, max_c, reqs) = barrier_server(100, |text, idx, _, _| {
+                    if idx == 0 {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"message\":\"wrong number code\"}".to_string()
+                    } else {
+                        assert!(text.contains("\"0001\""));
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"success\":true}".to_string()
+                    }
+                })
+                .await;
+                let ep = Endpoints::derive(&base);
+                let client = Client::new();
+                let cfg = NumberCfg {
+                    concurrency: 32,
+                    min_concurrency: 2,
+                    cooldown_ms: 1,
+                    max_cooldowns: 0,
+                };
+                let out = brute_force_number(
+                    &client,
+                    &ep,
+                    rid,
+                    "u1",
+                    &ep.answer_number(rid),
+                    "dev-1",
+                    cfg,
+                )
+                .await
+                .unwrap();
+                assert_eq!(out.discovered_code.as_deref(), Some("0001"));
+                assert_eq!(
+                    max_c.load(Ordering::SeqCst),
+                    1,
+                    "each rollcall is sequential"
+                );
+                assert_eq!(reqs.load(Ordering::SeqCst), 2);
+            }
+        }
     }
 }
