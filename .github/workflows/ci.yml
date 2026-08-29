@@ -153,6 +153,9 @@ jobs:
       - name: Run UI settings check
         shell: pwsh
         run: dotnet run --project tools/checks/UiSettings.Check/UiSettings.Check.csproj -c Release
+      - name: Raw-byte exact-source guard before release
+        shell: pwsh
+        run: ./tools/check-crlf.ps1
       # Unsigned Windows release dry-run：走真實 release.ps1 路徑（rustfmt/test/clippy、
       # production-linked checks、native marker、Release publish、版本驗證、隔離資料 smoke、
       # zip、build metadata、SHA256SUMS），但跳過 Android 簽章與 Inno installer（私鑰只在發行機，永不進 CI）。
@@ -174,6 +177,10 @@ jobs:
           $distCount = @(Get-ChildItem -LiteralPath dist -File -ErrorAction SilentlyContinue).Count
           if ($distCount -eq 0) { throw "dist 為空 — dry-run 應產出資產。" }
           Write-Host "  ✓ 工作樹乾淨，dist 內 $distCount 個資產。"
+      - name: Raw-byte exact-source guard after release
+        if: always()
+        shell: pwsh
+        run: ./tools/check-crlf.ps1
       - name: Upload release dry-run dist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

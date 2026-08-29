@@ -90,6 +90,65 @@ if ($ValidateOnly) {
 }
 
 # ── 來源／計畫閘：記下 exact HEAD；真正建置另要求乾淨工作樹。 ──
+
+function Assert-RawBytesExact {
+    param([string]$Phase)
+    $maxPrint = 20
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $modeFailures = [System.Collections.Generic.List[string]]::new()
+    $names = @(git ls-tree -r --name-only HEAD)
+    if ($LASTEXITCODE -ne 0) { throw "[$Phase] git ls-tree failed" }
+    $count = 0
+    foreach ($name in $names) {
+        $count++
+        $line = git ls-tree HEAD -- $name 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($line)) {
+            $failures.Add("$name (missing in HEAD)")
+            continue
+        }
+        $m = [regex]::Match($line, '^([0-9]+)\s+(\S+)\s+([0-9a-f]+)\s+')
+        if (-not $m.Success) { $failures.Add("$name (unparseable ls-tree)"); continue }
+        $mode = $m.Groups[1].Value
+        $type = $m.Groups[2].Value
+        $blob = $m.Groups[3].Value
+        if ($mode -eq "120000" -or $type -eq "commit") {
+            $modeFailures.Add("$name (unsupported mode $mode type $type)")
+            continue
+        }
+        if ($mode -ne "100644" -and $mode -ne "100755") {
+            $modeFailures.Add("$name (unexpected mode $mode)")
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $name -PathType Leaf)) {
+            $failures.Add("$name (missing on disk)")
+            continue
+        }
+        $raw = (git hash-object --no-filters -- $name 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            $failures.Add("$name (hash-object failed)")
+            continue
+        }
+        $raw = $raw.Trim()
+        if ($raw -ne $blob) {
+            $failures.Add($name)
+        }
+        if ($failures.Count -ge $maxPrint -and $modeFailures.Count -ge $maxPrint) { break }
+    }
+    if ($modeFailures.Count -gt 0) {
+        $show = @($modeFailures | Select-Object -First $maxPrint)
+        foreach ($p in $show) { Write-Host "  ! [$Phase] $p" -ForegroundColor Yellow }
+        if ($modeFailures.Count -gt $maxPrint) { Write-Host "  ... and $($modeFailures.Count - $maxPrint) more" -ForegroundColor Yellow }
+        throw "[$Phase] raw-byte guard: unsupported mode ($($modeFailures.Count))"
+    }
+    if ($failures.Count -gt 0) {
+        $show = @($failures | Select-Object -First $maxPrint)
+        foreach ($p in $show) { Write-Host "  ! [$Phase] $p" -ForegroundColor Yellow }
+        if ($failures.Count -gt $maxPrint) { Write-Host "  ... and $($failures.Count - $maxPrint) more" -ForegroundColor Yellow }
+        throw "[$Phase] raw-byte guard: differ ($($failures.Count)/$count); fix pwsh ./tools/check-crlf.ps1 -Fix"
+    }
+    Write-Host "  raw-byte guard [$Phase]: $count OK" -ForegroundColor Green
+}
+
 $headSha = [string](& git rev-parse HEAD 2>$null)
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($headSha)) { throw "無法取得 HEAD commit。" }
 $headSha = $headSha.Trim()
@@ -158,9 +217,13 @@ if ($PlanOnly) {
     exit 0
 }
 
+
 function Step([string]$Message) {
     Write-Host "`n=== $Message ===" -ForegroundColor Cyan
 }
+
+Assert-RawBytesExact -Phase "start"
+
 
 function Invoke-Native {
     param(
@@ -711,6 +774,7 @@ if ($finalGitStatus.Count -gt 0) {
     }
     throw "建置期間工作樹出現 $($finalGitStatus.Count) 筆變更；拒絕產生來源不明的 release metadata。"
 }
+Assert-RawBytesExact -Phase "final"
 if ($RequireTaggedHead) {
     $finalTagCommit = [string](& git rev-parse --verify --quiet "refs/tags/$Tag^{commit}" 2>$null)
     if ($LASTEXITCODE -ne 0 -or $finalTagCommit.Trim() -ne $headSha) {
