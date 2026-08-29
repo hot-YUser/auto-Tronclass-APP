@@ -1043,7 +1043,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         async fn serve(
-            mut listener: tokio::net::TcpListener,
+            listener: tokio::net::TcpListener,
             counter: Arc<AtomicUsize>,
             roster_present: bool,
         ) {
