@@ -363,7 +363,16 @@ function Clear-HeadBuildOutput([string]$TargetFramework) {
         (Join-Path $root "ui\bin\Release\$TargetFramework"),
         (Join-Path $root "ui\obj\Release\$TargetFramework")
     )) {
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        # Retry with build-server shutdown on lock (VBCSCompiler/R2R race on Windows).
+        for ($r = 0; $r -lt 3; $r++) {
+            try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop; break }
+            catch {
+                if ($r -eq 2) { throw }
+                try { & dotnet build-server shutdown 2>$null } catch {}
+                Start-Sleep -Milliseconds (500 * ($r + 1))
+            }
+        }
     }
 }
 
