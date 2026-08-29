@@ -6,12 +6,19 @@
 
 param(
     [switch]$CheckOnly,
-    [switch]$VerifyToolchainOnly
+    [switch]$VerifyToolchainOnly,
+    [switch]$VerifyLockOnly,
+    [switch]$PrepareToolchainCache
 )
 
 $ErrorActionPreference = "Stop"
-# Fail-closed switch combinations: exactly zero or one of -CheckOnly / -VerifyToolchainOnly may be set.
-if ($VerifyToolchainOnly -and $CheckOnly) { throw "cannot combine -VerifyToolchainOnly and -CheckOnly (fail-closed)" }
+# Fail-closed switch combinations: exactly zero or one of -CheckOnly/-VerifyToolchainOnly/-VerifyLockOnly/-PrepareToolchainCache may be set.
+$__switchCount = 0
+if ($CheckOnly) { $__switchCount++ }
+if ($VerifyToolchainOnly) { $__switchCount++ }
+if ($VerifyLockOnly) { $__switchCount++ }
+if ($PrepareToolchainCache) { $__switchCount++ }
+if ($__switchCount -gt 1) { throw "cannot combine -CheckOnly/-VerifyToolchainOnly/-VerifyLockOnly/-PrepareToolchainCache (fail-closed: exactly zero or one may be set)" }
 $tools = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $tools
 Set-Location $root
@@ -33,6 +40,7 @@ if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) { $cargo = "cargo" }
 # canonical package source (e.g. cargo vendor with [source."crates-io"] replace-with) keeps this value
 # and therefore remains offline-compatible. Any git/path/alternate registry or null/empty source fails.
 $ExpectedCsbindgenSource = "registry+https://github.com/rust-lang/crates.io-index"
+$ExpectedCsbindgenChecksum = "950f59b281d7e20f050b4efd56d7c36c0deb853bf9ea1f20b985a75ae5b03b34"
 
 $genTmpDir = Join-Path ([IO.Path]::GetTempPath()) ("tron-bindings-gen-" + [guid]::NewGuid().ToString("N"))
 $genOutput = Join-Path $genTmpDir "NativeMethods.g.cs"
@@ -143,6 +151,231 @@ function Assert-CsbindgenVersionGate {
     return $expectedVer
 }
 
+function Get-LockPackagesStrict {
+    param([Parameter(Mandatory)][string]$LockPath)
+    if (-not (Test-Path -LiteralPath $LockPath -PathType Leaf)) { throw "missing lock file: $LockPath" }
+    $bytes = [System.IO.File]::ReadAllBytes($LockPath)
+    if ($bytes.Length -eq 0) { throw "$LockPath`: empty file" }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw "$LockPath`: BOM not allowed" }
+    $utf8Strict = [System.Text.UTF8Encoding]::new($false, $true)
+    try { $text = $utf8Strict.GetString($bytes) }
+    catch { throw "$LockPath`: invalid UTF-8: $($_.Exception.Message)" }
+    $lines = $text -split "\r?\n"
+    $versionFound = $false
+    $versionValue = $null
+    $packages = [System.Collections.Generic.List[hashtable]]::new()
+    $seenBlockKeys = [System.Collections.Generic.HashSet[string]]::new()
+    $current = $null
+    $currentKeys = $null
+    $currentStartLine = 0
+    $inDepsArray = $false
+    $depsArrayLine = 0
+    for ($idx = 0; $idx -lt $lines.Count; $idx++) {
+        $lineNum = $idx + 1
+        $rawLine = $lines[$idx]
+        $trimmed = $rawLine.Trim()
+        if ($inDepsArray) {
+            if ($trimmed -eq "" -or $trimmed.StartsWith("#")) { continue }
+            if ($trimmed -eq "]") { $inDepsArray = $false; continue }
+            if ($trimmed -match '^"[^"]*"\s*,?\s*(?:#.*)?$') { continue }
+            throw "$LockPath`:$lineNum`: malformed dependencies entry: $rawLine (opened at $depsArrayLine)"
+        }
+        if ($trimmed -eq "" -or $trimmed.StartsWith("#")) { continue }
+        if ($trimmed -match '^\s*version\s*=\s*(.+?)\s*$') {
+            $isHeader = ($null -eq $current) -and (-not $versionFound)
+            if ($isHeader) {
+                $valPart = $Matches[1].Trim()
+                if ($valPart -match '^"(\d+)"$') { $valPart = $Matches[1] }
+                elseif ($valPart -match '^(\d+)$') { $valPart = $Matches[1] }
+                else { throw "$LockPath`:$lineNum`: malformed version value: $valPart" }
+                $versionFound = $true
+                $versionValue = $valPart
+                if ($versionValue -ne "4") { throw "$LockPath`:$lineNum`: unsupported lock version $versionValue (expected 4)" }
+                continue
+            }
+        }
+        if ($trimmed -eq "[[package]]") {
+            if ($null -ne $current) {
+                if (-not $current.ContainsKey("name")) { throw "$LockPath`:$currentStartLine`: package block missing name" }
+                if (-not $current.ContainsKey("version")) { throw "$LockPath`:$currentStartLine`: package block missing version for $($current["name"])" }
+                $srcKey = if ($current.ContainsKey("source")) { $current["source"] } else { "" }
+                $key = "$($current["name"])|$($current["version"])|$srcKey"
+                if (-not $seenBlockKeys.Add($key)) { throw "$LockPath`:$currentStartLine`: duplicate package block $key" }
+                $packages.Add($current)
+            }
+            $current = @{}
+            $currentKeys = [System.Collections.Generic.HashSet[string]]::new()
+            $currentStartLine = $lineNum
+            continue
+        }
+        if ($trimmed -eq "[package]") {
+            throw "$LockPath`:$lineNum`: malformed package header [package] (expected [[package]])"
+        }
+        if ($null -eq $current) {
+            throw "$LockPath`:$lineNum`: unexpected content outside [[package]]: $trimmed"
+        }
+        if ($trimmed -match '^dependencies\s*=\s*\[') {
+            if (-not $currentKeys.Add("dependencies")) { throw "$LockPath`:$lineNum`: duplicate key dependencies in package at $currentStartLine" }
+            $current["dependencies"] = "[array]"
+            $after = $trimmed.Substring($trimmed.IndexOf("["))
+            if ($after -match '^\[.*\]\s*(?:#.*)?$') {
+                continue
+            } else {
+                $remainder = $after.Substring(1).Trim()
+                if ($remainder -ne "" -and $remainder -notmatch '^(?:#.*)?$') {
+                    throw "$LockPath`:$lineNum`: malformed dependencies array start: $rawLine"
+                }
+                $inDepsArray = $true
+                $depsArrayLine = $lineNum
+                continue
+            }
+        }
+        # Quoted value may contain # — must not strip as comment. Try quoted first, then digits.
+        $qMatch = [regex]::Match($trimmed, '^([A-Za-z0-9_-]+)\s*=\s*("[^"]*")\s*(?:#.*)?$')
+        if ($qMatch.Success) {
+            $k = $qMatch.Groups[1].Value
+            $vRaw = $qMatch.Groups[2].Value
+            if (-not $currentKeys.Add($k)) { throw "$LockPath`:$lineNum`: duplicate key $k in package at $currentStartLine" }
+            $inner = $vRaw.Substring(1, $vRaw.Length - 2)
+            $current[$k] = $inner
+        } else {
+            $nMatch = [regex]::Match($trimmed, '^([A-Za-z0-9_-]+)\s*=\s*(\d+)\s*(?:#.*)?$')
+            if ($nMatch.Success) {
+                $k = $nMatch.Groups[1].Value
+                $vRaw = $nMatch.Groups[2].Value
+                if (-not $currentKeys.Add($k)) { throw "$LockPath`:$lineNum`: duplicate key $k in package at $currentStartLine" }
+                $current[$k] = $vRaw
+            } else {
+                throw "$LockPath`:$lineNum`: malformed line: $rawLine"
+            }
+        }
+    }
+    if ($inDepsArray) { throw "$LockPath`:$depsArrayLine`: unclosed dependencies array" }
+    if ($null -ne $current) {
+        if (-not $current.ContainsKey("name")) { throw "$LockPath`:$currentStartLine`: package block missing name" }
+        if (-not $current.ContainsKey("version")) { throw "$LockPath`:$currentStartLine`: package block missing version" }
+        $srcKey = if ($current.ContainsKey("source")) { $current["source"] } else { "" }
+        $key = "$($current["name"])|$($current["version"])|$srcKey"
+        if (-not $seenBlockKeys.Add($key)) { throw "$LockPath`:$currentStartLine`: duplicate package block $key" }
+        $packages.Add($current)
+    }
+    if (-not $versionFound) { throw "$LockPath`: missing version = 4 header" }
+    return $packages
+}
+
+function Assert-LockPreflight {
+    $pin = Get-ExpectedCsbindgenPin
+    $cargoConfigPaths = @(
+        (Join-Path $root ".cargo/config.toml")
+        (Join-Path $root ".cargo/config")
+    )
+    foreach ($cc in $cargoConfigPaths) {
+        if (Test-Path -LiteralPath $cc -PathType Leaf) {
+            $cBytes = [System.IO.File]::ReadAllBytes($cc)
+            $cText = [System.Text.Encoding]::UTF8.GetString($cBytes)
+            if ($cText -match '(?m)^\s*\[source' -or $cText -match 'replace-with' -or $cText -match 'directory\s*=') {
+                $isVendorAllow = $false
+                if ($cText -match 'replace-with\s*=\s*[''"]vendored-sources[''"]') { $isVendorAllow = $true }
+                if (-not $isVendorAllow) {
+                    throw "cargo config at $cc contains [source]/replace-with/directory (fail-closed; vendor not allow-listed)"
+                }
+                # Even when vendored-sources is present, reject any extra [source.*] beyond the two allowed ones,
+                # and any registry/git/path source injection.
+                $sourceHeaders = [regex]::Matches($cText, '(?m)^\s*\[source\.([^\]]+)\]')
+                foreach ($m in $sourceHeaders) {
+                    $srcName = $m.Groups[1].Value.Trim()
+                    # Allow only "crates-io" and "vendored-sources" (with or without quotes)
+                    $normalized = $srcName -replace '^[''"]|[''"]$',''
+                    if ($normalized -ne "crates-io" -and $normalized -ne "vendored-sources") {
+                        throw "cargo config at $cc contains non-allow-listed [source.$srcName] (fail-closed)"
+                    }
+                }
+                if ($cText -match '(?m)^\s*registry\s*=') {
+                    throw "cargo config at $cc contains registry = (fail-closed; only vendored directory allowed)"
+                }
+                # Directory must be exactly "vendor" under [source.vendored-sources]; any other path is fail-closed.
+                $dirMatches = [regex]::Matches($cText, '(?m)^\s*directory\s*=\s*[''"]?([^''"\s#]+)[''"]?\s*(?:#.*)?$')
+                foreach ($dm in $dirMatches) {
+                    $dirVal = $dm.Groups[1].Value.Trim()
+                    if ($dirVal -ne "vendor") {
+                        throw "cargo config at $cc contains non-allow-listed directory = `"$dirVal`" (only `"vendor`" allowed)"
+                    }
+                }
+            }
+        }
+    }
+    $genPkgs = Get-LockPackagesStrict -LockPath $genLock
+    $corePkgs = Get-LockPackagesStrict -LockPath $coreLock
+    foreach ($entry in @(@{ pkgs=$genPkgs; path=$genLock }, @{ pkgs=$corePkgs; path=$coreLock })) {
+        $pkgs = $entry.pkgs
+        $lockPath = $entry.path
+        $cs = @($pkgs | Where-Object { $_["name"] -eq "csbindgen" })
+        if ($cs.Count -ne 1) { throw "$lockPath`: expected exactly one csbindgen package block, found $($cs.Count)" }
+        $c = $cs[0]
+        if ($c["version"] -ne $pin) { throw "$lockPath`: csbindgen version $($c["version"]) != pin $pin" }
+        $src = $c["source"]
+        if ([string]::IsNullOrWhiteSpace($src)) { throw "$lockPath`: csbindgen source missing/empty (expected $ExpectedCsbindgenSource)" }
+        if ($src -ne $ExpectedCsbindgenSource) { throw "$lockPath`: csbindgen source not canonical: $src != $ExpectedCsbindgenSource (git/path/alternate registry not allowed)" }
+        $chk = $c["checksum"]
+        if ([string]::IsNullOrWhiteSpace($chk)) { throw "$lockPath`: csbindgen checksum missing/empty" }
+        if ($chk -cnotmatch '^[0-9a-f]{64}$') { throw "$lockPath`: csbindgen checksum malformed: $chk (expected 64 lower hex)" }
+        if ($chk -ne $ExpectedCsbindgenChecksum) { throw "$lockPath`: csbindgen checksum $chk != expected $ExpectedCsbindgenChecksum (must match pinned canonical crate)" }
+        foreach ($p in $pkgs) {
+            $n = $p["name"]
+            $s = if ($p.ContainsKey("source")) { $p["source"] } else { $null }
+            $ch = if ($p.ContainsKey("checksum")) { $p["checksum"] } else { $null }
+            if ([string]::IsNullOrWhiteSpace($n)) { throw "$lockPath`: package name empty" }
+            if (-not $p.ContainsKey("version") -or [string]::IsNullOrWhiteSpace($p["version"])) { throw "$lockPath`: package $n version empty" }
+            if ($null -ne $s) {
+                if ([string]::IsNullOrWhiteSpace($s)) { throw "$lockPath`: package $n source empty" }
+                if ($s -ne $ExpectedCsbindgenSource) { throw "$lockPath`: package $n source not canonical: $s (only $ExpectedCsbindgenSource allowed; git/path/alternate rejected)" }
+                if ([string]::IsNullOrWhiteSpace($ch)) { throw "$lockPath`: package $n checksum missing for registry source" }
+                if ($ch -cnotmatch '^[0-9a-f]{64}$') { throw "$lockPath`: package $n checksum malformed: $ch" }
+            } else {
+                if ($n -ne "tronclass-core" -and $n -ne "tron-bindings-gen") {
+                    throw "$lockPath`: package $n source missing (expected canonical registry source)"
+                }
+                if ($null -ne $ch -and -not [string]::IsNullOrWhiteSpace($ch)) {
+                    throw "$lockPath`: package $n unexpected checksum for path package"
+                }
+            }
+        }
+    }
+    $genCs = @($genPkgs | Where-Object { $_["name"] -eq "csbindgen" })[0]
+    $coreCs = @($corePkgs | Where-Object { $_["name"] -eq "csbindgen" })[0]
+    if ($genCs["version"] -ne $coreCs["version"] -or $genCs["source"] -ne $coreCs["source"] -or $genCs["checksum"] -ne $coreCs["checksum"]) {
+        throw "csbindgen mismatch between locks: generator $($genCs["version"]) $($genCs["source"]) $($genCs["checksum"]) vs core $($coreCs["version"]) $($coreCs["source"]) $($coreCs["checksum"]) (must be identical)"
+    }
+    Write-Host "  lock preflight OK (csbindgen $pin canonical, checksum $($genCs["checksum"].Substring(0,8))..., locks identical)" -ForegroundColor Green
+}
+
+function Invoke-CargoFetchLocked {
+    param([Parameter(Mandatory)][string]$ManifestPath)
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "missing manifest: $ManifestPath" }
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $cargo
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    foreach ($a in @("fetch","--locked","--manifest-path",$ManifestPath)) { $null = $psi.ArgumentList.Add($a) }
+    $proc = [Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    try {
+        if (-not $proc.Start()) { throw "failed to start cargo fetch for $ManifestPath" }
+        $out = $proc.StandardOutput.ReadToEnd()
+        $err = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) {
+            $msg = "cargo fetch failed for $ManifestPath (exit $($proc.ExitCode))"
+            if (-not [string]::IsNullOrWhiteSpace($err)) { $msg += ": $($err.Trim())" }
+            if (-not [string]::IsNullOrWhiteSpace($out)) { $msg += "`n$out" }
+            throw $msg
+        }
+        Write-Host "  cargo fetch --locked OK for $ManifestPath (downloads locked checksummed sources, no compile/build script)" -ForegroundColor Green
+    } finally { $proc.Dispose() }
+}
+
 
 function Cleanup-GenTmp {
     try { if ($genTmpDir -and (Test-Path -LiteralPath $genTmpDir -PathType Container)) { Remove-Item -LiteralPath $genTmpDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
@@ -169,15 +402,31 @@ function Cleanup-StagingWithRetry {
 }
 
 try {
-    # VerifyToolchainOnly: side-effect-free gate identical to pre-generation gate, no temp/staging/backup/target writes or mtime changes.
+    # VerifyLockOnly: static preflight only — no cargo, no network, no CARGO_HOME, no writes, no temp.
+    if ($VerifyLockOnly) {
+        Assert-LockPreflight
+        Write-Host "  verify lock only: OK (offline, no cargo, side-effect-free)" -ForegroundColor Green
+        exit 0
+    }
+    # PrepareToolchainCache: static preflight first (fail-closed before any network), then cargo fetch --locked for both manifests (no build script execution), then stays online caller scope; no tracked file writes.
+    if ($PrepareToolchainCache) {
+        Assert-LockPreflight
+        Write-Host "  priming cargo registry cache (cargo fetch --locked, canonical only; does not compile or execute build scripts)..." -ForegroundColor Cyan
+        Invoke-CargoFetchLocked -ManifestPath $generatorManifest
+        Invoke-CargoFetchLocked -ManifestPath (Join-Path $root "core/Cargo.toml")
+        Write-Host "  prepare toolchain cache: OK (CARGO_NET_OFFLINE not set here; caller must gate next step offline)" -ForegroundColor Green
+        exit 0
+    }
+    # VerifyToolchainOnly: static preflight + cargo metadata offline triple gate, side-effect-free.
     if ($VerifyToolchainOnly) {
+        Assert-LockPreflight
         $null = Assert-CsbindgenVersionGate
         Write-Host "  verify toolchain only: OK" -ForegroundColor Green
         exit 0
     }
 
-    # Fail-closed version+source gate: cargo metadata --locked --offline --format-version 1, exactly one package each, pin equality, canonical source, triple identical.
-    # Must run before generation or any tracked-file staging.
+    # Normal generation/update: static preflight + offline metadata gate before any staging.
+    Assert-LockPreflight
     $null = Assert-CsbindgenVersionGate
 
     New-Item -ItemType Directory -Force -Path $genTmpDir | Out-Null

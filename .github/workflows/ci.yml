@@ -153,12 +153,38 @@ jobs:
       - name: Run UI settings check
         shell: pwsh
         run: dotnet run --project tools/checks/UiSettings.Check/UiSettings.Check.csproj -c Release
+      - name: Static lock preflight (no cargo, no network, fail-closed before fetch)
+        shell: pwsh
+        run: |
+          $porcelainBefore = @(git status --porcelain)
+          $rawBefore = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          $mtimeBefore = $null
+          if (Test-Path -LiteralPath "ui/Interop/NativeMethods.g.cs" -PathType Leaf) {
+            $mtimeBefore = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+          }
+          pwsh ./tools/update-bindings.ps1 -VerifyLockOnly
+          if ($LASTEXITCODE -ne 0) { throw "static lock preflight failed (exit $LASTEXITCODE)" }
+          $porcelainAfter = @(git status --porcelain)
+          if (@($porcelainBefore).Count -ne @($porcelainAfter).Count -or (($porcelainBefore -join "`n") -ne ($porcelainAfter -join "`n"))) { throw "CI regression: -VerifyLockOnly mutated porcelain" }
+          $rawAfter = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          if ("$rawBefore" -ne "$rawAfter") { throw "CI regression: -VerifyLockOnly mutated raw bytes" }
+          if ($null -ne $mtimeBefore) {
+            $mtimeAfter = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+            if ($mtimeAfter -ne $mtimeBefore) { throw "CI regression: -VerifyLockOnly mutated mtime" }
+          }
+      - name: Prime cargo registry cache (after static preflight only, --locked canonical, no build script)
+        shell: pwsh
+        run: |
+          # cargo fetch downloads locked/checksummed sources but does not compile or execute build scripts (cargo fetch = update_lockfile + fetch_packages, no cargo_compile/build_script).
+          # Scope: only after static preflight proves manifests/locks are canonical crates.io ==1.9.8 with checksums; malicious git/path/alt is rejected before any network.
+          pwsh ./tools/update-bindings.ps1 -PrepareToolchainCache
+          if ($LASTEXITCODE -ne 0) { throw "prime cargo cache failed (exit $LASTEXITCODE)" }
       - name: Assert csbindgen toolchain (canonical registry source, offline)
         shell: pwsh
         env:
           CARGO_NET_OFFLINE: "true"
         run: |
-          # Single source of truth: tools/update-bindings.ps1 -VerifyToolchainOnly (cargo metadata --locked --offline)
+          # Single source of truth: tools/update-bindings.ps1 -VerifyToolchainOnly (static preflight + cargo metadata --locked --offline)
           # Asserts porcelain/raw bytes/NativeMethods mtime unchanged (side-effect-free verify mode).
           $porcelainBefore = @(git status --porcelain)
           $rawBefore = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
