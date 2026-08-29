@@ -48,35 +48,108 @@ $stagingTmp = $null
 $backupPath = $null
 $injectFail = $env:TRONCLASS_UPDATE_BINDINGS_INJECT_FAIL
 
-function Invoke-CargoMetadataLockedOffline {
-    param([Parameter(Mandatory)][string]$ManifestPath)
-    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "missing manifest: $ManifestPath" }
+function Invoke-CargoProcessWithTimeout {
+    param(
+        [Parameter(Mandatory)][string[]]$CargoArgs,
+        [Parameter(Mandatory)][string]$Label,
+        [int]$TimeoutMs = 600000
+    )
+    if (Test-Path Env:CARGO_NET_OFFLINE) {
+        $v = $env:CARGO_NET_OFFLINE
+        if ([string]::IsNullOrWhiteSpace($v)) {
+            Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue
+        } elseif ($v -ne "true" -and $v -ne "false") {
+            Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue
+        }
+    }
     $psi = [Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $cargo
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
-    foreach ($a in @("metadata","--manifest-path",$ManifestPath,"--locked","--offline","--format-version","1")) { $null = $psi.ArgumentList.Add($a) }
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    foreach ($a in $CargoArgs) { $null = $psi.ArgumentList.Add($a) }
     $proc = [Diagnostics.Process]::new()
     $proc.StartInfo = $psi
+    $outTask = $null
+    $errTask = $null
     $out = ""
     $err = ""
     try {
-        if (-not $proc.Start()) { throw "failed to start cargo metadata for $ManifestPath" }
-        $out = $proc.StandardOutput.ReadToEnd()
-        $err = $proc.StandardError.ReadToEnd()
-        $proc.WaitForExit()
+        if (-not $proc.Start()) { throw "failed to start cargo $Label" }
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $exited = $proc.WaitForExit($TimeoutMs)
+        if (-not $exited) {
+            try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+            # Bounded drain after kill — do not block indefinitely on .Result.
+            try { [Threading.Tasks.Task]::WhenAll($outTask, $errTask).Wait(10000) } catch {}
+            $partial = ""
+            try {
+                if ($null -ne $errTask -and $errTask.IsCompletedSuccessfully) { $partial = $errTask.Result }
+                elseif ($null -ne $errTask -and $errTask.IsCompleted) {
+                    try { $partial = $errTask.Result } catch { $partial = "" }
+                }
+            } catch { $partial = "" }
+            if (-not [string]::IsNullOrWhiteSpace($partial)) {
+                $partial = $partial.Trim()
+                if ($partial.Length -gt 2048) { $partial = $partial.Substring($partial.Length - 2048) }
+                $partial = ": $partial"
+            }
+            throw "cargo $Label timeout after $($TimeoutMs/1000)s$partial"
+        }
+        # Process exited — drain pipes with bounded wait, avoid indefinite .Result block.
+        $drained = $false
+        try { $drained = [Threading.Tasks.Task]::WhenAll($outTask, $errTask).Wait(10000) } catch { $drained = $false }
+        if (-not $drained) {
+            # One more bounded attempt before falling back to whatever completed.
+            try { [Threading.Tasks.Task]::WhenAll($outTask, $errTask).Wait(5000) } catch {}
+        }
+        # Only read Result if task completed; otherwise use empty to avoid blocking.
+        if ($null -ne $outTask -and $outTask.IsCompleted) {
+            try { $out = $outTask.Result } catch { $out = "" }
+        }
+        if ($null -ne $errTask -and $errTask.IsCompleted) {
+            try { $err = $errTask.Result } catch { $err = "" }
+        }
         if ($proc.ExitCode -ne 0) {
-            $msg = "cargo metadata failed for $ManifestPath (exit $($proc.ExitCode))"
-            if (-not [string]::IsNullOrWhiteSpace($err)) { $msg += ": $($err.Trim())" }
+            $detail = ""
+            if (-not [string]::IsNullOrWhiteSpace($err)) { $detail = $err.Trim() }
+            elseif (-not [string]::IsNullOrWhiteSpace($out)) { $detail = $out.Trim() }
+            if ($detail.Length -gt 2048) { $detail = $detail.Substring($detail.Length - 2048) }
+            $msg = "cargo $Label failed (exit $($proc.ExitCode))"
+            if (-not [string]::IsNullOrWhiteSpace($detail)) { $msg += ": $detail" }
             throw $msg
         }
-    } finally { $proc.Dispose() }
-    if ([string]::IsNullOrWhiteSpace($out)) { throw "cargo metadata empty output for $ManifestPath" }
-    try { $json = $out | ConvertFrom-Json }
-    catch { throw "cargo metadata malformed JSON for $ManifestPath : $($_.Exception.Message)" }
-    return $json
+    } finally { try { $proc.Dispose() } catch {} }
+    return @{ Out = $out; Err = $err }
+}
+
+function Invoke-CargoMetadataLockedOffline {
+    param([Parameter(Mandatory)][string]$ManifestPath)
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "missing manifest: $ManifestPath" }
+    $hadOffline = Test-Path Env:CARGO_NET_OFFLINE
+    $prevOffline = if ($hadOffline) { $env:CARGO_NET_OFFLINE } else { $null }
+    $env:CARGO_NET_OFFLINE = "true"
+    try {
+        $label = "metadata --locked --offline $ManifestPath"
+        $res = Invoke-CargoProcessWithTimeout -CargoArgs @("metadata","--manifest-path",$ManifestPath,"--locked","--offline","--format-version","1") -Label $label -TimeoutMs 90000
+        $out = $res.Out
+        if ([string]::IsNullOrWhiteSpace($out)) { throw "cargo metadata empty output for $ManifestPath" }
+        try { $json = $out | ConvertFrom-Json }
+        catch { throw "cargo metadata malformed JSON for $ManifestPath : $($_.Exception.Message)" }
+        return $json
+    } finally {
+        if ($hadOffline) {
+            if ([string]::IsNullOrWhiteSpace($prevOffline) -or ($prevOffline -ne "true" -and $prevOffline -ne "false")) {
+                Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue
+            } else {
+                $env:CARGO_NET_OFFLINE = $prevOffline
+            }
+        } else { Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue }
+    }
 }
 
 function Get-ExpectedCsbindgenPin {
@@ -352,28 +425,22 @@ function Assert-LockPreflight {
 function Invoke-CargoFetchLocked {
     param([Parameter(Mandatory)][string]$ManifestPath)
     if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "missing manifest: $ManifestPath" }
-    $psi = [Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $cargo
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    foreach ($a in @("fetch","--locked","--manifest-path",$ManifestPath)) { $null = $psi.ArgumentList.Add($a) }
-    $proc = [Diagnostics.Process]::new()
-    $proc.StartInfo = $psi
+    $hadOffline = Test-Path Env:CARGO_NET_OFFLINE
+    $prevOffline = if ($hadOffline) { $env:CARGO_NET_OFFLINE } else { $null }
+    Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue
     try {
-        if (-not $proc.Start()) { throw "failed to start cargo fetch for $ManifestPath" }
-        $out = $proc.StandardOutput.ReadToEnd()
-        $err = $proc.StandardError.ReadToEnd()
-        $proc.WaitForExit()
-        if ($proc.ExitCode -ne 0) {
-            $msg = "cargo fetch failed for $ManifestPath (exit $($proc.ExitCode))"
-            if (-not [string]::IsNullOrWhiteSpace($err)) { $msg += ": $($err.Trim())" }
-            if (-not [string]::IsNullOrWhiteSpace($out)) { $msg += "`n$out" }
-            throw $msg
-        }
+        $label = "fetch --locked $ManifestPath"
+        $null = Invoke-CargoProcessWithTimeout -CargoArgs @("fetch","--locked","--manifest-path",$ManifestPath) -Label $label -TimeoutMs 600000
         Write-Host "  cargo fetch --locked OK for $ManifestPath (downloads locked checksummed sources, no compile/build script)" -ForegroundColor Green
-    } finally { $proc.Dispose() }
+    } finally {
+        if ($hadOffline) {
+            if ([string]::IsNullOrWhiteSpace($prevOffline) -or ($prevOffline -ne "true" -and $prevOffline -ne "false")) {
+                Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue
+            } else {
+                $env:CARGO_NET_OFFLINE = $prevOffline
+            }
+        } else { Remove-Item Env:CARGO_NET_OFFLINE -ErrorAction SilentlyContinue }
+    }
 }
 
 
