@@ -63,8 +63,8 @@ public sealed class SettingsPage : ContentPage
                 SettingRow("啟用門檻", "關閉後任何點名都會處理", _thresholdOn),
                 Theme.Primary("儲存監控設定", async () =>
                 {
-                    if (!int.TryParse(_countdown.Text, out var secs) || secs < 0 ||
-                        !double.TryParse(_threshold.Text, out var pct) || pct is < 0 or > 100)
+                    if (!SettingsSync.TryParseCountdown(_countdown.Text, out var secs) ||
+                        !SettingsSync.TryParseGate(_threshold.Text, out var pct))
                     {
                         state.Notify("error", "數值格式不正確");
                         return;
@@ -72,7 +72,7 @@ public sealed class SettingsPage : ContentPage
                     if (await state.SaveConfig(secs, pct, _thresholdOn.IsToggled))
                     {
                         // 回填剛儲存的正規值(門檻停用時 core 存 0 → 畫面顯示預設 15),dirty 隨之清除
-                        _countdown.Text = secs.ToString();
+                        _countdown.Text = secs.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         _threshold.Text = SettingsSync.CanonicalGateText(_thresholdOn.IsToggled ? pct : 0);
                         _monitorSync.Saved();
                         state.Notify("info", "監控設定已儲存");
@@ -136,13 +136,13 @@ public sealed class SettingsPage : ContentPage
                     var endpoint = _endpoint.Text?.Trim() ?? "";
                     var model = _model.Text?.Trim() ?? "";
                     if (endpoint.Length == 0 || model.Length == 0) { state.Notify("error", "端點與模型不可空白"); return; }
-                    if (!int.TryParse(_maxTokens.Text, out var mt) || mt < 0) { state.Notify("error", "最大 tokens 格式不正確"); return; }
+                    if (!SettingsSync.TryParseMaxTokens(_maxTokens.Text, out var mt)) { state.Notify("error", "最大 tokens 格式不正確"); return; }
                     if (await state.SaveLlmSettings(endpoint, model, mt, _resubmit.IsToggled, _tools.IsToggled))
                     {
                         // 回填剛儲存的正規值(trimmed),dirty 隨之清除
                         _endpoint.Text = endpoint;
                         _model.Text = model;
-                        _maxTokens.Text = mt.ToString();
+                        _maxTokens.Text = mt.ToString(System.Globalization.CultureInfo.InvariantCulture);
                         _llmSync.Saved();
                         state.Notify("info", "LLM 設定已儲存");
                     }
@@ -222,7 +222,7 @@ public sealed class SettingsPage : ContentPage
         if (s is null) return;
         if (_monitorSync.ShouldPopulate)
         {
-            _countdown.Text = s.CountdownSecs.ToString();
+            _countdown.Text = s.CountdownSecs.ToString(System.Globalization.CultureInfo.InvariantCulture);
             _thresholdOn.IsToggled = s.AttendanceGatePercent > 0;
             _threshold.Text = SettingsSync.CanonicalGateText(s.AttendanceGatePercent);
             _monitorSync.Populated();
@@ -231,7 +231,7 @@ public sealed class SettingsPage : ContentPage
         {
             _endpoint.Text = s.LlmEndpoint;
             _model.Text = s.LlmModel;
-            _maxTokens.Text = s.LlmMaxTokens.ToString();
+            _maxTokens.Text = s.LlmMaxTokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
             _resubmit.IsToggled = s.ResubmitForCorrect;
             _tools.IsToggled = s.EnableLlmTools;
             _llmSync.Populated();

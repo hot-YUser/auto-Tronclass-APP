@@ -6,6 +6,7 @@
 #   ./tools/release.ps1 -Tag v2.0.0-alpha.4
 #   ./tools/release.ps1 -Tag v2.0.0-alpha.4 -SkipAndroid
 #   ./tools/release.ps1 -Tag v2.0.0-alpha.4 -ValidateOnly   # 純版本驗算，不建置
+#   ./tools/release.ps1 -Tag v2.0.0-alpha.4 -PlanOnly       # 純發版計畫，不建置／發布
 #
 # Tag 必須是嚴格 SemVer（v?M.m.p[-alpha|beta|rc.N]）；DisplayVersion／Android
 # versionCode／Windows 數值版本一律由 Tag 依共享公式計算，不依賴 Ui.csproj 的手動欄位。
@@ -21,6 +22,8 @@ param(
     [switch]$RequireTaggedHead,
     # 純版本解析自測：驗算 Tag → DisplayVersion/versionCode/Windows 版本後直接結束，不改工作區。
     [switch]$ValidateOnly,
+    # 純計畫：輸出 exact HEAD target、gates 與將上傳的資產後結束，不建置、不寫 dist、不發布。
+    [switch]$PlanOnly,
     [string]$ExpectedApkFingerprint = $env:ANDROID_APK_FINGERPRINT
 )
 
@@ -32,6 +35,9 @@ Set-Location $root
 
 if ($SkipWindows -and $SkipAndroid) {
     throw "不能同時跳過 Windows 與 Android；至少必須驗證一個正式發行 head。"
+}
+if ($ValidateOnly -and $PlanOnly) {
+    throw "不能同時使用 -ValidateOnly 與 -PlanOnly。"
 }
 
 function ConvertTo-ReleaseVersion {
@@ -83,25 +89,114 @@ if ($ValidateOnly) {
     exit 0
 }
 
-# ── 來源閘：工作樹必須乾淨（尊重 .gitignore），並記下 HEAD 供產物稽核。 ──
-$gitStatus = @(& git status --porcelain 2>$null)
-if ($LASTEXITCODE -ne 0) { throw "無法執行 git status；請確認在 git 工作樹內執行。" }
-if ($gitStatus.Count -gt 0) {
-    throw "git 工作樹不乾淨（$($gitStatus.Count) 筆變更）；發行前請先提交或清除變更。"
+# ── 來源／計畫閘：記下 exact HEAD；真正建置另要求乾淨工作樹。 ──
+
+Import-Module (Join-Path $tools "GitRawHelper.psm1") -Force
+
+function Assert-RawBytesExact {
+    param([string]$Phase)
+    $maxPrint = 20
+    $failures = [System.Collections.Generic.List[string]]::new()
+    # Get-GitHeadEntries is fail-closed on unsupported modes/types and NUL/UTF-8/parse errors.
+    $entries = Get-GitHeadEntries -RepoRoot $root
+    $count = $entries.Count
+    foreach ($e in $entries) {
+        $rel = $e.Path
+        $esc = Escape-GitPath $rel
+        $abs = Join-Path $root $rel
+        if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) {
+            $failures.Add("$esc (missing on disk)")
+            continue
+        }
+        try { $raw = Get-FileGitBlobHash -LiteralPath $abs }
+        catch { throw "[$Phase] raw-byte guard: hash failed for $esc : $($_.Exception.Message)" }
+        if ($raw -ne $e.Sha) { $failures.Add($esc) }
+        if ($failures.Count -ge $maxPrint) { break }
+    }
+    if ($failures.Count -gt 0) {
+        $show = @($failures | Select-Object -First $maxPrint)
+        foreach ($p in $show) { Write-Host "  ! [$Phase] $p" -ForegroundColor Yellow }
+        if ($failures.Count -gt $maxPrint) { Write-Host "  ... and $($failures.Count - $maxPrint) more" -ForegroundColor Yellow }
+        throw "[$Phase] raw-byte guard: differ ($($failures.Count)/$count); fix pwsh ./tools/check-crlf.ps1 -Fix"
+    }
+    Write-Host "  raw-byte guard [$Phase]: $count OK" -ForegroundColor Green
 }
+
 $headSha = [string](& git rev-parse HEAD 2>$null)
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($headSha)) { throw "無法取得 HEAD commit。" }
-if ($RequireTaggedHead) {
-    $tagCommit = [string](& git rev-parse --verify --quiet "$Tag^{commit}" 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw "找不到 git tag $Tag（-RequireTaggedHead 要求 tag 已存在）。" }
-    if ($tagCommit.Trim() -ne $headSha.Trim()) {
-        throw "git tag $Tag 指向 $($tagCommit.Trim())，不是 HEAD $($headSha.Trim())（-RequireTaggedHead）。"
+$headSha = $headSha.Trim()
+
+if (-not $PlanOnly) {
+    $gitStatus = @(& git status --porcelain 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "無法執行 git status；請確認在 git 工作樹內執行。" }
+    if ($gitStatus.Count -gt 0) {
+        $redacted = @($gitStatus | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+        if ($redacted.Count -gt 0) {
+            Write-Host ("  ! 工作樹不乾淨（節選，最多 20 筆，已去敏僅列路徑）：") -ForegroundColor Yellow
+            foreach ($dirtyPath in $redacted) { Write-Host ("    - $dirtyPath") -ForegroundColor Yellow }
+        }
+        throw "git 工作樹不乾淨（$($gitStatus.Count) 筆變更）；發行前請先提交或清除變更。"
     }
 }
+if ($RequireTaggedHead) {
+    # Resolve the tag namespace explicitly: a same-named branch must never satisfy this release gate.
+    $tagRef = "refs/tags/$Tag"
+    $tagCommit = [string](& git rev-parse --verify --quiet "$tagRef^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "找不到 git tag $Tag（-RequireTaggedHead 要求 tag 已存在）。" }
+    if ($tagCommit.Trim() -ne $headSha) {
+        throw "git tag $Tag 指向 $($tagCommit.Trim())，不是 HEAD $headSha（-RequireTaggedHead）。"
+    }
+}
+
+$winTfm = "net11.0-windows10.0.19041.0"
+$winName = "AutoTronclass-$Tag-windows-x64-portable"
+$setupName = "AutoTronclass-$Tag-windows-x64-setup"
+$apkName = "AutoTronclass-$Tag-android.apk"
+$dist = Join-Path $root "dist"
+$notesPath = Join-Path $dist "RELEASE_NOTES-$Tag.md"
+$metadataPath = Join-Path $dist "build-metadata.json"
+$sumsPath = Join-Path $dist "SHA256SUMS.txt"
+
+$expectedAssets = @()
+if (-not $SkipWindows) {
+    $expectedAssets += Join-Path $dist "$winName.zip"
+    if (-not $SkipInstaller) { $expectedAssets += Join-Path $dist "$setupName.exe" }
+}
+if (-not $SkipAndroid) { $expectedAssets += Join-Path $dist $apkName }
+$releaseAssets = @($expectedAssets + $metadataPath + $sumsPath)
+
+$csharpChecks = @(
+    @{ Name = "ProtocolContract"; Path = (Join-Path $tools "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") },
+    @{ Name = "CommandWire"; Path = (Join-Path $tools "checks\CommandWire.Check\CommandWire.Check.csproj") },
+    @{ Name = "UiSettings"; Path = (Join-Path $tools "checks\UiSettings.Check\UiSettings.Check.csproj") }
+)
+if (-not $SkipWindows) {
+    $csharpChecks += @{ Name = "DeviceKey"; Path = (Join-Path $tools "checks\DeviceKey.Check\DeviceKey.Check.csproj") }
+}
+$releaseCheckNames = @("Rustfmt", "RustTests", "RustClippy") + @($csharpChecks | ForEach-Object Name)
+
+if ($PlanOnly) {
+    [ordered]@{
+        schema         = 1
+        tag            = $version.Tag
+        displayVersion = $version.DisplayVersion
+        versionCode    = $version.VersionCode
+        windowsVersion = $version.WindowsVersion
+        target         = $headSha
+        checks         = @($releaseCheckNames)
+        assets         = @($releaseAssets | ForEach-Object { [IO.Path]::GetFileName($_) })
+        notesFile      = [IO.Path]::GetFileName($notesPath)
+    } | ConvertTo-Json -Depth 3 | Write-Output
+    exit 0
+}
+
 
 function Step([string]$Message) {
     Write-Host "`n=== $Message ===" -ForegroundColor Cyan
 }
+
+Assert-RawBytesExact -Phase "start"
+
 
 function Invoke-Native {
     param(
@@ -268,7 +363,16 @@ function Clear-HeadBuildOutput([string]$TargetFramework) {
         (Join-Path $root "ui\bin\Release\$TargetFramework"),
         (Join-Path $root "ui\obj\Release\$TargetFramework")
     )) {
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        # Retry with build-server shutdown on lock (VBCSCompiler/R2R race on Windows).
+        for ($r = 0; $r -lt 3; $r++) {
+            try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop; break }
+            catch {
+                if ($r -eq 2) { throw }
+                try { & dotnet build-server shutdown 2>$null } catch {}
+                Start-Sleep -Milliseconds (500 * ($r + 1))
+            }
+        }
     }
 }
 
@@ -400,11 +504,6 @@ if (-not $SkipAndroid) {
 
 $core = Join-Path $root "core"
 $buildCore = Join-Path $tools "build-core.ps1"
-$winTfm = "net11.0-windows10.0.19041.0"
-$winName = "AutoTronclass-$Tag-windows-x64-portable"
-$setupName = "AutoTronclass-$Tag-windows-x64-setup"
-$apkName = "AutoTronclass-$Tag-android.apk"
-$dist = Join-Path $root "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -414,32 +513,23 @@ New-Item -ItemType Directory -Force -Path $markerRoot | Out-Null
 $winMarkerPath = Join-Path $markerRoot "windows.json"
 $androidMarkerPath = Join-Path $markerRoot "android.json"
 
+Step "cargo fmt --check"
+Invoke-Native -FilePath "cargo" -Arguments @("fmt", "--manifest-path", "$core/Cargo.toml", "--all", "--", "--check") -FailureMessage "Rust cargo fmt --check 失敗"
 Step "cargo test"
 Invoke-Native -FilePath "cargo" -Arguments @("test", "--manifest-path", "$core/Cargo.toml", "--locked", "--all-targets", "--all-features") -FailureMessage "Rust cargo test 失敗"
 Step "cargo clippy"
 Invoke-Native -FilePath "cargo" -Arguments @("clippy", "--manifest-path", "$core/Cargo.toml", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings") -FailureMessage "Rust cargo clippy 失敗"
 
-if (-not $SkipWindows) {
-    # 四個檢查直接連結 production source，防止 OS key、Rust↔C# wire contract（入站解析與出站命令
-    # 序列化各一支）與設定頁保護邏輯在發版前漂移。
-    foreach ($check in @(
-        @{ Name = "DeviceKey"; Path = (Join-Path $tools "checks\DeviceKey.Check\DeviceKey.Check.csproj") },
-        @{ Name = "ProtocolContract"; Path = (Join-Path $tools "checks\ProtocolContract.Check\ProtocolContract.Check.csproj") },
-        @{ Name = "CommandWire"; Path = (Join-Path $tools "checks\CommandWire.Check\CommandWire.Check.csproj") },
-        @{ Name = "UiSettings"; Path = (Join-Path $tools "checks\UiSettings.Check\UiSettings.Check.csproj") }
-    )) {
-        if (-not (Test-Path -LiteralPath $check.Path -PathType Leaf)) {
-            throw "缺少 $($check.Name) 可執行檢查：$($check.Path)"
-        }
-        Step "$($check.Name) 可執行檢查"
-        # 檢查以已發布的 net10 LTS API 面建置；發行機只有 net11 preview 時允許向前執行。
-        $oldRollForward = $env:DOTNET_ROLL_FORWARD
-        $env:DOTNET_ROLL_FORWARD = "Major"
-        try {
-            Invoke-Native -FilePath $dotnet -Arguments @("run", "--project", $check.Path, "-c", "Release") -FailureMessage "$($check.Name) 可執行檢查失敗"
-        }
-        finally { $env:DOTNET_ROLL_FORWARD = $oldRollForward }
+# 三支跨平台檢查一律執行；只有 DPAPI/NativeCore lifecycle 的 DeviceKey 依 Windows head。
+# 每支都直接連結 production source，防止 Rust↔C# wire、設定／Android FGS 純邏輯漂移。
+foreach ($check in $csharpChecks) {
+    if (-not (Test-Path -LiteralPath $check.Path -PathType Leaf)) {
+        throw "缺少 $($check.Name) 可執行檢查：$($check.Path)"
     }
+    Step "$($check.Name) 可執行檢查"
+    # Checks declare RollForward Major via tools/checks/Directory.Build.props so both CI and
+    # release share the same project-declared runtime policy (no env duplication).
+    Invoke-Native -FilePath $dotnet -Arguments @("run", "--project", $check.Path, "-c", "Release") -FailureMessage "$($check.Name) 可執行檢查失敗"
 }
 
 # ── 原生核心：build-core 會先刪除精確輸出，並寫 hash/mtime/build marker ──
@@ -649,20 +739,38 @@ if (-not $SkipAndroid) {
     Write-Host ("  ✓ dist\$apkName ({0:N0} MB)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB)) -ForegroundColor Green
 }
 
-Step "資產備妥於 dist\（尚未發布）"
-$expectedAssets = @()
-if (-not $SkipWindows) {
-    $expectedAssets += Join-Path $dist "$winName.zip"
-    if (-not $SkipInstaller) { $expectedAssets += Join-Path $dist "$setupName.exe" }
+# 長時間雙平台建置期間若 HEAD、tracked source 或要求的 tag 被移動，先前記下的 SHA 已不再
+# 能代表實際產物；在寫 metadata／發布計畫前再次 fail closed。
+$finalHeadSha = [string](& git rev-parse HEAD 2>$null)
+if ($LASTEXITCODE -ne 0 -or $finalHeadSha.Trim() -ne $headSha) {
+    throw "建置期間 HEAD 已變更；起始 $headSha，現在 $($finalHeadSha.Trim())。"
 }
-if (-not $SkipAndroid) { $expectedAssets += Join-Path $dist $apkName }
+$finalGitStatus = @(& git status --porcelain 2>$null)
+if ($LASTEXITCODE -ne 0) { throw "建置完成後無法執行 git status。" }
+if ($finalGitStatus.Count -gt 0) {
+    $redacted = @($finalGitStatus | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+    if ($redacted.Count -gt 0) {
+        Write-Host ("  ! 工作樹變更（節選，最多 20 筆，已去敏僅列路徑）：") -ForegroundColor Yellow
+        foreach ($dirtyPath in $redacted) { Write-Host ("    - $dirtyPath") -ForegroundColor Yellow }
+        try { & git diff --name-only 2>$null | Select-Object -First 20 | ForEach-Object { Write-Host ("    diff: $_") -ForegroundColor Yellow } } catch {}
+    }
+    throw "建置期間工作樹出現 $($finalGitStatus.Count) 筆變更；拒絕產生來源不明的 release metadata。"
+}
+Assert-RawBytesExact -Phase "final"
+if ($RequireTaggedHead) {
+    $finalTagCommit = [string](& git rev-parse --verify --quiet "refs/tags/$Tag^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $finalTagCommit.Trim() -ne $headSha) {
+        throw "建置期間 git tag $Tag 已消失或移動；拒絕產生 release metadata。"
+    }
+}
+
+Step "資產備妥於 dist\（尚未發布）"
 foreach ($asset in $expectedAssets) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "缺少預期發行資產：$asset" }
     $item = Get-Item -LiteralPath $asset
     if ($item.Length -le 0) { throw "發行資產為空：$asset" }
     Write-Host ("  {0}  {1:N0} MB" -f $item.Name, ($item.Length / 1MB))
 }
-$notesPath = Join-Path $dist "RELEASE_NOTES-$Tag.md"
 $noteLines = @(
     "# Auto-Tronclass $Tag",
     "",
@@ -678,11 +786,11 @@ $noteLines = @(
     "## 已驗證資產",
     ""
 )
-$noteLines += ($expectedAssets | ForEach-Object { "- ``$([IO.Path]::GetFileName($_))``" })
+$noteLines += ($releaseAssets | ForEach-Object { "- ``$([IO.Path]::GetFileName($_))``" })
 Set-Content -LiteralPath $notesPath -Encoding UTF8 -Value ($noteLines -join "`n")
 if ((Get-Item -LiteralPath $notesPath).Length -le 0) { throw "release notes 為空：$notesPath" }
 
-# machine-readable 建置中繼資料；與所有產物一起列入 SHA256SUMS。
+# machine-readable 建置中繼資料；與所有平台產物一起列入 SHA256SUMS，並作為 Release 資產。
 $toolchains = [ordered]@{
     rustc  = Get-ToolVersion -Name "rustc"
     cargo  = Get-ToolVersion -Name "cargo"
@@ -701,22 +809,24 @@ $metadata = [ordered]@{
     builtAtUtc     = [DateTime]::UtcNow.ToString("o")
     toolchains     = $toolchains
 }
-$metadataPath = Join-Path $dist "build-metadata.json"
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding UTF8
 
 $sumLines = @()
-foreach ($file in @($expectedAssets + $notesPath + $metadataPath)) {
+foreach ($file in @($expectedAssets + $metadataPath)) {
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
     $sumLines += "{0}  {1}" -f $hash, [IO.Path]::GetFileName($file)
 }
 $sumLines = @($sumLines | Sort-Object)
-$sumsPath = Join-Path $dist "SHA256SUMS.txt"
 Set-Content -LiteralPath $sumsPath -Encoding ASCII -Value ($sumLines -join "`n")
+foreach ($asset in $releaseAssets) {
+    if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "缺少預期 GitHub Release 資產：$asset" }
+    if ((Get-Item -LiteralPath $asset).Length -le 0) { throw "GitHub Release 資產為空：$asset" }
+}
 Write-Host ("  ✓ build-metadata.json + SHA256SUMS.txt（{0} 個檔）" -f $sumLines.Count) -ForegroundColor Green
 
-$assets = ($expectedAssets | ForEach-Object { "dist/$([IO.Path]::GetFileName($_))" }) -join " "
+$assets = ($releaseAssets | ForEach-Object { "dist/$([IO.Path]::GetFileName($_))" }) -join " "
 Write-Host "`n下一步（使用者決定後）：" -ForegroundColor Yellow
-Write-Host "  gh release create $Tag --repo hot-YUser/auto-Tronclass-APP --prerelease --target main ``"
+Write-Host "  gh release create $Tag --repo hot-YUser/auto-Tronclass-APP --prerelease --target $headSha ``"
 Write-Host "    --title `"$Tag`" --notes-file dist/RELEASE_NOTES-$Tag.md ``"
 Write-Host "    $assets"
 

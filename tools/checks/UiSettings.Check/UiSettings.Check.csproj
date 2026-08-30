@@ -13,5 +13,6 @@
     <Compile Include="..\..\..\ui\State\ScheduleCalculator.cs" Link="ScheduleCalculator.cs" />
     <Compile Include="..\..\..\ui\State\ScheduleCoordinator.cs" Link="ScheduleCoordinator.cs" />
     <Compile Include="..\..\..\ui\State\AndroidSchedulePolicy.cs" Link="AndroidSchedulePolicy.cs" />
+    <Compile Include="..\..\..\ui\State\ForegroundServiceHandshakeState.cs" Link="ForegroundServiceHandshakeState.cs" />
   </ItemGroup>
 </Project>

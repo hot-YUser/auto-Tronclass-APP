@@ -7,6 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_SCHEMA_VERSION: u8 = 1;
+pub(crate) const AUTOANSWER_TYPES: &[&str] = &[
+    "exam",
+    "questionnaire",
+    "homework",
+    "vote",
+    "classroom",
+    "courseware",
+];
+pub(crate) const RADAR_STRATEGIES: &[&str] = &["empty_answer", "global_wgs84"];
+pub(crate) const LOG_LEVELS: &[&str] = &["normal", "debug"];
 const MINUTES_PER_DAY: u16 = 1_440;
 const MINUTES_PER_WEEK: u32 = 7 * MINUTES_PER_DAY as u32;
 
@@ -90,6 +100,84 @@ impl Default for Settings {
             quiz_detect_secs: default_quiz_detect_secs(),
             log_level: default_log_level(),
         }
+    }
+}
+
+impl Settings {
+    /// Validate the complete persisted settings object. This boundary is shared by startup, saves,
+    /// and runtime patches so editing config.json cannot bypass the command-side validator.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_range("countdown_secs", self.countdown_secs, 1, 86_400)?;
+        if !self.attendance_gate_percent.is_finite()
+            || !(0.0..=100.0).contains(&self.attendance_gate_percent)
+        {
+            return Err("attendance_gate_percent 必須介於 0 與 100".to_string());
+        }
+        if !valid_http_url(&self.llm_endpoint) {
+            return Err("llm_endpoint 必須是有效的 http(s) URL".to_string());
+        }
+        if self.llm_model.trim().is_empty() {
+            return Err("llm_model 不得為空".to_string());
+        }
+        validate_range(
+            "llm_max_tokens",
+            u64::from(self.llm_max_tokens),
+            0,
+            1_000_000,
+        )?;
+        validate_closed_unique(
+            "autoanswer_types",
+            &self.autoanswer_types,
+            AUTOANSWER_TYPES,
+            true,
+        )?;
+        validate_closed_unique(
+            "radar_strategy",
+            &self.radar_strategy,
+            RADAR_STRATEGIES,
+            false,
+        )?;
+        if !LOG_LEVELS.contains(&self.log_level.as_str()) {
+            return Err("log_level 必須是 normal 或 debug".to_string());
+        }
+        validate_range("max_answer_reask", u64::from(self.max_answer_reask), 1, 100)?;
+        validate_range(
+            "prepare_retry_budget_secs",
+            self.prepare_retry_budget_secs,
+            1,
+            86_400,
+        )?;
+        validate_range(
+            "max_tool_iterations",
+            u64::from(self.max_tool_iterations),
+            0,
+            100,
+        )?;
+        validate_range(
+            "number_concurrency",
+            u64::from(self.number_concurrency),
+            1,
+            256,
+        )?;
+        validate_range(
+            "number_min_concurrency",
+            u64::from(self.number_min_concurrency),
+            1,
+            256,
+        )?;
+        if self.number_min_concurrency > self.number_concurrency {
+            return Err("number_min_concurrency 不得大於 number_concurrency".to_string());
+        }
+        validate_range("number_cooldown_ms", self.number_cooldown_ms, 1, 3_600_000)?;
+        validate_range(
+            "number_max_cooldowns",
+            u64::from(self.number_max_cooldowns),
+            0,
+            1_000,
+        )?;
+        validate_range("poll_idle_secs", self.poll_idle_secs, 1, 86_400)?;
+        validate_range("quiz_detect_secs", self.quiz_detect_secs, 1, 86_400)?;
+        Ok(())
     }
 }
 
@@ -476,6 +564,7 @@ impl Config {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err("unsupported config schema".to_string());
         }
+        self.settings.validate()?;
         self.monitoring.global_schedule.validate()?;
         let mut account_ids = HashSet::new();
         for account in &self.accounts {
@@ -602,6 +691,47 @@ fn has_duplicates(values: &[String]) -> bool {
     values.iter().any(|value| !seen.insert(value.as_str()))
 }
 
+fn validate_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), String> {
+    if !(min..=max).contains(&value) {
+        return Err(format!("{name} 必須介於 {min} 與 {max}"));
+    }
+    Ok(())
+}
+
+fn validate_closed_unique(
+    name: &str,
+    values: &[String],
+    allowed: &[&str],
+    allow_empty: bool,
+) -> Result<(), String> {
+    if values.is_empty() && !allow_empty {
+        return Err(format!("{name} 不得為空"));
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() {
+            return Err(format!("{name} 不得包含空值"));
+        }
+        if !allowed.contains(&value.as_str()) {
+            return Err(format!("{name} 包含未實作值: {value}"));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(format!("{name} 不得包含重複值: {value}"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_http_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 fn default_countdown() -> u64 {
     15
 }
@@ -630,20 +760,16 @@ fn default_tool_iterations() -> u32 {
     3
 }
 fn default_autoanswer_types() -> Vec<String> {
-    [
-        "exam",
-        "questionnaire",
-        "homework",
-        "vote",
-        "classroom",
-        "courseware",
-    ]
-    .iter()
-    .map(|value| (*value).to_string())
-    .collect()
+    AUTOANSWER_TYPES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
 }
 fn default_radar_strategy() -> Vec<String> {
-    vec!["empty_answer".to_string(), "global_wgs84".to_string()]
+    RADAR_STRATEGIES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
 }
 fn default_number_concurrency() -> u32 {
     100
@@ -911,6 +1037,91 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), bytes);
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn persisted_settings_share_the_runtime_validation_boundary() {
+        let path = temporary_path("settings-validation");
+        let mut config = Config::default();
+        config.settings.llm_max_tokens = 0;
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().settings.llm_max_tokens, 0);
+
+        let mut invalid = config;
+        invalid.settings.log_level = "verbose".into();
+        let invalid_bytes = serde_json::to_vec_pretty(&invalid).unwrap();
+        fs::write(&path, &invalid_bytes).unwrap();
+        assert!(matches!(
+            Config::initialize_at(&path, 7),
+            Err(ConfigLoadError::UnsupportedOrCorrupt)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
+
+        invalid.settings.log_level = "normal".into();
+        invalid.settings.llm_endpoint = "https://".into();
+        assert!(invalid.save(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_settings_reject_unknown_fields_without_silent_rewrite() {
+        let path = temporary_path("settings-unknown-reject");
+        let config = Config::default();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["settings"]["bogus_future_field"] = json!("unexpected");
+        let invalid_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &invalid_bytes).unwrap();
+        // Startup/load must reject unknown settings fields, not silently accept and rewrite.
+        assert!(matches!(
+            Config::initialize_at(&path, 7),
+            Err(ConfigLoadError::UnsupportedOrCorrupt)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
+        // Unknown fields must stay rejected on direct load as well.
+        assert!(Config::load(&path).is_err());
+        let _ = fs::remove_file(&path);
+        // Direct parse of Settings with deny_unknown_fields.
+        let known: Settings = serde_json::from_value(json!({
+            "countdown_secs": 30,
+            "attendance_gate_percent": 12.5,
+            "llm_endpoint": "https://example.test",
+            "llm_model": "m",
+            "llm_max_tokens": 0,
+        }))
+        .unwrap();
+        assert_eq!(known.countdown_secs, 30);
+        assert!(serde_json::from_value::<Settings>(json!({
+            "countdown_secs": 30,
+            "unknown_key": 1,
+        }))
+        .is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_settings_known_schemas_accepted_save_failure_does_not_alter_disk() {
+        let path = temporary_path("settings-known-and-save-fail");
+        // Known current schema (partial with defaults) must be accepted at load.
+        let partial = json!({
+            "schema_version": 1,
+            "config_revision": 0,
+            "schedule_revision": 0,
+            "accounts": [],
+            "settings": { "countdown_secs": 30 },
+            "groups": [],
+            "monitoring": { "global_schedule": { "monday": [], "tuesday": [], "wednesday": [], "thursday": [], "friday": [], "saturday": [], "sunday": [] }, "time_zone": { "kind": "device" }, "all_suspended": false },
+            "runtime": { "manual_overrides": [], "group_rotation": {}, "platform_block": null }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&partial).unwrap()).unwrap();
+        assert!(Config::initialize_at(&path, 7).is_ok());
+        // UpdateConfig/save failure must not alter memory/disk: patch with invalid range.
+        let before = fs::read(&path).unwrap();
+        let mut loaded = Config::load(&path).unwrap();
+        loaded.settings.countdown_secs = 0; // invalid
+        assert!(loaded.save(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

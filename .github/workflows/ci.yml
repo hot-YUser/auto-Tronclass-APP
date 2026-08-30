@@ -7,10 +7,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust tests and clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # 1.97.1
@@ -27,8 +32,90 @@ jobs:
   windows:
     name: Windows checks and unsigned release dry-run
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify release plan and negative gates
+        shell: pwsh
+        run: |
+          function Assert-Fails {
+            param([scriptblock]$Action, [string]$MessagePattern)
+            try {
+              & $Action
+              throw "預期失敗但實際成功"
+            }
+            catch {
+              if ($_.Exception.Message -notmatch $MessagePattern) { throw }
+            }
+          }
+
+          # Preflight must not leave an untracked dirty file that would poison the exact-source guard.
+          $prePorcelain = @(git status --porcelain)
+          if ($prePorcelain.Count -gt 0) {
+            $redacted = @($prePorcelain | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+            foreach ($pp in $redacted) { Write-Host "  preflight 前工作樹不乾淨: $pp" }
+            throw "CI 回歸：preflight 前工作樹不乾淨（$($prePorcelain.Count) 筆）。"
+          }
+          try {
+            if (Test-Path -LiteralPath dist) { throw "plan check 前不應存在 dist" }
+            $headSha = (git rev-parse HEAD).Trim()
+            $full = ./tools/release.ps1 -Tag v0.0.0-alpha.0 -PlanOnly | ConvertFrom-Json
+            if ($full.target -ne $headSha) { throw "release target 不是 exact HEAD SHA" }
+            foreach ($check in "Rustfmt", "RustTests", "RustClippy", "ProtocolContract", "CommandWire", "UiSettings", "DeviceKey") {
+              if ($full.checks -notcontains $check) { throw "完整 release plan 缺少 check：$check" }
+            }
+            $requiredAssets = @(
+              "AutoTronclass-v0.0.0-alpha.0-windows-x64-portable.zip",
+              "AutoTronclass-v0.0.0-alpha.0-windows-x64-setup.exe",
+              "AutoTronclass-v0.0.0-alpha.0-android.apk",
+              "build-metadata.json",
+              "SHA256SUMS.txt"
+            )
+            if (@($full.assets).Count -ne $requiredAssets.Count) { throw "完整 release plan 資產數量錯誤" }
+            foreach ($asset in $requiredAssets) {
+              if ($full.assets -notcontains $asset) { throw "完整 release plan 缺少資產：$asset" }
+            }
+
+            $androidOnly = ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -PlanOnly | ConvertFrom-Json
+            foreach ($check in "ProtocolContract", "CommandWire", "UiSettings") {
+              if ($androidOnly.checks -notcontains $check) { throw "SkipWindows 不應跳過 $check" }
+            }
+            if ($androidOnly.checks -contains "DeviceKey") { throw "SkipWindows 應跳過 Windows-only DeviceKey" }
+            if (@($androidOnly.assets).Count -ne 3) { throw "Android-only plan 資產數量錯誤" }
+            foreach ($asset in "AutoTronclass-v0.0.0-alpha.0-android.apk", "build-metadata.json", "SHA256SUMS.txt") {
+              if ($androidOnly.assets -notcontains $asset) { throw "Android-only plan 缺少資產：$asset" }
+            }
+            if (Test-Path -LiteralPath dist) { throw "-PlanOnly 不得寫入 dist" }
+
+            Assert-Fails { ./tools/release.ps1 -Tag not-semver -ValidateOnly } "Tag 必須是嚴格 SemVer"
+            Assert-Fails {
+              ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipWindows -SkipAndroid -PlanOnly
+            } "不能同時跳過 Windows 與 Android"
+
+            # A branch named like a release must not satisfy -RequireTaggedHead; only refs/tags/* counts.
+            $spoof = "v0.0.0-alpha.999"
+            git branch $spoof HEAD
+            try {
+              Assert-Fails {
+                ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly
+              } "找不到 git tag"
+              git tag $spoof HEAD
+              $tagged = ./tools/release.ps1 -Tag $spoof -RequireTaggedHead -PlanOnly | ConvertFrom-Json
+              if ($tagged.target -ne $headSha) { throw "真 tag plan 未綁定 exact HEAD" }
+            }
+            finally {
+              git tag -d $spoof 2>$null
+              git branch -D $spoof 2>$null
+            }
+          }
+          finally {
+            $postPorcelain = @(git status --porcelain)
+            if ($postPorcelain.Count -gt 0) {
+              $redacted = @($postPorcelain | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+              foreach ($pp in $redacted) { Write-Host "  preflight 後工作樹不乾淨: $pp" }
+              throw "CI 回歸：preflight 後工作樹不乾淨（$($postPorcelain.Count) 筆）；暫存檔未清理或 NativeMethods 漂移。"
+            }
+          }
       # 工具鏈單一真理：tools/toolchain.json；版本寫入 GITHUB_ENV 供 shell 步驟使用。
       - name: Load toolchain pins
         id: load-toolchain
@@ -43,7 +130,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # 1.97.1
         with:
           toolchain: 1.97.1 # rust-toolchain.toml 固定
-          components: clippy
+          components: clippy,rustfmt
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: ${{ steps.load-toolchain.outputs.dotnet-sdk }}
@@ -72,12 +159,100 @@ jobs:
       - name: Run UI settings check
         shell: pwsh
         run: dotnet run --project tools/checks/UiSettings.Check/UiSettings.Check.csproj -c Release
-      # Unsigned Windows release dry-run：走真實 release.ps1 路徑（cargo test/clippy、
-      # native marker、Release publish、版本驗證、隔離資料 smoke、zip、SHA256SUMS），
-      # 但跳過 Android 簽章與 Inno installer（私鑰只在發行機，永不進 CI）。
+      - name: Static lock preflight (no cargo, no network, fail-closed before fetch)
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $porcelainBefore = @(git status --porcelain)
+          $rawBefore = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          $mtimeBefore = $null
+          if (Test-Path -LiteralPath "ui/Interop/NativeMethods.g.cs" -PathType Leaf) {
+            $mtimeBefore = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+          }
+          pwsh ./tools/update-bindings.ps1 -VerifyLockOnly
+          if ($LASTEXITCODE -ne 0) { throw "static lock preflight failed (exit $LASTEXITCODE)" }
+          $porcelainAfter = @(git status --porcelain)
+          if (@($porcelainBefore).Count -ne @($porcelainAfter).Count -or (($porcelainBefore -join "`n") -ne ($porcelainAfter -join "`n"))) { throw "CI regression: -VerifyLockOnly mutated porcelain" }
+          $rawAfter = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          if ("$rawBefore" -ne "$rawAfter") { throw "CI regression: -VerifyLockOnly mutated raw bytes" }
+          if ($null -ne $mtimeBefore) {
+            $mtimeAfter = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+            if ($mtimeAfter -ne $mtimeBefore) { throw "CI regression: -VerifyLockOnly mutated mtime" }
+          }
+      - name: Prime cargo registry cache (after static preflight only, --locked canonical, no build script)
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          # cargo fetch downloads locked/checksummed sources but does not compile or execute build scripts (cargo fetch = update_lockfile + fetch_packages, no cargo_compile/build_script).
+          # Scope: only after static preflight proves manifests/locks are canonical crates.io ==1.9.8 with checksums; malicious git/path/alt is rejected before any network.
+          pwsh ./tools/update-bindings.ps1 -PrepareToolchainCache
+          if ($LASTEXITCODE -ne 0) { throw "prime cargo cache failed (exit $LASTEXITCODE)" }
+      - name: Assert csbindgen toolchain (canonical registry source, offline)
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          # Single source of truth: tools/update-bindings.ps1 -VerifyToolchainOnly (static preflight + cargo metadata --locked --offline)
+          # Asserts porcelain/raw bytes/NativeMethods mtime unchanged (side-effect-free verify mode).
+          $porcelainBefore = @(git status --porcelain)
+          $rawBefore = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          $mtimeBefore = $null
+          if (Test-Path -LiteralPath "ui/Interop/NativeMethods.g.cs" -PathType Leaf) {
+            $mtimeBefore = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+          }
+          $tmpBefore = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter "tron-bindings-gen-*" -Directory -ErrorAction SilentlyContinue)
+          $stagingBefore = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter ".NativeMethods.g.cs.tmp-*" -File -ErrorAction SilentlyContinue)
+          $backupBefore = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter "NativeMethods.g.cs.bak-*" -File -ErrorAction SilentlyContinue)
+          pwsh ./tools/update-bindings.ps1 -VerifyToolchainOnly
+          if ($LASTEXITCODE -ne 0) { throw "update-bindings -VerifyToolchainOnly failed (exit $LASTEXITCODE)" }
+          $porcelainAfter = @(git status --porcelain)
+          if (@($porcelainBefore).Count -ne @($porcelainAfter).Count -or (($porcelainBefore -join "`n") -ne ($porcelainAfter -join "`n"))) {
+            $redacted = @($porcelainAfter | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+            foreach ($pp in $redacted) { Write-Host "  after-verify porcelain: $pp" }
+            throw "CI regression: -VerifyToolchainOnly mutated git porcelain (must be side-effect-free)"
+          }
+          $rawAfter = git ls-files --stage -- ui/Interop/NativeMethods.g.cs 2>$null
+          if ("$rawBefore" -ne "$rawAfter") { throw "CI regression: -VerifyToolchainOnly mutated git raw bytes for NativeMethods.g.cs" }
+          if ($null -ne $mtimeBefore) {
+            if (-not (Test-Path -LiteralPath "ui/Interop/NativeMethods.g.cs" -PathType Leaf)) { throw "CI regression: NativeMethods.g.cs vanished after verify" }
+            $mtimeAfter = (Get-Item -LiteralPath "ui/Interop/NativeMethods.g.cs").LastWriteTimeUtc
+            if ($mtimeAfter -ne $mtimeBefore) { throw "CI regression: -VerifyToolchainOnly mutated NativeMethods.g.cs mtime (must be side-effect-free)" }
+          }
+          $tmpAfter = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter "tron-bindings-gen-*" -Directory -ErrorAction SilentlyContinue)
+          $stagingAfter = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter ".NativeMethods.g.cs.tmp-*" -File -ErrorAction SilentlyContinue)
+          $backupAfter = @(Get-ChildItem -LiteralPath "ui/Interop" -Filter "NativeMethods.g.cs.bak-*" -File -ErrorAction SilentlyContinue)
+          if (@($tmpAfter).Count -ne @($tmpBefore).Count) { throw "CI regression: -VerifyToolchainOnly leaked system temp tron-bindings-gen-* (must be side-effect-free)" }
+          if (@($stagingAfter).Count -ne @($stagingBefore).Count) { throw "CI regression: -VerifyToolchainOnly leaked staging .NativeMethods.g.cs.tmp-*" }
+          if (@($backupAfter).Count -ne @($backupBefore).Count) { throw "CI regression: -VerifyToolchainOnly leaked backup NativeMethods.g.cs.bak-*" }
+      - name: Raw-byte exact-source guard before release
+        shell: pwsh
+        run: ./tools/check-crlf.ps1
+      # Unsigned Windows release dry-run：走真實 release.ps1 路徑（rustfmt/test/clippy、
+      # production-linked checks、native marker、Release publish、版本驗證、隔離資料 smoke、
+      # zip、build metadata、SHA256SUMS），但跳過 Android 簽章與 Inno installer（私鑰只在發行機，永不進 CI）。
       - name: Unsigned Windows release dry-run
         shell: pwsh
         run: ./tools/release.ps1 -Tag v0.0.0-alpha.0 -SkipAndroid -SkipInstaller
+      - name: Assert exact-source guard — working tree still clean after build
+        if: always()
+        shell: pwsh
+        run: |
+          $porcelain = @(git status --porcelain)
+          if ($porcelain.Count -gt 0) {
+            Write-Host "::error::建置後工作樹不乾淨（$($porcelain.Count) 筆）："
+            $redacted = @($porcelain | ForEach-Object { ($_ -replace "^\s*\S+\s+", "").Trim() } | Where-Object { $_ -ne "" } | Select-Object -First 20)
+            foreach ($path in $redacted) { Write-Host "  - $path" }
+            try { git diff --name-only 2>$null | Select-Object -First 20 | ForEach-Object { Write-Host "  diff: $_" } } catch {}
+            throw "CI 回歸：release 建置後工作樹不乾淨（$($porcelain.Count) 筆）；NativeMethods 封裝或暫存清理回歸。"
+          }
+          $distCount = @(Get-ChildItem -LiteralPath dist -File -ErrorAction SilentlyContinue).Count
+          if ($distCount -eq 0) { throw "dist 為空 — dry-run 應產出資產。" }
+          Write-Host "  ✓ 工作樹乾淨，dist 內 $distCount 個資產。"
+      - name: Raw-byte exact-source guard after release
+        if: always()
+        shell: pwsh
+        run: ./tools/check-crlf.ps1
       - name: Upload release dry-run dist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -88,6 +263,7 @@ jobs:
   android:
     name: Android UI and native ABI build
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # 工具鏈單一真理：tools/toolchain.json；版本寫入 GITHUB_ENV 供 shell 步驟使用，

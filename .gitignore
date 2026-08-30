@@ -46,6 +46,13 @@ Claude Memory/
 # Default build marker written by tools/build-core.ps1 when run standalone
 /core/.native-build-*.json
 
+# Narrow staging/backup residue from tools/check-crlf.ps1 -Fix and tools/update-bindings.ps1
+# (same-dir atomic staging; never compiled, tool reports leftovers if AV lock prevents cleanup)
+ui/Interop/.NativeMethods.g.cs.tmp-*
+ui/Interop/.crlf-fix-*.tmp
+ui/Interop/NativeMethods.g.cs.bak-*
+/tools/bindings-generator/target/
+
 # IDE / OS
 .vs/
 .idea/

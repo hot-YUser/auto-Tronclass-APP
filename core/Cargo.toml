@@ -33,7 +33,7 @@ md-5 = "0.10"
 pdf-extract = "0.7"
 
 [build-dependencies]
-csbindgen = "1"
+csbindgen = "=1.9.8"
 
 [features]
 # The in-repo fake TronClass server is dev/test-only; the shipped cdylib never contains it.

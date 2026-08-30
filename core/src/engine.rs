@@ -1540,7 +1540,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             if let Err(error) = apply_config_patch(&mut next.settings, &patch) {
                 return reply(cb, id, false, Some(error));
             }
-            if let Err(error) = validate_config(&next.settings) {
+            if let Err(error) = next.settings.validate() {
                 return reply(cb, id, false, Some(error));
             }
             if let Err(error) = next.save(&st.config_path()) {
@@ -3012,91 +3012,6 @@ fn str_vec_field(key: &str, value: &Value) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// Validate the COMPLETE post-patch settings — every range, the cross-field min<=max invariant, and
-/// the LLM endpoint URL shape — on the clone before anything is saved. Patch-only checks are not
-/// enough: a one-field patch must not be able to push `number_min_concurrency` above the CURRENT
-/// `number_concurrency`.
-fn validate_config(settings: &Settings) -> Result<(), String> {
-    let range = |name: &str, value: u64, min: u64, max: u64| -> Result<(), String> {
-        if !(min..=max).contains(&value) {
-            return Err(format!("{name} 必須介於 {min} 與 {max}"));
-        }
-        Ok(())
-    };
-    range("countdown_secs", settings.countdown_secs, 1, 86_400)?;
-    if !settings.attendance_gate_percent.is_finite()
-        || !(0.0..=100.0).contains(&settings.attendance_gate_percent)
-    {
-        return Err("attendance_gate_percent 必須介於 0 與 100".to_string());
-    }
-    if !valid_http_url(&settings.llm_endpoint) {
-        return Err("llm_endpoint 必須是有效的 http(s) URL".to_string());
-    }
-    range(
-        "llm_max_tokens",
-        u64::from(settings.llm_max_tokens),
-        1,
-        1_000_000,
-    )?;
-    range(
-        "max_answer_reask",
-        u64::from(settings.max_answer_reask),
-        1,
-        100,
-    )?;
-    range(
-        "prepare_retry_budget_secs",
-        settings.prepare_retry_budget_secs,
-        1,
-        86_400,
-    )?;
-    range(
-        "max_tool_iterations",
-        u64::from(settings.max_tool_iterations),
-        0,
-        100,
-    )?;
-    range(
-        "number_concurrency",
-        u64::from(settings.number_concurrency),
-        1,
-        256,
-    )?;
-    range(
-        "number_min_concurrency",
-        u64::from(settings.number_min_concurrency),
-        1,
-        256,
-    )?;
-    if settings.number_min_concurrency > settings.number_concurrency {
-        return Err("number_min_concurrency 不得大於 number_concurrency".to_string());
-    }
-    range(
-        "number_cooldown_ms",
-        settings.number_cooldown_ms,
-        1,
-        3_600_000,
-    )?;
-    range(
-        "number_max_cooldowns",
-        u64::from(settings.number_max_cooldowns),
-        0,
-        1_000,
-    )?;
-    range("poll_idle_secs", settings.poll_idle_secs, 1, 86_400)?;
-    range("quiz_detect_secs", settings.quiz_detect_secs, 1, 86_400)?;
-
-    Ok(())
-}
-
-/// Minimal URL sanity for the LLM endpoint: an http(s) scheme with a non-empty, whitespace-free
-/// target. Plain `http://` is allowed (local LLM servers); only the scheme/shape is enforced.
-fn valid_http_url(url: &str) -> bool {
-    url.strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .is_some_and(|rest| !rest.is_empty() && !rest.chars().any(char::is_whitespace))
-}
-
 /// Re-lock and cache a refreshed session — but only while the account still exists in config. The
 /// existence check and the vault write happen under the SAME lock, so a Delete committed while the
 /// network round-trip was in flight cannot race past it; on `AccountGone` nothing is written and a
@@ -4345,9 +4260,17 @@ mod tests {
             r#"{"countdown_secs":"fast"}"#,
             r#"{"countdown_secs":true}"#,
             r#"{"autoanswer_types":["exam",5]}"#,
+            r#"{"autoanswer_types":["exam","exam"]}"#,
+            r#"{"autoanswer_types":["exam","future_kind"]}"#,
+            r#"{"radar_strategy":[]}"#,
+            r#"{"radar_strategy":["empty_answer",""]}"#,
+            r#"{"radar_strategy":["global_wgs84","global_wgs84"]}"#,
+            r#"{"radar_strategy":["future_strategy"]}"#,
             r#"{"llm_endpoint":"not-a-url"}"#,
             r#"{"llm_endpoint":"ftp://example.com/v1"}"#,
             r#"{"llm_endpoint":""}"#,
+            r#"{"llm_model":"   "}"#,
+            r#"{"log_level":"verbose"}"#,
             r#"{"attendance_gate_percent":150}"#,
         ];
         for (index, patch) in bad_patches.iter().enumerate() {
@@ -4384,16 +4307,39 @@ mod tests {
             before,
             "unknown key must not touch the file"
         );
-        // ...and a valid patch still applies afterwards.
+        // ...and a valid patch still applies afterwards. Because validation covers the complete clone,
+        // this also proves none of the failed semantic patches leaked into memory. Zero max_tokens is
+        // a supported persisted sentinel; llm::resolve_max_tokens keeps resolving it to 16384.
         send(
             &core,
-            r#"{"id":100,"cmd":"UpdateConfig","patch":{"poll_idle_secs":7}}"#.as_bytes(),
+            r#"{"id":100,"cmd":"UpdateConfig","patch":{"poll_idle_secs":7,"llm_max_tokens":0}}"#
+                .as_bytes(),
         );
         assert!(wait_for(
             |v| v["event"] == "Reply" && v["id"] == 100 && v["ok"] == true,
             5
         )
         .is_some());
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(on_disk["settings"]["poll_idle_secs"], 7);
+        assert_eq!(on_disk["settings"]["llm_max_tokens"], 0);
+        assert_eq!(
+            on_disk["settings"]["llm_model"],
+            Settings::default().llm_model
+        );
+        assert_eq!(
+            on_disk["settings"]["autoanswer_types"],
+            json!(Settings::default().autoanswer_types)
+        );
+        assert_eq!(
+            on_disk["settings"]["radar_strategy"],
+            json!(Settings::default().radar_strategy)
+        );
+        assert_eq!(
+            on_disk["settings"]["log_level"],
+            Settings::default().log_level
+        );
     }
 
     // ===================== async panic backstop / monitor watchdog =====================

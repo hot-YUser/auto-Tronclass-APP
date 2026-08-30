@@ -2032,6 +2032,26 @@ fn dispatch_signs_for(
         cooldown_ms: cfg.number_cooldown_ms,
         max_cooldowns: cfg.number_max_cooldowns,
     };
+    if ncfg.was_clamped() {
+        emit(
+            cb,
+            &json!({ "id": null, "event": "NumberConcurrencyClamped",
+                "activity_token": activity_token.clone(),
+                "rollcall_id": key.2.clone(),
+                "configured_concurrency": ncfg.concurrency,
+                "configured_min_concurrency": ncfg.min_concurrency,
+                "effective_concurrency": ncfg.effective_concurrency(),
+                "reason": "unknown-safe single-flight: at most one unresolved Number mutation per rollcall/profile" }),
+        );
+    }
+    emit(
+        cb,
+        &json!({ "id": null, "event": "NumberConcurrencyStatus",
+            "activity_token": activity_token.clone(),
+            "rollcall_id": key.2.clone(),
+            "effective_concurrency": ncfg.effective_concurrency(),
+            "configured_concurrency": ncfg.concurrency }),
+    );
 
     if kind == RollcallKind::Qr {
         // QR: needs a teacher account to source the rotating data; students then sign their own id on
@@ -2213,6 +2233,14 @@ fn redispatch_signs(
         cooldown_ms: cfg.number_cooldown_ms,
         max_cooldowns: cfg.number_max_cooldowns,
     };
+    if ncfg.was_clamped() {
+        emit(
+            cb,
+            &json!({ "id": null, "event": "NumberConcurrencyClamped",
+                "effective_concurrency": ncfg.effective_concurrency(),
+                "configured_concurrency": ncfg.concurrency }),
+        );
+    }
     let has_teacher = accounts.values().any(|account| account.is_teacher);
     let mut qr_keys: Vec<ActivityKey> = Vec::new();
     for (key, a) in activities.iter_mut() {
