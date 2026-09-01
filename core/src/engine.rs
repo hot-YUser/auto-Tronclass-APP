@@ -1498,6 +1498,36 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             }
         }
 
+        Command::SetQrRemoteKey { mut key, .. } => {
+            use zeroize::Zeroize;
+            let Some(st) = guard.as_mut() else {
+                key.zeroize();
+                return reply(cb, id, false, Some("not initialized".into()));
+            };
+            let result = match st.vault.as_mut() {
+                Some(v) => {
+                    if key.trim().is_empty() {
+                        key.zeroize();
+                        v.set_qr_remote_key(String::new())
+                    } else {
+                        v.set_qr_remote_key(key)
+                    }
+                }
+                None => {
+                    key.zeroize();
+                    Err("vault is locked".into())
+                }
+            };
+            match result {
+                Ok(()) => {
+                    push_config(st);
+                    emit_settings(cb, st);
+                    reply(cb, id, true, None);
+                }
+                Err(e) => reply(cb, id, false, Some(e)),
+            }
+        }
+
         Command::SubmitCaptcha {
             account_id, text, ..
         } => {
@@ -2050,6 +2080,13 @@ fn monitor_config(st: &CoreState) -> MonitorConfig {
         number_max_cooldowns: s.number_max_cooldowns,
         poll_idle_secs: s.poll_idle_secs,
         quiz_detect_secs: s.quiz_detect_secs,
+        qr_remote_enabled: s.qr_remote_enabled,
+        qr_remote_base_url: s.qr_remote_base_url.clone(),
+        qr_remote_key: st
+            .vault
+            .as_ref()
+            .and_then(|v| v.get_qr_remote_key_secret())
+            .map(std::sync::Arc::new),
     }
 }
 
@@ -2970,6 +3007,17 @@ fn apply_config_patch(settings: &mut Settings, patch: &Value) -> Result<(), Stri
             "poll_idle_secs" => settings.poll_idle_secs = u64_field(key, value)?,
             "quiz_detect_secs" => settings.quiz_detect_secs = u64_field(key, value)?,
             "log_level" => settings.log_level = str_field(key, value)?,
+            "qr_remote_enabled" => settings.qr_remote_enabled = bool_field(key, value)?,
+            "qr_remote_base_url" => {
+                let raw = str_field(key, value)?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    settings.qr_remote_base_url = String::new();
+                } else {
+                    settings.qr_remote_base_url =
+                        crate::config::normalize_qr_remote_base_url(&raw)?;
+                }
+            }
 
             _ => return Err(format!("unknown config field: {key}")),
         }
@@ -3103,6 +3151,7 @@ fn warn_insecure_http(cb: EventCb, base_url: &str) {
 fn emit_settings(cb: EventCb, st: &CoreState) {
     let s = &st.config.settings;
     let has_llm_key = st.vault.as_ref().is_some_and(|v| v.has_llm_key());
+    let has_qr_remote_key = st.vault.as_ref().is_some_and(|v| v.has_qr_remote_key());
     emit(
         cb,
         &json!({ "id": null, "event": "Settings", "settings": {
@@ -3114,6 +3163,9 @@ fn emit_settings(cb: EventCb, st: &CoreState) {
             "resubmit_for_correct": s.resubmit_for_correct,
             "enable_llm_tools": s.enable_llm_tools,
             "has_llm_key": has_llm_key,
+            "has_qr_remote_key": has_qr_remote_key,
+            "qr_remote_enabled": s.qr_remote_enabled,
+            "qr_remote_base_url": s.qr_remote_base_url,
         }}),
     );
 }
@@ -4865,5 +4917,270 @@ mod tests {
         let ok =
             wait_for(|v| v["event"] == "LoginResult" && v["id"] == 5, 10).expect("relogin result");
         assert_eq!(ok["ok"], true, "relogin with the fresh answer succeeds");
+    }
+
+    #[test]
+    fn qr_remote_update_config_disabled_empty_accepted_enabled_empty_rejected_without_touching_disk(
+    ) {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let dir = data_dir("qr-update-config");
+        let core = init(collect_event).unwrap();
+        send(
+            &core,
+            format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
+        // Materialize file then freeze baseline (Init alone leaves file absent).
+        send(
+            &core,
+            r#"{"id":2,"cmd":"UpdateConfig","patch":{"countdown_secs":2}}"#.as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 2 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        let config_path = std::path::Path::new(&dir).join("config.json");
+        // Distributed check — disabled+empty patch accepted, settings never contains raw key, disk has canonical "" not default.
+        let before: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(before["settings"]["qr_remote_enabled"], false);
+        let _pre_len = events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+
+        // Disabled + trimmed empty is accepted as canonical empty string.
+        send(
+            &core,
+            r#"{"id":10,"cmd":"UpdateConfig","patch":{"qr_remote_enabled":false,"qr_remote_base_url":""}}"#
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 10 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        send(
+            &core,
+            r#"{"id":11,"cmd":"UpdateConfig","patch":{"qr_remote_enabled":false,"qr_remote_base_url":"   "}}"#
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 11 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        // Settings after id 11 — find newest Settings (ring never cleared mid-test for id reuse pattern).
+        let snapshot = events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let ev = snapshot
+            .iter()
+            .rev()
+            .find(|v| v["event"] == "Settings" && v["id"] == Value::Null)
+            .expect("Settings after disabled+empty");
+        assert_eq!(ev["settings"]["qr_remote_base_url"], "");
+        assert_eq!(ev["settings"]["qr_remote_enabled"], false);
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(on_disk["settings"]["qr_remote_base_url"], "");
+        assert_eq!(on_disk["settings"]["qr_remote_enabled"], false);
+
+        // Enabled + empty / whitespace must be rejected at Settings::validate boundary and must NOT touch disk.
+        let frozen = std::fs::read(&config_path).unwrap();
+        for (id, patch) in [
+            (
+                12u64,
+                r#"{"qr_remote_enabled":true,"qr_remote_base_url":""}"#,
+            ),
+            (
+                13u64,
+                r#"{"qr_remote_enabled":true,"qr_remote_base_url":"   "}"#,
+            ),
+        ] {
+            send(
+                &core,
+                format!(r#"{{"id":{id},"cmd":"UpdateConfig","patch":{patch}}}"#).as_bytes(),
+            );
+            let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == id, 5)
+                .unwrap_or_else(|| panic!("no reply for patch {patch}"));
+            assert_eq!(
+                reply["ok"], false,
+                "enabled+empty patch {patch} must be rejected"
+            );
+            assert_eq!(
+                std::fs::read(&config_path).unwrap(),
+                frozen,
+                "enabled+empty must not touch file"
+            );
+        }
+        // Unknown / malformed qr base field types are rejected (strict typing) and also leave disk untouched.
+        for (id, patch) in [
+            (14u64, r#"{"qr_remote_base_url":123}"#),
+            (15u64, r#"{"qr_remote_base_url":true}"#),
+            (16u64, r#"{"qr_remote_enabled":"true"}"#),
+        ] {
+            send(
+                &core,
+                format!(r#"{{"id":{id},"cmd":"UpdateConfig","patch":{patch}}}"#).as_bytes(),
+            );
+            let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == id, 5)
+                .unwrap_or_else(|| panic!("no reply for patch {patch}"));
+            assert_eq!(
+                reply["ok"], false,
+                "malformed qr patch {patch} must be rejected"
+            );
+            assert_eq!(
+                std::fs::read(&config_path).unwrap(),
+                frozen,
+                "malformed qr patch must not touch file"
+            );
+        }
+        // A valid nonempty patch still applies and leaves canonical normalized value (trailing slash stripped).
+        send(
+            &core,
+            r#"{"id":20,"cmd":"UpdateConfig","patch":{"qr_remote_enabled":true,"qr_remote_base_url":"https://example.com/path/"}}"#
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 20 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(on_disk["settings"]["qr_remote_enabled"], true);
+        assert_eq!(
+            on_disk["settings"]["qr_remote_base_url"], "https://example.com/path",
+            "core must canonical-normalize trailing slash"
+        );
+        // default-port input must be stored canonical without port (UI hint never does this).
+        send(
+            &core,
+            r#"{"id":21,"cmd":"UpdateConfig","patch":{"qr_remote_base_url":"https://example.com:443/"}}"#
+                .as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 21 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["settings"]["qr_remote_base_url"],
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn settings_event_never_contains_raw_qr_key_and_redaction_covers_it() {
+        let _g = LIFECYCLE_SEQ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let dir = data_dir("qr-settings-no-raw");
+        let core = init(collect_event).unwrap();
+        send(
+            &core,
+            format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
+        );
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
+        send(&core, r#"{"id":2,"cmd":"CreateVault"}"#.as_bytes());
+        assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
+        let raw_key = "qr-secret-value";
+        send(
+            &core,
+            format!(r#"{{"id":3,"cmd":"SetQrRemoteKey","key":"{raw_key}"}}"#).as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 3 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        // In-memory ring already holds the Settings emitted by SetQrRemoteKey; scan it before it rolls.
+        let events_snapshot = events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let settings_lines: Vec<String> = events_snapshot
+            .iter()
+            .filter(|v| v["event"] == "Settings")
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            !settings_lines.is_empty(),
+            "Settings must have been emitted after SetQrRemoteKey"
+        );
+        for line in &settings_lines {
+            assert!(
+                !line.contains(raw_key),
+                "Settings event must never contain raw key; line={line}"
+            );
+        }
+        // Settings event shape is bool-only for has_qr_remote_key, and includes the canonical qr fields.
+        let latest = events_snapshot
+            .iter()
+            .rev()
+            .find(|v| v["event"] == "Settings")
+            .expect("latest Settings");
+        let s = &latest["settings"];
+        assert!(
+            s["has_qr_remote_key"].is_boolean(),
+            "has_qr_remote_key must be bool, got {}",
+            s["has_qr_remote_key"]
+        );
+        assert_eq!(s["has_qr_remote_key"], true);
+        assert!(
+            s["qr_remote_enabled"].is_boolean(),
+            "qr_remote_enabled must be bool"
+        );
+        assert!(s["qr_remote_base_url"].is_string());
+        assert!(
+            s.get("qr_remote_key").is_none() && s.get("qr_secret").is_none(),
+            "Settings must not have raw key field"
+        );
+        // Direct redaction path also covers qr_remote_key.
+        let mut v =
+            serde_json::json!({"qr_remote_key": raw_key, "nested": {"qr_remote_key": raw_key}});
+        crate::redaction::redact(&mut v);
+        let serialized = v.to_string();
+        assert!(
+            !serialized.contains(raw_key),
+            "redact must not leak raw key"
+        );
+        assert_eq!(v["qr_remote_key"], "[redacted]");
+        assert_eq!(v["nested"]["qr_remote_key"], "[redacted]");
+        // Clear emits a Settings with has_qr_remote_key=false, still without raw.
+        events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        send(
+            &core,
+            r#"{"id":4,"cmd":"SetQrRemoteKey","key":""}"#.as_bytes(),
+        );
+        assert!(wait_for(
+            |v| v["event"] == "Reply" && v["id"] == 4 && v["ok"] == true,
+            5
+        )
+        .is_some());
+        let cleared = wait_for(|v| v["event"] == "Settings", 5).expect("Settings after clear");
+        assert_eq!(cleared["settings"]["has_qr_remote_key"], false);
+        assert!(
+            !cleared.to_string().contains(raw_key),
+            "clear Settings must not contain raw key"
+        );
     }
 }

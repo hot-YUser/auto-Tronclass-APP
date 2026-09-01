@@ -28,6 +28,11 @@ public sealed class SettingsPage : ContentPage
     readonly Entry _maxTokens = NumEntry();
     readonly Switch _resubmit = new();
     readonly Switch _tools = new();
+    // QR remote
+    readonly Label _qrKeyStatus = Theme.Dim("", 12.5);
+    readonly Entry _qrKey = new() { Placeholder = "QR 遠端 API 金鑰", IsPassword = true };
+    readonly Entry _qrBaseUrl = new() { Placeholder = "https://api.hlp.qzz.io" };
+    readonly Switch _qrEnabled = new();
     readonly Label _logEmpty = Theme.Dim("尚無日誌。", 12);
 
     readonly Action _onSettings;
@@ -36,6 +41,7 @@ public sealed class SettingsPage : ContentPage
     bool _subscribed;
     readonly SettingsCardSync _monitorSync = new();
     readonly SettingsCardSync _llmSync = new();
+    readonly SettingsCardSync _qrRemoteSync = new();
 
     public SettingsPage(AppState state)
     {
@@ -49,6 +55,8 @@ public sealed class SettingsPage : ContentPage
         _maxTokens.TextChanged += (_, _) => _llmSync.MarkEdited();
         _resubmit.Toggled += (_, _) => _llmSync.MarkEdited();
         _tools.Toggled += (_, _) => _llmSync.MarkEdited();
+        _qrBaseUrl.TextChanged += (_, _) => _qrRemoteSync.MarkEdited();
+        _qrEnabled.Toggled += (_, _) => _qrRemoteSync.MarkEdited();
 
         // --- 監控參數 ---
         var monitorCard = Theme.Card(new VerticalStackLayout
@@ -111,6 +119,55 @@ public sealed class SettingsPage : ContentPage
                         // 金鑰欄位是暫存輸入,回填永不碰它;HasLlmKey 由隨後的 Settings 事件更新
                         _llmKey.Text = "";
                         state.Notify("info", "金鑰已儲存");
+                    }
+                }),
+            },
+        });
+
+        // --- QR 遠端 ---
+        var qrRemoteCard = Theme.Card(new VerticalStackLayout
+        {
+            Spacing = 10,
+            Children =
+            {
+                SettingRow("啟用 QR 遠端", "啟用後無教師時嘗試遠端取得 QR data", _qrEnabled),
+                Theme.Divider(),
+                SettingRow("遠端位址", "https://… 或 http://localhost:…", _qrBaseUrl),
+                Theme.Divider(),
+                _qrKeyStatus,
+                _qrKey,
+                Theme.Primary("儲存 QR 遠端金鑰", async () =>
+                {
+                    var key = _qrKey.Text?.Trim() ?? "";
+                    if (key.Length == 0) { state.Notify("error", "請輸入 QR 遠端金鑰"); return; }
+                    if (await state.SetQrRemoteKey(key))
+                    {
+                        _qrKey.Text = "";
+                        state.Notify("info", "QR 遠端金鑰已儲存");
+                    }
+                }),
+                Theme.Ghost("清除 QR 遠端金鑰", async () =>
+                {
+                    if (await state.SetQrRemoteKey(""))
+                    {
+                        _qrKey.Text = "";
+                        state.Notify("info", "QR 遠端金鑰已清除");
+                    }
+                }),
+                Theme.Divider(),
+                Theme.Primary("儲存 QR 遠端設定", async () =>
+                {
+                    var baseUrl = _qrBaseUrl.Text?.Trim() ?? "";
+                    if (_qrEnabled.IsToggled && baseUrl.Length == 0) { state.Notify("error", "啟用時遠端位址不可空白"); return; }
+                    if (_qrEnabled.IsToggled && !TryHintQrRemoteBaseUrl(baseUrl, out var err))
+                    {
+                        state.Notify("error", err);
+                        return;
+                    }
+                    if (await state.SaveQrRemoteConfig(_qrEnabled.IsToggled, baseUrl))
+                    {
+                        _qrRemoteSync.Saved();
+                        state.Notify("info", "QR 遠端設定已儲存");
                     }
                 }),
             },
@@ -185,6 +242,8 @@ public sealed class SettingsPage : ContentPage
                     scheduleCard,
                     Theme.Section("LLM 金鑰"),
                     keyCard,
+                    Theme.Section("QR 遠端"),
+                    qrRemoteCard,
                     Theme.Section("LLM 連線與答題"),
                     llmCard,
                     Theme.Section("此裝置的能力(由核心偵測)"),
@@ -237,6 +296,13 @@ public sealed class SettingsPage : ContentPage
             _llmSync.Populated();
         }
         _keyStatus.Text = s.HasLlmKey ? "金鑰狀態:已設定" : "金鑰狀態:尚未設定";
+        if (_qrRemoteSync.ShouldPopulate)
+        {
+            _qrEnabled.IsToggled = s.QrRemoteEnabled;
+            _qrBaseUrl.Text = s.QrRemoteBaseUrl;
+            _qrRemoteSync.Populated();
+        }
+        _qrKeyStatus.Text = s.HasQrRemoteKey ? "QR 遠端金鑰:已設定" : "QR 遠端金鑰:尚未設定";
     }
 
     protected override void OnDisappearing()
@@ -273,6 +339,17 @@ public sealed class SettingsPage : ContentPage
         control.VerticalOptions = LayoutOptions.Center;
         g.Add(control, 1, 0);
         return g;
+    }
+
+    static bool TryHintQrRemoteBaseUrl(string text, out string error)
+    {
+        error = "";
+        var trimmed = text.Trim();
+        if (trimmed.Length == 0) { error = "遠端位址不得為空"; return false; }
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)) { error = "遠端位址格式不正確"; return false; }
+        if (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp) { error = "僅支援 http/https"; return false; }
+        if (string.IsNullOrEmpty(uri.Host)) { error = "必須包含 host"; return false; }
+        return true;
     }
 
     void BuildCaps()
