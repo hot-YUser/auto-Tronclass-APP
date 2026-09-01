@@ -62,11 +62,12 @@ public sealed class CapsVm : ObservableObject
 }
 
 /// <summary>核心目前生效的設定快照,讓設定頁反映「已存的值」而非只有預設。
-/// api_key 是機密、永不過縫——只帶 <see cref="HasLlmKey"/> 布林表示是否已設定。</summary>
+/// api_key 是機密、永不過縫——只帶 <see cref="HasLlmKey"/> 布林表示是否已設定。QR 遠端亦同。</summary>
 public sealed record SettingsSnapshot(
     int CountdownSecs, double AttendanceGatePercent,
     string LlmEndpoint, string LlmModel, int LlmMaxTokens,
-    bool ResubmitForCorrect, bool EnableLlmTools, bool HasLlmKey);
+    bool ResubmitForCorrect, bool EnableLlmTools, bool HasLlmKey,
+    bool HasQrRemoteKey, bool QrRemoteEnabled, string QrRemoteBaseUrl);
 
 public sealed class AccountVm : ObservableObject
 {

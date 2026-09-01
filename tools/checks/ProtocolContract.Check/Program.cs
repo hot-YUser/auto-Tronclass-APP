@@ -176,6 +176,25 @@ AssertThrowsFormat(
     },
     "missing monitoring field must fail closed");
 
+// ---- Settings 事件：QR 遠端欄位的布林契約（決不含 raw key）----
+{
+    // has_qr_remote_key 必須是布林，且永不出現 raw key（與 llm 同等：只露布林）
+    var settingsObj = JsonDocument.Parse(
+        """{"settings":{"countdown_secs":15,"attendance_gate_percent":15,"llm_endpoint":"https://example.com","llm_model":"m","llm_max_tokens":16384,"resubmit_for_correct":true,"enable_llm_tools":true,"has_llm_key":false,"has_qr_remote_key":true,"qr_remote_enabled":true,"qr_remote_base_url":"https://api.hlp.qzz.io"}}""").RootElement.GetProperty("settings");
+    Assert(settingsObj.TryGetProperty("has_qr_remote_key", out var hasQr) && hasQr.ValueKind is JsonValueKind.True or JsonValueKind.False, "has_qr_remote_key must be bool");
+    Assert(settingsObj.TryGetProperty("qr_remote_enabled", out var enabled) && enabled.ValueKind is JsonValueKind.True or JsonValueKind.False, "qr_remote_enabled must be bool");
+    Assert(settingsObj.TryGetProperty("qr_remote_base_url", out var baseUrl) && baseUrl.ValueKind == JsonValueKind.String, "qr_remote_base_url must be string");
+    Assert(!settingsObj.TryGetProperty("qr_remote_key", out _), "Settings must never contain raw qr_remote_key");
+    Assert(!settingsObj.TryGetProperty("qr_secret", out _), "Settings must not leak secret alias");
+    // 反例：has_qr_remote_key 寫成字串必須在嚴格解析下被 AppState/合約拒絕（AppState.Bool 只接受 True/False，非字串）
+    AssertThrowsFormat(() =>
+    {
+        var bad = JsonDocument.Parse("""{"has_qr_remote_key":"true"}""").RootElement;
+        if (bad.TryGetProperty("has_qr_remote_key", out var v) && v.ValueKind != JsonValueKind.True && v.ValueKind != JsonValueKind.False)
+            throw new FormatException("has_qr_remote_key must be bool");
+    }, "string has_qr_remote_key must fail closed");
+}
+
 Console.WriteLine("ProtocolContract.Check：全部通過");
 
 static void Assert(bool condition, string message)

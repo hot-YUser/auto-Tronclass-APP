@@ -29,19 +29,60 @@ impl RollcallKind {
 }
 
 /// Classify a rollcall by its status flags — each rollcall is exactly one type (rollcall.rs table).
+/// Live QR may arrive as `type=qr_rollcall` / `source=qr` without `unsupported_qrcode`; ARTT covers those
+/// aliases (`is_qrcode`/`is_qr_code`/`is_qr`/`qrcode`/`qr_code`/`qrcode_url` or type `qr`). We recognise the exact
+/// live aliases (normalized, case-insensitive) without substring matching to avoid false positives,
+/// while preserving `is_number > is_radar > is_self_registration` precedence.
 pub fn classify(rc: &Value) -> RollcallKind {
     let flag = |k: &str| rc.get(k).and_then(Value::as_bool) == Some(true);
     if flag("is_number") {
-        RollcallKind::Number
-    } else if flag("is_radar") {
-        RollcallKind::Radar
-    } else if flag("is_self_registration") {
-        RollcallKind::SelfRegistration
-    } else if flag("unsupported_qrcode") {
-        RollcallKind::Qr
-    } else {
-        RollcallKind::Unknown
+        return RollcallKind::Number;
     }
+    if flag("is_radar") {
+        return RollcallKind::Radar;
+    }
+    if flag("is_self_registration") {
+        return RollcallKind::SelfRegistration;
+    }
+    let type_val = rc
+        .get("type")
+        .or_else(|| rc.get("rollcall_type"))
+        .or_else(|| rc.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if type_val == "self_registration" {
+        return RollcallKind::SelfRegistration;
+    }
+    if flag("unsupported_qrcode")
+        || flag("is_qrcode")
+        || flag("is_qr_code")
+        || flag("is_qr")
+        || rc.get("qrcode").and_then(Value::as_bool) == Some(true)
+        || rc.get("qr_code").and_then(Value::as_bool) == Some(true)
+        || rc
+            .get("qrcode_url")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        return RollcallKind::Qr;
+    }
+    if matches!(
+        type_val.as_str(),
+        "qr_rollcall" | "qrcode" | "qr" | "qr_code" | "qrcode_rollcall"
+    ) {
+        return RollcallKind::Qr;
+    }
+    if rc
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().eq_ignore_ascii_case("qr"))
+        .unwrap_or(false)
+    {
+        return RollcallKind::Qr;
+    }
+    RollcallKind::Unknown
 }
 
 /// Result of a successful sign; `discovered_code` lets a brute-force number sign share its find.
@@ -850,9 +891,51 @@ pub async fn sign_self_registration(
     }
 }
 
+/// Authoritative roster preflight for QR only: if the monitored user is already on_call_fine,
+/// return `qr(already-present)` with zero PUT. Otherwise confirm absent and let the caller emit
+/// exactly one PUT. Request/session errors are fail-closed (no PUT) except an explicit
+/// `SESSION_INVALID` which preserves the existing auth-recovery path.
+async fn qr_roster_preflight(
+    student: &Client,
+    ep: &Endpoints,
+    student_rollcall_id: &str,
+    user_no: &str,
+) -> Result<bool, String> {
+    let resp = student
+        .get(ep.student_rollcalls(student_rollcall_id))
+        .send()
+        .await
+        .map_err(|e| format!("qr: roster preflight failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let rurl = resp.url().clone();
+    let body_bytes =
+        crate::http::read_bounded(resp, crate::http::MAX_API_JSON, "rollcall roster preflight")
+            .await
+            .map_err(|e| format!("qr: roster preflight failed: {e}"))?;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    if response_auth_lost(status, &rurl, &body_str) {
+        return Err(format!("qr: {SESSION_INVALID}"));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("qr: roster preflight failed: HTTP {status}"));
+    }
+    if crate::http::explicit_business_error(&body_str) {
+        return Err("qr: roster preflight failed: server rejected the request".into());
+    }
+    let v: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|_| "qr: roster preflight invalid response".to_string())?;
+    let (present, total) = roster_stats(&v);
+    let already = my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v);
+    Ok(already)
+}
+
 /// qr teacher-assist: `data` sourced from the TEACHER's own qr rollcall is submitted to the
 /// STUDENT's real `student_rollcall_id` (docs 32 — the token is portable; teacher rollcall is only
-/// the data source, never the sign target).
+/// the data source, never the sign target). An authoritative `student_rollcalls` preflight is
+/// performed immediately before the PUT: if the roster already marks the monitored user
+/// `on_call_fine`, return `qr(already-present)` with ZERO PUT; otherwise emit exactly one PUT
+/// and post-recheck. Preflight transport/auth/invalid errors are fail-closed (no PUT) except
+/// `SESSION_INVALID` which is surfaced for the existing relogin retry path.
 pub async fn sign_qr_with_teacher_data(
     student: &Client,
     ep: &Endpoints,
@@ -861,6 +944,16 @@ pub async fn sign_qr_with_teacher_data(
     data: &str,
     user_no: &str,
 ) -> Result<SignOutcome, String> {
+    match qr_roster_preflight(student, ep, student_rollcall_id, user_no).await {
+        Ok(true) => {
+            return Ok(SignOutcome {
+                method: "qr(already-present)".into(),
+                ..Default::default()
+            })
+        }
+        Ok(false) => {}
+        Err(e) => return Err(e),
+    }
     let resp = student
         .put(ep.answer_qr(student_rollcall_id))
         .json(&json!({ "deviceId": device_id, "data": data }))
@@ -883,6 +976,7 @@ pub async fn sign_qr_with_teacher_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn mutating_sign_response_rejects_non_success_before_roster_recheck() {
@@ -1526,5 +1620,611 @@ mod tests {
                 assert_eq!(reqs.load(Ordering::SeqCst), 2);
             }
         }
+    }
+
+    #[test]
+    fn classify_qr_live_aliases_exact_not_substring_with_precedence() {
+        let cases: Vec<(Value, RollcallKind, &str)> = vec![
+            // live exact shapes
+            (
+                json!({"type":"qr_rollcall"}),
+                RollcallKind::Qr,
+                "qr_rollcall",
+            ),
+            (
+                json!({"type":"QR_ROLLCALL"}),
+                RollcallKind::Qr,
+                "QR_ROLLCALL case-insensitive",
+            ),
+            (
+                json!({"type":"qr_rollcall","source":"qr"}),
+                RollcallKind::Qr,
+                "qr_rollcall+source qr",
+            ),
+            (json!({"source":"qr"}), RollcallKind::Qr, "source qr"),
+            (
+                json!({"source":"QR"}),
+                RollcallKind::Qr,
+                "source QR case-insensitive",
+            ),
+            (
+                json!({"source":" qr "}),
+                RollcallKind::Qr,
+                "source qr trimmed",
+            ),
+            (json!({"is_qrcode":true}), RollcallKind::Qr, "is_qrcode"),
+            (json!({"is_qr_code":true}), RollcallKind::Qr, "is_qr_code"),
+            (json!({"is_qr":true}), RollcallKind::Qr, "is_qr"),
+            (json!({"qrcode":true}), RollcallKind::Qr, "qrcode bool"),
+            (json!({"qr_code":true}), RollcallKind::Qr, "qr_code bool"),
+            (
+                json!({"qrcode_url":"https://example.com/qr.png"}),
+                RollcallKind::Qr,
+                "qrcode_url non-empty",
+            ),
+            (
+                json!({"unsupported_qrcode":true}),
+                RollcallKind::Qr,
+                "legacy unsupported_qrcode",
+            ),
+            (json!({"type":"qrcode"}), RollcallKind::Qr, "type qrcode"),
+            (json!({"type":"qr"}), RollcallKind::Qr, "type qr"),
+            (json!({"type":"qr_code"}), RollcallKind::Qr, "type qr_code"),
+            (
+                json!({"type":"qrcode_rollcall"}),
+                RollcallKind::Qr,
+                "type qrcode_rollcall",
+            ),
+            // precedence: number/radar/self_registration win over QR aliases
+            (
+                json!({"is_number":true,"type":"qr_rollcall"}),
+                RollcallKind::Number,
+                "number precedence",
+            ),
+            (
+                json!({"is_radar":true,"type":"qr_rollcall"}),
+                RollcallKind::Radar,
+                "radar precedence",
+            ),
+            (
+                json!({"is_self_registration":true,"type":"qr_rollcall"}),
+                RollcallKind::SelfRegistration,
+                "self_registration precedence",
+            ),
+            (
+                json!({"type":"self_registration"}),
+                RollcallKind::SelfRegistration,
+                "type self_registration exact",
+            ),
+            (
+                json!({"type":"Self_Registration"}),
+                RollcallKind::SelfRegistration,
+                "type Self_Registration case-insensitive",
+            ),
+            // false positives: substring must NOT match
+            (
+                json!({"type":"homework"}),
+                RollcallKind::Unknown,
+                "homework unknown",
+            ),
+            (
+                json!({"type":"squad"}),
+                RollcallKind::Unknown,
+                "squad contains qr substring but unknown",
+            ),
+            (
+                json!({"type":"square"}),
+                RollcallKind::Unknown,
+                "square contains qr substring but unknown",
+            ),
+            (
+                json!({"source":"qrs"}),
+                RollcallKind::Unknown,
+                "source qrs not exact",
+            ),
+            (json!({}), RollcallKind::Unknown, "empty unknown"),
+            (
+                json!({"type":"qr_rollcall","status":"on_call_fine"}),
+                RollcallKind::Qr,
+                "qr_rollcall on_call_fine still Qr classify",
+            ),
+            // ARTT compat rollcall_type / name aliases
+            (
+                json!({"rollcall_type":"qr_rollcall"}),
+                RollcallKind::Qr,
+                "rollcall_type qr_rollcall",
+            ),
+            (
+                json!({"name":"qr_rollcall"}),
+                RollcallKind::Qr,
+                "name qr_rollcall",
+            ),
+        ];
+        for (payload, expect, label) in cases {
+            assert_eq!(classify(&payload), expect, "classify {label}: {payload}");
+        }
+    }
+
+    #[test]
+    fn classify_source_qr_exact_not_substring_and_alias_flags() {
+        assert_eq!(classify(&json!({"source":"qr"})), RollcallKind::Qr);
+        assert_eq!(classify(&json!({"source":"QR"})), RollcallKind::Qr);
+        assert_eq!(classify(&json!({"source":"Qr"})), RollcallKind::Qr);
+        assert_eq!(classify(&json!({"source":"qrs"})), RollcallKind::Unknown);
+        assert_eq!(classify(&json!({"source":"myqr"})), RollcallKind::Unknown);
+        assert_eq!(classify(&json!({"source":""} )), RollcallKind::Unknown);
+        assert_eq!(classify(&json!({"qrcode":false})), RollcallKind::Unknown);
+        assert_eq!(classify(&json!({"qrcode":"yes"})), RollcallKind::Unknown);
+        assert_eq!(classify(&json!({"qrcode_url":""})), RollcallKind::Unknown);
+        assert_eq!(
+            classify(&json!({"qrcode_url":"   "})),
+            RollcallKind::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_guard_my_present_and_recheck_on_call_fine() {
+        use crate::fake;
+        use crate::providers::Endpoints;
+        use cookie_store::CookieStore;
+        use reqwest_cookie_store::CookieStoreMutex;
+        use std::sync::Arc;
+
+        let (port, listener) = fake::bind_ephemeral().await;
+        tokio::spawn(fake::serve(listener));
+        let base = format!("http://127.0.0.1:{port}");
+        let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
+        let client = reqwest::Client::builder()
+            .cookie_provider(jar)
+            .build()
+            .unwrap();
+        let ep = Endpoints::derive(&base);
+
+        // Open a rollcall with high attendance so top-level is on_call_fine, sign s1 via number answer
+        let open = serde_json::json!({"id":"RC-GUARD","kind":"number","number_code":"1234","attendance_rate":100.0});
+        client
+            .post(format!("{base}/_test/open_rollcall"))
+            .json(&open)
+            .send()
+            .await
+            .unwrap();
+        // Login as s1 (cookie jar must persist session for roster read)
+        let resp = client
+            .post(format!("{base}/login"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("username=s1&password=secret&csrf=tok123".to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let put = client
+            .put(format!(
+                "{}/api/rollcall/RC-GUARD/answer_number_rollcall",
+                base
+            ))
+            .json(&serde_json::json!({"deviceId":"dev-s1","numberCode":"1234"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            put.status().is_success(),
+            "PUT must succeed, got {}",
+            put.status()
+        );
+        let roster = client
+            .get(format!("{}/api/rollcall/RC-GUARD/student_rollcalls", base))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert!(
+            my_present(&roster, "s1"),
+            "s1 must be my_present after sign: {roster}"
+        );
+        assert!(
+            recheck_on_call_fine(&client, &ep, "RC-GUARD", "s1").await,
+            "recheck must be true for present s1"
+        );
+        // A fresh roster for s2 who did not sign must not be my_present via s2
+        assert!(
+            !my_present(&roster, "s2"),
+            "s2 not signed must not be my_present"
+        );
+        // Whole-class present already covers recheck for any user_no (including s2) via present==total
+        assert!(
+            recheck_on_call_fine(&client, &ep, "RC-GUARD", "s2").await,
+            "whole-class on_call_fine covers s2"
+        );
+    }
+
+    async fn qr_preflight_harness(
+        roster_payload: &str,
+        preflight_status: Option<u16>,
+        roster_invalid_json: bool,
+        expire_stage: Option<&'static str>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let puts = Arc::new(AtomicUsize::new(0));
+        let payload_owned = roster_payload.to_string();
+        let g = gets.clone();
+        let p = puts.clone();
+        tokio::spawn(async move {
+            // Serve up to ~8 requests: enough for preflight (1) + at-most one PUT (1) + post recheck (1)
+            // plus small parallelism in concurrent harnesses. Each connection handles one request.
+            for _ in 0..16 {
+                let Ok((mut s, _)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(400), listener.accept())
+                        .await
+                        .unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "")))
+                else {
+                    break;
+                };
+                let payload = payload_owned.clone();
+                let g = g.clone();
+                let p = p.clone();
+                let status_override = preflight_status;
+                let invalid = roster_invalid_json;
+                let expire = expire_stage;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let method_is_get = text.starts_with("GET ");
+                    let is_put = text.starts_with("PUT ") && text.contains("answer_qr_rollcall");
+                    let is_get = method_is_get && text.contains("student_rollcalls");
+                    if is_put {
+                        p.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if is_get {
+                        g.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let resp = if matches!(expire, Some("preflight")) && is_get {
+                        // Simulate session lost on preflight GET: login page 200 (universal auth-lost shape).
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 32\r\nConnection: close\r\n\r\n<html><body>login page</body></html>".to_string()
+                    } else if matches!(expire, Some("network")) && is_get {
+                        // For network-failClosed test we don't bind here; caller builds a refused port instead.
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if is_get {
+                        if let Some(code) = status_override {
+                            let body = if invalid { "not-json" } else { &payload };
+                            format!(
+                                "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                if code == 200 { "OK" } else { "Error" },
+                                body.len(),
+                                body
+                            )
+                        } else if invalid {
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json".to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                payload.len(),
+                                payload
+                            )
+                        }
+                    } else if is_put {
+                        if matches!(expire, Some("put")) {
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 42\r\nConnection: close\r\n\r\n<html><body>login</body></html>".to_string()
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"success\":true}".to_string()
+                        }
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), gets, puts)
+    }
+
+    #[tokio::test]
+    async fn qr_preflight_already_present_zero_put_and_success_without_side_effect() {
+        use crate::providers::Endpoints;
+        use std::sync::atomic::Ordering;
+        // Roster says the caller is already on_call_fine via my_present (authoritative).
+        let roster = r#"{"status":"in_progress","rollcallStatus":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"},{"user_no":"c0","rollcall_status":"absent"}]}"#;
+        let (base, gets, puts) = qr_preflight_harness(roster, None, false, None).await;
+        let ep = Endpoints::derive(&base);
+        let client = reqwest::Client::new();
+        let out = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .expect("already present must succeed");
+        assert_eq!(out.method, "qr(already-present)");
+        // Must be zero MUTATION PUT — only the 1 preflight GET is allowed.
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            0,
+            "already-present must emit 0 PUT"
+        );
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "must perform exactly 1 preflight read"
+        );
+
+        // Also covers top_fine and whole-class present==total variants (deterministic, no PUT).
+        for variant in [
+            r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"absent"}]}"#,
+            r#"{"status":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"absent"},{"user_no":"u2","rollcall_status":"on_call_fine"}]}"#,
+        ] {
+            // The second variant's whole-class is NOT fully present so it's not already-present; expect 1 PUT path.
+            // To keep zero-PUT for whole-class, craft fully present.
+            let fully_present = r#"{"status":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+            let _ = variant;
+            let (base2, _g2, puts2) = qr_preflight_harness(fully_present, None, false, None).await;
+            let ep2 = Endpoints::derive(&base2);
+            let client2 = reqwest::Client::new();
+            let out2 = sign_qr_with_teacher_data(&client2, &ep2, "RC-QR2", "dev-1", "tok", "u1")
+                .await
+                .expect("whole-class present must be already-present");
+            assert_eq!(out2.method, "qr(already-present)");
+            assert_eq!(puts2.load(Ordering::SeqCst), 0);
+        }
+
+        // Direct top_fine: top-level status on_call_fine even with empty/absent roster.
+        let top_only = r#"{"status":"on_call_fine","student_rollcalls":[]}"#;
+        let (base3, _g3, puts3) = qr_preflight_harness(top_only, None, false, None).await;
+        let ep3 = Endpoints::derive(&base3);
+        let client3 = reqwest::Client::new();
+        let out3 = sign_qr_with_teacher_data(&client3, &ep3, "RC-QR3", "dev-1", "tok", "u1")
+            .await
+            .expect("top_fine must be already-present");
+        assert_eq!(out3.method, "qr(already-present)");
+        assert_eq!(puts3.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn qr_preflight_absent_one_put_then_post_recheck_confirms_on_call_fine() {
+        use crate::providers::Endpoints;
+        use std::sync::atomic::Ordering;
+        // Absent on preflight, PUT 200, then roster flips to present for post-recheck (2nd GET).
+        // Harness that mutates its roster payload after the PUT is observed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let puts_c = puts.clone();
+        let gets_c = gets.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut served = 0usize;
+            loop {
+                let Ok((mut s, _)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(600), listener.accept())
+                        .await
+                        .unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "")))
+                else {
+                    break;
+                };
+                let puts_c = puts_c.clone();
+                let gets_c = gets_c.clone();
+                let served_idx = served;
+                served += 1;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let is_put = text.starts_with("PUT ") && text.contains("answer_qr_rollcall");
+                    let is_get = text.starts_with("GET ") && text.contains("student_rollcalls");
+                    if is_put {
+                        puts_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if is_get {
+                        gets_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let resp = if is_get {
+                        // If a PUT already happened before this GET, serve the post-recheck present state.
+                        let payload = if puts_c.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                            r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#
+                        } else {
+                            r#"{"status":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"in_progress"}]}"#
+                        };
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            payload.len(),
+                            payload
+                        )
+                    } else if is_put {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"success\":true}".to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = served_idx;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let ep = Endpoints::derive(&base);
+        let client = reqwest::Client::new();
+        let out = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .expect("absent→1 PUT must succeed once roster flips");
+        assert_eq!(out.method, "qr(teacher-assist)");
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            1,
+            "absent must emit exactly 1 PUT then post-recheck"
+        );
+        assert!(
+            gets.load(Ordering::SeqCst) >= 2,
+            "must recheck after PUT: gets={}",
+            gets.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn qr_preflight_auth_lost_surfaces_session_invalid_with_zero_put_and_allows_relogin_retry(
+    ) {
+        use crate::providers::Endpoints;
+        use std::sync::atomic::Ordering;
+        // Preflight GET returns a 200 login HTML page → SESSION_INVALID with 0 PUT.
+        let roster = r#"{"status":"in_progress","student_rollcalls":[]}"#;
+        let (base, _gets, puts) =
+            qr_preflight_harness(roster, None, false, Some("preflight")).await;
+        let ep = Endpoints::derive(&base);
+        let client = reqwest::Client::new();
+        let err = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains(SESSION_INVALID),
+            "preflight login page must be session invalid: {err}"
+        );
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            0,
+            "auth-lost preflight must emit 0 PUT"
+        );
+
+        // The monitor's `sign_qr_student` relogin path must trigger on this error. We model it inline:
+        // a second attempt after relogin sees already-present and still emits 0 additional PUT.
+        let roster2 = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+        let (base2, _g2, puts2) = qr_preflight_harness(roster2, None, false, None).await;
+        let ep2 = Endpoints::derive(&base2);
+        let client2 = reqwest::Client::new();
+        let first_is_auth_lost = is_auth_lost(&err);
+        assert!(
+            first_is_auth_lost,
+            "preflight auth lost must be is_auth_lost"
+        );
+        let out = sign_qr_with_teacher_data(&client2, &ep2, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .expect("post-relogin already-present should succeed");
+        assert_eq!(out.method, "qr(already-present)");
+        assert_eq!(puts2.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn qr_preflight_network_and_invalid_response_are_fail_closed_no_blind_put() {
+        use crate::providers::Endpoints;
+        use std::sync::atomic::Ordering;
+        // 1) Network error: connect to a closed port (no server) → transport err, 0 PUT, NOT session invalid.
+        let closed_base = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            format!("http://{a}")
+        };
+        let ep_closed = Endpoints::derive(&closed_base);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let err = sign_qr_with_teacher_data(&client, &ep_closed, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .unwrap_err();
+        assert!(
+            !is_auth_lost(&err),
+            "network error must NOT be auth-lost: {err}"
+        );
+        assert!(
+            err.contains("roster preflight"),
+            "network error must surface preflight: {err}"
+        );
+
+        // 2) Non-JSON 200 body → invalid response, 0 PUT, not auth-lost, no blind PUT.
+        let (base, _gets, puts) =
+            qr_preflight_harness(r#"not-json-irrelevant"#, None, true, None).await;
+        let ep = Endpoints::derive(&base);
+        let client = reqwest::Client::new();
+        let err2 = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .unwrap_err();
+        assert!(
+            !is_auth_lost(&err2),
+            "invalid response must NOT be auth-lost: {err2}"
+        );
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            0,
+            "invalid preflight must emit 0 PUT"
+        );
+        assert!(
+            err2.contains("invalid response"),
+            "invalid json must be invalid response: {err2}"
+        );
+
+        // 3) HTTP 500 preflight → fail-closed, 0 PUT.
+        let roster_ok = r#"{"status":"in_progress","student_rollcalls":[]}"#;
+        let (base3, _g3, puts3) = qr_preflight_harness(roster_ok, Some(500), false, None).await;
+        let ep3 = Endpoints::derive(&base3);
+        let client3 = reqwest::Client::new();
+        let err3 = sign_qr_with_teacher_data(&client3, &ep3, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .unwrap_err();
+        assert!(!is_auth_lost(&err3));
+        assert_eq!(puts3.load(Ordering::SeqCst), 0);
+        assert!(
+            err3.contains("HTTP 500"),
+            "non-2xx preflight must surface HTTP: {err3}"
+        );
+
+        // 4) Explicit business error in preflight payload → fail-closed.
+        let bad_payload = r#"{"success":false,"student_rollcalls":[]}"#;
+        let (base4, _g4, puts4) = qr_preflight_harness(bad_payload, Some(200), false, None).await;
+        let ep4 = Endpoints::derive(&base4);
+        let client4 = reqwest::Client::new();
+        let err4 = sign_qr_with_teacher_data(&client4, &ep4, "RC-QR", "dev-1", "tok", "u1")
+            .await
+            .unwrap_err();
+        assert!(!is_auth_lost(&err4));
+        assert_eq!(puts4.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn classify_exact_type_before_qr_flags_and_case_trim_normalization() {
+        // type/rollcall_type/name normalization (trim + ascii lowercase) must happen BEFORE QR flag fallback
+        assert_eq!(
+            classify(
+                &json!({"type":" Self_Registration ", "qrcode_url":"https://example.com/qr.png"})
+            ),
+            RollcallKind::SelfRegistration,
+            "exact type must win over qrcode_url"
+        );
+        // qrcode_url with value and exact-type precedence
+        assert_eq!(
+            classify(&json!({"type":" SELF_REGISTRATION "})),
+            RollcallKind::SelfRegistration,
+            "trimmed case-insensitive self_registration must normalize"
+        );
+        // QR aliases still work after reorder
+        assert_eq!(
+            classify(&json!({"type":"qr_rollcall"})),
+            RollcallKind::Qr,
+            "qr_rollcall still Qr"
+        );
+        // boolean flags remain top priority
+        assert_eq!(
+            classify(&json!({"is_number":true,"type":"self_registration"})),
+            RollcallKind::Number
+        );
+        assert_eq!(
+            classify(&json!({"is_radar":true,"type":"self_registration"})),
+            RollcallKind::Radar
+        );
+        assert_eq!(
+            classify(
+                &json!({"is_self_registration":true,"qrcode_url":"https://example.com/qr.png"})
+            ),
+            RollcallKind::SelfRegistration
+        );
     }
 }

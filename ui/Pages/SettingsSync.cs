@@ -40,6 +40,18 @@ internal static class SettingsSync
     /// <summary>門檻停用(core 存 0)時畫面顯示的預設值；其餘以共享格式化呈現。</summary>
     public static string CanonicalGateText(double attendanceGatePercent) =>
         attendanceGatePercent > 0 ? FormatGate(attendanceGatePercent) : "15";
+
+    /// <summary>QR 遠端位址的最小 hint：僅檢查必填與 http(s) 絕對 URL，正規化留給 core。</summary>
+    public static bool TryHintQrRemoteBaseUrl(string? text, out string error)
+    {
+        error = "";
+        var trimmed = (text ?? "").Trim();
+        if (trimmed.Length == 0) { error = "遠端位址不得為空"; return false; }
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)) { error = "遠端位址格式不正確"; return false; }
+        if (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp) { error = "僅支援 http/https"; return false; }
+        if (string.IsNullOrEmpty(uri.Host)) { error = "必須包含 host"; return false; }
+        return true;
+    }
 }
 
 /// <summary>

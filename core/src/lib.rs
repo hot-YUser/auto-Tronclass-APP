@@ -17,6 +17,7 @@ mod monitor;
 mod persistence;
 mod protocol;
 mod providers;
+mod qr_remote;
 mod quiz;
 mod radar;
 mod redaction;

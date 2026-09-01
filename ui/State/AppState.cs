@@ -185,7 +185,8 @@ public sealed class AppState : ObservableObject
                 CurrentSettings = new SettingsSnapshot(
                     Int(s, "countdown_secs"), Dbl(s, "attendance_gate_percent"),
                     Str(s, "llm_endpoint") ?? "", Str(s, "llm_model") ?? "", Int(s, "llm_max_tokens"),
-                    Bool(s, "resubmit_for_correct"), Bool(s, "enable_llm_tools"), Bool(s, "has_llm_key"));
+                    Bool(s, "resubmit_for_correct"), Bool(s, "enable_llm_tools"), Bool(s, "has_llm_key"),
+                    Bool(s, "has_qr_remote_key"), Bool(s, "qr_remote_enabled"), Str(s, "qr_remote_base_url") ?? "https://api.hlp.qzz.io");
                 SettingsChanged?.Invoke();
                 break;
 
@@ -766,6 +767,14 @@ public sealed class AppState : ObservableObject
             ("subject_id", subjectId), ("answer", answer));
 
     public async Task<bool> SetLlmKey(string key) => OkReply(await Send("SetLlmKey", ("key", key)));
+    public async Task<bool> SetQrRemoteKey(string key) => OkReply(await Send("SetQrRemoteKey", ("key", key)));
+
+    public async Task<bool> SaveQrRemoteConfig(bool enabled, string baseUrl) =>
+        OkReply(await Send("UpdateConfig", ("patch", new Dictionary<string, object?>
+        {
+            ["qr_remote_enabled"] = enabled,
+            ["qr_remote_base_url"] = baseUrl,
+        })));
 
     public async Task<bool> SaveConfig(int countdownSecs, double thresholdPct, bool thresholdEnabled) =>
         // 鍵名對齊 core Settings(config.rs)。core 只有單一 attendance_gate_percent:停用門檻 = 送 0%

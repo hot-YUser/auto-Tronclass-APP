@@ -20,6 +20,7 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 /// Reserved vault entry id for the LLM API key (accounts use random hex ids, so no collision).
 const LLM_KEY_ID: &str = "__llm__";
+const QR_REMOTE_KEY_ID: &str = "__qr_remote__";
 
 /// A string secret whose `Debug`/`Display` are masked, so a stray `{:?}`/log of a struct holding it
 /// (e.g. the monitor's `Account`, which carries a password for session re-login) never leaks it. The
@@ -275,6 +276,49 @@ impl VaultFile {
                 .is_some_and(|secret| !secret.password.is_empty())
     }
 
+    pub fn set_qr_remote_key(&mut self, mut key: String) -> Result<(), String> {
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            key.zeroize();
+            return self.delete(QR_REMOTE_KEY_ID);
+        }
+        if let Err(error) = validate_qr_remote_key(&trimmed) {
+            key.zeroize();
+            return Err(error);
+        }
+        let result = self.set(
+            QR_REMOTE_KEY_ID,
+            AccountSecret {
+                password: trimmed,
+                cookies: String::new(),
+            },
+        );
+        key.zeroize();
+        result
+    }
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn get_qr_remote_key(&self) -> Option<String> {
+        self.key.as_ref()?;
+        self.data
+            .get(QR_REMOTE_KEY_ID)
+            .map(|secret| secret.password.clone())
+            .filter(|key| !key.is_empty())
+    }
+    pub fn get_qr_remote_key_secret(&self) -> Option<Secret> {
+        self.key.as_ref()?;
+        self.data
+            .get(QR_REMOTE_KEY_ID)
+            .map(|secret| Secret::new(secret.password.clone()))
+            .filter(|secret| !secret.expose().is_empty())
+    }
+    pub fn has_qr_remote_key(&self) -> bool {
+        self.key.is_some()
+            && self
+                .data
+                .get(QR_REMOTE_KEY_ID)
+                .is_some_and(|secret| !secret.password.is_empty())
+    }
+
     pub fn lock(&mut self) {
         if let Some(mut key) = self.key.take() {
             key.zeroize();
@@ -287,6 +331,20 @@ impl VaultFile {
         }
         self.data.clear();
     }
+}
+
+fn validate_qr_remote_key(trimmed: &str) -> Result<(), String> {
+    if trimmed.is_empty() {
+        return Err("qr remote key 不得為空".to_string());
+    }
+    if trimmed.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+        return Err("qr remote key 包含空白或不可見字元".to_string());
+    }
+    let bearer = zeroize::Zeroizing::new(format!("Bearer {trimmed}"));
+    reqwest::header::HeaderValue::from_str(bearer.as_str())
+        .map(|_| ())
+        .map_err(|_| "qr remote key 格式不正確".to_string())?;
+    Ok(())
 }
 
 impl Drop for VaultFile {
@@ -536,5 +594,123 @@ mod tests {
         assert!(!output.contains("super-secret-password"));
         assert!(!output.contains("account-password"));
         assert!(!output.contains("session-cookie"));
+    }
+
+    #[test]
+    fn vault_qr_remote_key_set_get_clear_and_redaction() {
+        let dir = std::env::temp_dir().join(format!("tron-vault-qr-{}", crate::config::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [7u8; 32];
+        let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
+        assert!(!vault.has_qr_remote_key());
+        vault.set_qr_remote_key("qr-secret-value".into()).unwrap();
+        assert!(vault.has_qr_remote_key());
+        assert_eq!(
+            vault.get_qr_remote_key().as_deref(),
+            Some("qr-secret-value")
+        );
+        // Redaction must hide the raw key
+        let mut value = serde_json::json!({"qr_remote_key": "qr-secret-value", "other": "ok"});
+        crate::redaction::redact(&mut value);
+        assert_eq!(value["qr_remote_key"], "[redacted]");
+        assert_eq!(value["other"], "ok");
+        // Also case-insensitive
+        let mut value2 = serde_json::json!({"QR_REMOTE_KEY": "secret"});
+        crate::redaction::redact(&mut value2);
+        assert_eq!(value2["QR_REMOTE_KEY"], "[redacted]");
+        // Empty clears
+        vault.set_qr_remote_key(String::new()).unwrap();
+        assert!(!vault.has_qr_remote_key());
+        assert!(vault.get_qr_remote_key().is_none());
+        // Wrong key fails to unlock
+        let wrong = [9u8; 32];
+        assert!(VaultFile::unlock_with_key(&dir.join("vault.bin"), wrong).is_err());
+        vault.lock();
+        assert!(!vault.has_qr_remote_key());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn qr_remote_key_validation_vault_unchanged_clear_and_secret() {
+        let dir = std::env::temp_dir().join(format!(
+            "tron-vault-qr-validate-{}",
+            crate::config::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [7u8; 32];
+        let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
+        vault.set_qr_remote_key("good-key-123".into()).unwrap();
+        assert!(vault.has_qr_remote_key());
+        // Invalid interior whitespace / control / non-visible-ASCII must be rejected BEFORE vault write, vault unchanged
+        for bad in [
+            "bad key",
+            "bad\tkey",
+            "bad\nkey",
+            "bad\u{7f}key",
+            "bad\u{00}key",
+            "bad\u{1f}key",
+        ] {
+            let before = vault.get_qr_remote_key();
+            let err = vault.set_qr_remote_key(bad.to_string()).unwrap_err();
+            assert!(
+                err.contains("空白") || err.contains("格式"),
+                "bad {bad:?} err {err}"
+            );
+            assert_eq!(
+                vault.get_qr_remote_key(),
+                before,
+                "vault unchanged for {bad:?}"
+            );
+        }
+        // Surrounding whitespace is trimmed to a valid interior — must succeed after trim
+        for (raw, canonical) in [
+            (" bad-key", "bad-key"),
+            ("bad-key ", "bad-key"),
+            ("  good-key-123  ", "good-key-123"),
+        ] {
+            vault.set_qr_remote_key(raw.to_string()).unwrap();
+            assert_eq!(
+                vault.get_qr_remote_key().as_deref(),
+                Some(canonical),
+                "surrounding whitespace must trim for {raw:?}"
+            );
+        }
+        // Restore good key for subsequent steps
+        vault.set_qr_remote_key("good-key-123".into()).unwrap();
+        // Whitespace-only clears (empty means clear)
+        vault.set_qr_remote_key("   ".into()).unwrap();
+        assert!(!vault.has_qr_remote_key());
+        assert!(vault.get_qr_remote_key().is_none());
+        assert!(vault.get_qr_remote_key_secret().is_none());
+        // Set again and verify zeroizing Secret accessor
+        vault.set_qr_remote_key("qr-secret-value".into()).unwrap();
+        let secret = vault.get_qr_remote_key_secret().unwrap();
+        assert_eq!(secret.expose(), "qr-secret-value");
+        assert!(
+            format!("{secret:?}").contains("***")
+                && !format!("{secret:?}").contains("qr-secret-value")
+        );
+        // Verify Secret accessor is zeroizing (no long-lived plain clone outside vault) — Debug masked
+        let secret2 = vault.get_qr_remote_key_secret().unwrap();
+        assert_eq!(secret2.expose(), "qr-secret-value");
+        assert!(!format!("{secret2:?}").contains("qr-secret-value"));
+        // Empty string clears via delete
+        vault.set_qr_remote_key(String::new()).unwrap();
+        assert!(!vault.has_qr_remote_key());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_qr_remote_key_uses_zeroizing_buffer() {
+        assert!(validate_qr_remote_key("valid-qr-key-123").is_ok());
+        // RFC 7230 invalid HeaderValue characters must still be rejected even under Zeroizing
+        assert!(
+            validate_qr_remote_key("bad\nkey")
+                .unwrap_err()
+                .contains("空白")
+                || validate_qr_remote_key("bad\nkey")
+                    .unwrap_err()
+                    .contains("格式")
+        );
     }
 }

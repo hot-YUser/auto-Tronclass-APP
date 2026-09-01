@@ -146,6 +146,16 @@ Equal("GetMonitoringSnapshot",
     JsonWire.SerializeCommand(22, "GetMonitoringSnapshot"),
     """{"id":22,"cmd":"GetMonitoringSnapshot"}""");
 
+Equal("SetQrRemoteKey:nonempty key wire shape",
+    JsonWire.SerializeCommand(23, "SetQrRemoteKey", ("key", "my-secret-key-123")),
+    """{"id":23,"cmd":"SetQrRemoteKey","key":"my-secret-key-123"}""");
+Equal("SetQrRemoteKey:clear wire shape empty string",
+    JsonWire.SerializeCommand(24, "SetQrRemoteKey", ("key", "")),
+    """{"id":24,"cmd":"SetQrRemoteKey","key":""}""");
+Equal("SetQrRemoteKey:whitespace-only clear is empty string on wire",
+    JsonWire.SerializeCommand(25, "SetQrRemoteKey", ("key", "   ")),
+    """{"id":25,"cmd":"SetQrRemoteKey","key":"   "}""");
+
 var supportedMonitoringCommands = new[]
 {
     "CreateGroup", "UpdateGroup", "DeleteGroup", "MergeGroups", "ListCommonCourses",

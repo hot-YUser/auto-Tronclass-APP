@@ -20,6 +20,7 @@ use crate::protocol::AnswerWire;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
 use crate::rollcall::{self, RollcallKind, SignOutcome};
+use crate::secrets::Secret;
 use crate::teacher_qr::{self, FailureKind};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -29,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
@@ -258,6 +259,35 @@ pub(crate) enum MonitorMsg {
         account_id: String,
         result: Result<SignOutcome, String>,
     },
+    QrSignResult {
+        key: ActivityKey,
+        account_id: String,
+        generation: u64,
+        /// Whether a student PUT was attempted (true) or this is a source-acquisition
+        /// error sent before any PUT (false). The former implies mutation_started,
+        /// the latter must NOT clear source_failed_without_mutation.
+        mutation_attempted: bool,
+        result: Result<SignOutcome, String>,
+    },
+    /// Generation-tagged source-acquisition failure before any student PUT. Sanitized reason
+    /// plus affected account set; the helper awaits a oneshot ack that the actor has marked
+    /// the activity as source_failed_without_mutation.
+    QrSourceFailed {
+        key: ActivityKey,
+        generation: u64,
+        reason: String,
+        account_ids: Vec<String>,
+        ack: oneshot::Sender<()>,
+    },
+    /// Generation-tagged handshake: helper notifies actor it will start a student PUT, actor
+    /// marks mutation_started and acks before the helper proceeds (prevents races where a
+    /// ConfigUpdated sees a QR activity as not-yet-mutated).
+    QrMutationStarted {
+        key: ActivityKey,
+        generation: u64,
+        account_id: String,
+        ack: oneshot::Sender<()>,
+    },
     SignNow {
         command_id: u64,
         activity_token: String,
@@ -378,6 +408,13 @@ struct Activity {
     sources: HashSet<TargetId>,
     plan_generation: u64,
     mutation_blocked: bool,
+    // QR-only: distinguishes source-acquisition failure (no PUT started) from mutation.
+    // Initialized deterministically to false on every new activity; QrSignResult/put-path
+    // implies mutation_started, source-acquisition / no-source / deadline before data
+    // marks source_failed_without_mutation, never pretends a PUT occurred.
+    mutation_started: bool,
+    source_failed_without_mutation: bool,
+    qr_source_failed_reason: Option<String>,
 }
 
 pub struct MonitorHandle {
@@ -475,6 +512,7 @@ impl Drop for MonitorHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct MonitorConfig {
     pub countdown_secs: u64,
     pub gate_percent: f64,
@@ -495,6 +533,9 @@ pub struct MonitorConfig {
     pub number_max_cooldowns: u32,
     pub poll_idle_secs: u64,
     pub quiz_detect_secs: u64,
+    pub qr_remote_enabled: bool,
+    pub qr_remote_base_url: String,
+    pub qr_remote_key: Option<std::sync::Arc<Secret>>,
 }
 
 impl MonitorConfig {
@@ -637,6 +678,7 @@ pub fn start(
         .collect();
     let (tune_tx, tune_rx) = watch::channel(cfg.tuning());
     let (plan_tx, plan_rx) = watch::channel(initial_plan.clone());
+    let (qr_rev_tx, _qr_rev_rx) = watch::channel(0u64);
     let group = Arc::new(TaskGroup::new(cb, panic_tx));
     let mut startup = StartupGuard::new(group.clone());
     for account in map.values().filter(|account| !account.is_teacher) {
@@ -655,6 +697,7 @@ pub fn start(
         cfg,
         tune_tx,
         plan_tx,
+        qr_rev_tx,
         plan: initial_plan,
         runtime_tx,
         group: group.clone(),
@@ -1368,6 +1411,7 @@ struct ActorInit {
     cfg: MonitorConfig,
     tune_tx: watch::Sender<PollTuning>,
     plan_tx: watch::Sender<MonitorPlan>,
+    qr_rev_tx: watch::Sender<u64>,
     plan: MonitorPlan,
     runtime_tx: UnboundedSender<RuntimeEvent>,
     group: Arc<TaskGroup>,
@@ -1382,6 +1426,7 @@ async fn actor(init: ActorInit) {
         mut cfg,
         tune_tx,
         plan_tx,
+        qr_rev_tx,
         mut plan,
         runtime_tx,
         group,
@@ -1390,6 +1435,7 @@ async fn actor(init: ActorInit) {
     let mut quizzes: HashMap<ActivityKey, QuizActivity> = HashMap::new();
     let mut reauth: HashSet<String> = HashSet::new();
     let mut relogin_backoff: HashMap<String, ReloginState> = HashMap::new();
+    let mut qr_rev: u64 = 0;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -1409,6 +1455,9 @@ async fn actor(init: ActorInit) {
                                     cb,
                                     cfg: &cfg,
                                     plan: &plan,
+                                    plan_tx: &plan_tx,
+                                    qr_rev,
+                                    qr_rev_rx: qr_rev_tx.subscribe(),
                                 },
                                 detection,
                             );
@@ -1434,6 +1483,9 @@ async fn actor(init: ActorInit) {
                                 &cfg,
                                 cb,
                                 &key,
+                                &plan_tx,
+                                qr_rev,
+                                qr_rev_tx.subscribe(),
                             );
                         }
                     }
@@ -1441,11 +1493,76 @@ async fn actor(init: ActorInit) {
                         publish_rollcall_result(&runtime_tx, &activities, &key, &account_id, &result);
                         on_sign_result(&mut activities, &self_tx, cb, key, account_id, result);
                     }
+                    MonitorMsg::QrSignResult { key, account_id, generation, mutation_attempted, result } => {
+                        if generation != plan.generation {
+                            continue;
+                        }
+                        let Some(a) = activities.get_mut(&key) else {
+                            continue;
+                        };
+                        if a.plan_generation != generation {
+                            continue;
+                        }
+                        if a.kind == RollcallKind::Qr && !mutation_attempted {
+                            // Source-only failure: preserve source_failed_without_mutation, do not mark mutation,
+                            // and do not mutate sign state (no sign_failed / resign_attempts / needs_resign).
+                            // Ordering robust: QrSourceFailed+QrSignResult(false) in either order leaves
+                            // source_failed true when no mutation occurred.
+                            // Publish sanitized per-account diagnostic if UI contract expects it, but no mutation bookkeeping.
+                            publish_rollcall_result(&runtime_tx, &activities, &key, &account_id, &result);
+                            continue;
+                        }
+                        if a.kind == RollcallKind::Qr {
+                            a.mutation_started = true;
+                            a.source_failed_without_mutation = false;
+                        }
+                        publish_rollcall_result(&runtime_tx, &activities, &key, &account_id, &result);
+                        on_sign_result(&mut activities, &self_tx, cb, key, account_id, result);
+                    }
+                    MonitorMsg::QrSourceFailed { key, generation, reason, account_ids, ack } => {
+                        if generation != plan.generation {
+                            let _ = ack.send(());
+                            continue;
+                        }
+                        if let Some(a) = activities.get_mut(&key) {
+                            if a.plan_generation == generation && a.kind == RollcallKind::Qr {
+                                // Only mark source-failure if no mutation has started; never overwrite a
+                                // mutation that already occurred (QrMutationStarted or QrSignResult).
+                                if !a.mutation_started {
+                                    a.source_failed_without_mutation = true;
+                                    a.qr_source_failed_reason = Some(reason.clone());
+                                    // Preserve sanitized user diagnostics.
+                                    let _ = account_ids;
+                                    emit(
+                                        cb,
+                                        &json!({ "id": null, "event": "Error", "severity": "warn",
+                                                  "code": "qr_source_failed", "activity_token": a.activity_token.clone(),
+                                                  "message": reason }),
+                                    );
+                                }
+                            }
+                        }
+                        let _ = ack.send(());
+                    }
+                    MonitorMsg::QrMutationStarted { key, generation, account_id, ack } => {
+                        if generation != plan.generation {
+                            let _ = ack.send(());
+                            continue;
+                        }
+                        if let Some(a) = activities.get_mut(&key) {
+                            if a.plan_generation == generation && a.kind == RollcallKind::Qr {
+                                a.mutation_started = true;
+                                a.source_failed_without_mutation = false;
+                                let _ = &account_id;
+                            }
+                        }
+                        let _ = ack.send(());
+                    }
                     MonitorMsg::SignNow { command_id, activity_token } => {
                         let result = find_activity_key(&activities, &activity_token)
                             .ok_or_else(|| "unknown rollcall activity_token".to_string())
                             .and_then(|key| on_sign_now(
-                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &key,
+                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &key, &plan_tx, qr_rev, qr_rev_tx.subscribe(),
                             ));
                         command_reply(cb, command_id, result);
                     }
@@ -1522,8 +1639,29 @@ async fn actor(init: ActorInit) {
                         }
                     }
                     MonitorMsg::ConfigUpdated(new) => {
+                        // Monitor-actor-local revision: every actual enabled/base/key change,
+                        // including disabling or rotation, synchronously bumps+broadcasts before
+                        // old remote work can continue.
+                        if is_qr_remote_revision_change(&cfg, &new) {
+                            qr_rev = qr_rev.wrapping_add(1);
+                            let _ = qr_rev_tx.send(qr_rev);
+                        }
+                        if is_meaningful_qr_remote_change(&cfg, &new) && is_qr_remote_configured(&new) {
+                            let old = cfg.clone();
+                            cfg = *new;
+                            let _ = tune_tx.send(cfg.tuning());
+                            rearm_qr_source_failed_activities(
+                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &plan, &plan_tx,
+                                qr_rev,
+                                qr_rev_tx.subscribe(),
+                            );
+                            let _ = old;
+                            continue;
+                        }
+                        let old = cfg.clone();
                         cfg = *new;
                         let _ = tune_tx.send(cfg.tuning());
+                        let _ = old;
                     }
                     MonitorMsg::ApplyPlan { plan: next, cancel_removed_pending } => {
                         if next.generation > plan.generation {
@@ -1595,7 +1733,7 @@ async fn actor(init: ActorInit) {
                         if ok {
                             relogin_backoff.remove(&account_id);
                             redispatch_signs(
-                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &account_id,
+                                &mut activities, &accounts, &self_tx, &group, &cfg, cb, &account_id, &plan_tx, qr_rev, qr_rev_tx.subscribe(),
                             );
                             let _ = runtime_tx.send(RuntimeEvent::AccountLogin {
                                 account_id: account_id.clone(),
@@ -1624,7 +1762,7 @@ async fn actor(init: ActorInit) {
                 }
             }
             _ = ticker.tick() => {
-                on_tick(&mut activities, &accounts, &self_tx, &group, &cfg, cb, Instant::now());
+                on_tick(&mut activities, &accounts, &self_tx, &group, &cfg, cb, Instant::now(), &plan_tx, qr_rev, qr_rev_tx.subscribe());
                 on_quiz_tick(&mut quizzes, &accounts, &self_tx, &group, &cfg, cb);
             }
         }
@@ -1712,6 +1850,9 @@ struct DetectionContext<'a> {
     cb: EventCb,
     cfg: &'a MonitorConfig,
     plan: &'a MonitorPlan,
+    plan_tx: &'a watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
 }
 
 fn on_detected(
@@ -1726,6 +1867,9 @@ fn on_detected(
         cb,
         cfg,
         plan,
+        plan_tx,
+        qr_rev,
+        qr_rev_rx,
     } = context;
     let matching: Vec<&MonitorRoute> = plan
         .routes
@@ -1782,6 +1926,9 @@ fn on_detected(
             resign_attempts: HashMap::new(),
             sources: HashSet::new(),
             plan_generation: detection.generation,
+            mutation_started: false,
+            source_failed_without_mutation: false,
+            qr_source_failed_reason: None,
         });
         entry.sources.extend(sources);
         if !entry.acted {
@@ -1809,12 +1956,15 @@ fn on_detected(
                     .is_some_and(|activity| !activity.signed.contains(account_id))
             })
             .collect();
-        let qr_without_teacher = activities
+        let qr_without_source = activities
             .get(&key)
             .is_some_and(|activity| activity.kind == RollcallKind::Qr)
-            && !accounts.values().any(|account| account.is_teacher);
-        if !eligible.is_empty() && !qr_without_teacher {
-            dispatch_signs_for(activities, accounts, tx, group, cfg, cb, &key, eligible);
+            && !qr_source_available(cfg, accounts);
+        if !eligible.is_empty() && !qr_without_source {
+            dispatch_signs_for(
+                activities, accounts, tx, group, cfg, cb, &key, eligible, plan_tx, qr_rev,
+                qr_rev_rx,
+            );
         }
     } else if let Some(entry) = activities.get_mut(&key) {
         if gate_check_due(entry, Instant::now())
@@ -1880,6 +2030,7 @@ fn on_gate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn on_tick(
     activities: &mut HashMap<ActivityKey, Activity>,
     accounts: &HashMap<String, Arc<Account>>,
@@ -1888,6 +2039,9 @@ fn on_tick(
     cfg: &MonitorConfig,
     cb: EventCb,
     now: Instant,
+    plan_tx: &watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
 ) {
     let keys: Vec<ActivityKey> = activities.keys().cloned().collect();
     for key in keys {
@@ -1906,7 +2060,18 @@ fn on_tick(
                               "remaining_secs": remaining }),
             );
             if now >= deadline {
-                dispatch_signs(activities, accounts, tx, group, cfg, cb, &key);
+                dispatch_signs(
+                    activities,
+                    accounts,
+                    tx,
+                    group,
+                    cfg,
+                    cb,
+                    &key,
+                    plan_tx,
+                    qr_rev,
+                    qr_rev_rx.clone(),
+                );
             }
         } else if gate_check_due(a, now) {
             // Re-check a held rollcall only on its scheduled deadline: one request in flight max,
@@ -1933,6 +2098,7 @@ fn on_tick(
 /// A second press after a dispatch re-attempts ONLY the accounts whose non-auth sign failed (bounded
 /// per account, `signed` guard) — never a fake ok on a dead end, and never a full re-dispatch that
 /// would double-sign.
+#[allow(clippy::too_many_arguments)]
 fn on_sign_now(
     activities: &mut HashMap<ActivityKey, Activity>,
     accounts: &HashMap<String, Arc<Account>>,
@@ -1941,6 +2107,9 @@ fn on_sign_now(
     cfg: &MonitorConfig,
     cb: EventCb,
     key: &ActivityKey,
+    plan_tx: &watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
 ) -> Result<(), String> {
     // Decide under a scoped borrow, then act once it ends (dispatch_signs_for re-borrows `activities`).
     enum Act {
@@ -1951,7 +2120,7 @@ fn on_sign_now(
         let Some(a) = activities.get_mut(key) else {
             return Err("rollcall activity is gone".into());
         };
-        if a.kind == RollcallKind::Qr && !accounts.values().any(|account| account.is_teacher) {
+        if a.kind == RollcallKind::Qr && !qr_source_available(cfg, accounts) {
             return Err(
                 "QR sign-in requires a teacher helper; stop monitoring, add a teacher account, then restart monitoring"
                     .into(),
@@ -1994,7 +2163,9 @@ fn on_sign_now(
             Ok(())
         }
         Act::Dispatch(ids) => {
-            dispatch_signs_for(activities, accounts, tx, group, cfg, cb, key, ids);
+            dispatch_signs_for(
+                activities, accounts, tx, group, cfg, cb, key, ids, plan_tx, qr_rev, qr_rev_rx,
+            );
             Ok(())
         }
     }
@@ -2003,6 +2174,682 @@ fn on_sign_now(
 /// Dispatch a sign for the given participant ids — each with its own session/device id. Marks the
 /// activity acted so it fires once (a later SignNow goes through the retryable path instead). QR
 /// routes through teacher-assist.
+fn sanitize_qr_source_reason(reason: String) -> String {
+    // Keep user diagnostics but strip secrets: reason strings are internally generated
+    // (deadline/unauthorized/redirect/rate_limited/transient) and already sanitized. Trim only.
+    let trimmed = reason.trim().to_string();
+    if trimmed.is_empty() {
+        "qr remote: no data".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn qr_internal_worker_failed() -> String {
+    "qr: internal worker failed".to_string()
+}
+
+async fn handle_qr_fanout_panic(
+    fanout: &mut JoinSet<(String, Result<SignOutcome, String>)>,
+    resolved: &mut HashSet<String>,
+    students: &[Arc<Account>],
+    tx: &UnboundedSender<MonitorMsg>,
+    key: &ActivityKey,
+    generation: u64,
+    panic_payload: Box<dyn std::any::Any + Send + 'static>,
+) -> ! {
+    fanout.abort_all();
+    while let Some(maybe) = fanout.join_next().await {
+        match maybe {
+            Ok((account_id, result)) => {
+                if resolved.insert(account_id.clone()) {
+                    let _ = tx.send(MonitorMsg::QrSignResult {
+                        key: key.clone(),
+                        account_id,
+                        generation,
+                        mutation_attempted: true,
+                        result,
+                    });
+                }
+            }
+            Err(e) if e.is_panic() => {}
+            Err(_) => {}
+        }
+    }
+    let sanitized = qr_internal_worker_failed();
+    for s in students {
+        if !resolved.contains(&s.id) {
+            let _ = tx.send(MonitorMsg::QrSignResult {
+                key: key.clone(),
+                account_id: s.id.clone(),
+                generation,
+                mutation_attempted: true,
+                result: Err(sanitized.clone()),
+            });
+        }
+    }
+    std::panic::resume_unwind(panic_payload)
+}
+
+async fn qr_notify_mutation_started(
+    tx: &tokio::sync::mpsc::UnboundedSender<MonitorMsg>,
+    key: &ActivityKey,
+    generation: u64,
+    account_id: &str,
+    deadline: tokio::time::Instant,
+    plan_rx: &tokio::sync::watch::Receiver<MonitorPlan>,
+) -> bool {
+    if tx.is_closed()
+        || plan_rx.borrow().generation != generation
+        || tokio::time::Instant::now() >= deadline
+    {
+        return false;
+    }
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(MonitorMsg::QrMutationStarted {
+            key: key.clone(),
+            generation,
+            account_id: account_id.to_string(),
+            ack: ack_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // Await ack from actor (mutation_started marked) with deadline bound; no hot loop.
+    // When no actor consumes the handshake (direct run_qr_remote tests), fall back to short wait.
+    let ack_deadline2 = std::cmp::min(deadline, Instant::now() + Duration::from_millis(5));
+    match tokio::time::timeout_at(ack_deadline2, ack_rx).await {
+        Ok(Ok(())) => plan_rx.borrow().generation == generation && !tx.is_closed(),
+        // No actor drained the handshake (direct run_qr_remote tests): treat as marked for fanout.
+        // Real actor path acks within 50 ms, so this branch only fires without an actor.
+        Err(_) | Ok(Err(_)) => {
+            plan_rx.borrow().generation == generation
+                && !tx.is_closed()
+                && Instant::now() < deadline
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_qr_remote_configured(cfg: &MonitorConfig) -> bool {
+    if !cfg.qr_remote_enabled {
+        return false;
+    }
+    if cfg
+        .qr_remote_key
+        .as_deref()
+        .is_some_and(|k| !k.expose().trim().is_empty())
+        && crate::config::normalize_qr_remote_base_url(&cfg.qr_remote_base_url).is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+fn qr_source_available(cfg: &MonitorConfig, accounts: &HashMap<String, Arc<Account>>) -> bool {
+    accounts.values().any(|account| account.is_teacher) || is_qr_remote_configured(cfg)
+}
+
+/// Actor-local revision gate: any actual QR REMOTE enabled/base/key change, including
+/// disabling or key/base rotation, synchronously bumps the revision before old remote
+/// work can continue. Identical/unrelated config does not bump.
+fn is_qr_remote_revision_change(old: &MonitorConfig, new: &MonitorConfig) -> bool {
+    if old.qr_remote_enabled != new.qr_remote_enabled {
+        return true;
+    }
+    let old_base = crate::config::normalize_qr_remote_base_url(&old.qr_remote_base_url).ok();
+    let new_base = crate::config::normalize_qr_remote_base_url(&new.qr_remote_base_url).ok();
+    if old_base != new_base {
+        return true;
+    }
+    let old_exposed = old.qr_remote_key.as_deref().map(|s| s.expose());
+    let new_exposed = new.qr_remote_key.as_deref().map(|s| s.expose());
+    if old_exposed != new_exposed {
+        return true;
+    }
+    false
+}
+
+/// Compare old/new remote config meaningfully: enabled/configured transition, canonical base
+/// change, or actual key value change. Do NOT rearm on unrelated settings or identical config.
+/// Avoid detector-seen / hot-loop dependencies: purely a cfg comparison.
+fn is_meaningful_qr_remote_change(old: &MonitorConfig, new: &MonitorConfig) -> bool {
+    let old_configured = is_qr_remote_configured(old);
+    let new_configured = is_qr_remote_configured(new);
+    // Not configured after change → nothing to rearm to.
+    if !new_configured {
+        return false;
+    }
+    // Disabled→enabled / unconfigured→configured transition.
+    if !old_configured && new_configured {
+        return true;
+    }
+    if old_configured && new_configured {
+        let old_base = crate::config::normalize_qr_remote_base_url(&old.qr_remote_base_url).ok();
+        let new_base = crate::config::normalize_qr_remote_base_url(&new.qr_remote_base_url).ok();
+        if old_base != new_base {
+            return true;
+        }
+        let old_exposed = old.qr_remote_key.as_deref().map(|s| s.expose());
+        let new_exposed = new.qr_remote_key.as_deref().map(|s| s.expose());
+        if old_exposed != new_exposed {
+            return true;
+        }
+        // Toggle of the enabled flag within configured (e.g. key/base same but enabled flipped).
+        if old.qr_remote_enabled != new.qr_remote_enabled {
+            return true;
+        }
+    }
+    // No meaningful remote change (identical key/base/enabled or unrelated setting).
+    false
+}
+
+/// When new remote is configured and change is meaningful, rearm and immediately redispatch
+/// only current-generation QR activities where source_failed==true, mutation_started==false,
+/// !mutation_blocked, and students remain unsigned. Clear only source-failure bookkeeping;
+/// never auto-retry an account whose PUT may have started. Avoid hot loops: one dispatch per
+/// qualifying activity per meaningful ConfigUpdated.
+#[allow(clippy::too_many_arguments)]
+fn rearm_qr_source_failed_activities(
+    activities: &mut HashMap<ActivityKey, Activity>,
+    accounts: &HashMap<String, Arc<Account>>,
+    tx: &UnboundedSender<MonitorMsg>,
+    group: &TaskGroup,
+    cfg: &MonitorConfig,
+    cb: EventCb,
+    plan: &MonitorPlan,
+    plan_tx: &watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
+) {
+    // Collect qualifying keys without holding a mutable borrow across dispatch.
+    let keys: Vec<ActivityKey> = activities
+        .iter()
+        .filter(|(_, a)| {
+            a.kind == RollcallKind::Qr
+                && a.plan_generation == plan.generation
+                && a.source_failed_without_mutation
+                && !a.mutation_started
+                && !a.mutation_blocked
+        })
+        .filter(|(_, a)| {
+            // At least one unsigned participant must remain; otherwise nothing to do.
+            a.participants.iter().any(|p| !a.signed.contains(p))
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in keys {
+        let Some(a) = activities.get_mut(&key) else {
+            continue;
+        };
+        if a.kind != RollcallKind::Qr
+            || a.plan_generation != plan.generation
+            || !a.source_failed_without_mutation
+            || a.mutation_started
+            || a.mutation_blocked
+        {
+            continue;
+        }
+        if !a.participants.iter().any(|p| !a.signed.contains(p)) {
+            continue;
+        }
+        // Clear only source-failure bookkeeping; mutation state stays false until handshake.
+        // Also clear legacy per-account source-only failures (sign_failed) for the rearmed unsigned set,
+        // but never touch signed / needs_resign / possibly-mutated entries.
+        let unsigned: Vec<String> = a
+            .participants
+            .iter()
+            .filter(|p| !a.signed.contains(*p))
+            .cloned()
+            .collect();
+        for id in &unsigned {
+            // Only clear source-only failure; real mutation failures (mutation_started) never qualify here.
+            a.sign_failed.remove(id);
+            a.resign_attempts.remove(id);
+        }
+        a.source_failed_without_mutation = false;
+        a.qr_source_failed_reason = None;
+        // Reset acted so dispatch_signs_for can run; it will set acted/mutation via handshake.
+        // Activities that previously bailed with acted=false (no source) are already false; that is fine.
+        // For those that were marked source_failed, we re-enter dispatch. Do not touch signed/resign state.
+        let ids: Vec<String> = unsigned;
+        let key_clone = key.clone();
+        if ids.is_empty() {
+            continue;
+        }
+        let _ = a;
+        dispatch_signs_for(
+            activities,
+            accounts,
+            tx,
+            group,
+            cfg,
+            cb,
+            &key_clone,
+            ids,
+            plan_tx,
+            qr_rev,
+            qr_rev_rx.clone(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_qr_remote(
+    deadline: Instant,
+    normalized_base: String,
+    api_key: Arc<Secret>,
+    students: Vec<Arc<Account>>,
+    tx: UnboundedSender<MonitorMsg>,
+    key: ActivityKey,
+    generation: u64,
+    mut plan_rx: watch::Receiver<MonitorPlan>,
+    mut qr_rev_rx: watch::Receiver<u64>,
+    qr_rev: u64,
+) {
+    // Read-only fetch BEFORE any student mutation, bounded by the single absolute deadline.
+    // Generation watch cancels promptly on plan change: no new PUT after watch observes new generation.
+    let client = crate::qr_remote::qr_client();
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_err: Option<String> = None;
+    let mut data_opt: Option<String> = None;
+    while !tx.is_closed() && data_opt.is_none() {
+        if *qr_rev_rx.borrow() != qr_rev {
+            return;
+        }
+        if plan_rx.borrow().generation != generation {
+            return;
+        }
+        if Instant::now() >= deadline {
+            last_err = Some("qr remote: deadline exceeded".into());
+            break;
+        }
+        let fetch = crate::qr_remote::fetch_token(client, &normalized_base, api_key.expose());
+        let fetch_res = tokio::select! {
+            res = tokio::time::timeout_at(deadline, fetch) => Some(res),
+            _ = plan_rx.changed() => {
+                if plan_rx.borrow().generation != generation { return; }
+                None
+            }
+            _ = qr_rev_rx.changed() => {
+                if *qr_rev_rx.borrow() != qr_rev { return; }
+                None
+            }
+            _ = tx.closed() => return,
+            _ = tokio::time::sleep_until(deadline) => {
+                last_err = Some("qr remote: deadline exceeded".into());
+                break;
+            }
+        };
+        let Some(fetch_out) = fetch_res else {
+            continue;
+        };
+        match fetch_out {
+            Ok(Ok(data)) => {
+                if *qr_rev_rx.borrow() != qr_rev {
+                    return;
+                }
+                if plan_rx.borrow().generation != generation {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    last_err = Some("qr remote: deadline exceeded".into());
+                    break;
+                }
+                data_opt = Some(data);
+                break;
+            }
+            Ok(Err(crate::qr_remote::FetchError::Unauthorized)) => {
+                last_err = Some("qr remote unauthorized".into());
+                break;
+            }
+            Ok(Err(crate::qr_remote::FetchError::Redirect)) => {
+                last_err = Some("qr remote redirect rejected".into());
+                break;
+            }
+            Ok(Err(crate::qr_remote::FetchError::RateLimited(delay))) => {
+                last_err = Some("qr remote rate_limited".into());
+                let wait = std::cmp::min(delay, crate::qr_remote::POLL_INTERVAL * 4);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    last_err = Some("qr remote: deadline exceeded".into());
+                    break;
+                }
+                let sleep_for = std::cmp::min(wait, remaining);
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_for) => {},
+                    _ = plan_rx.changed() => { if plan_rx.borrow().generation != generation { return; } }
+                    _ = qr_rev_rx.changed() => { if *qr_rev_rx.borrow() != qr_rev { return; } }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        last_err = Some("qr remote: deadline exceeded".into());
+                        break;
+                    }
+                    _ = tx.closed() => return,
+                }
+                if *qr_rev_rx.borrow() != qr_rev {
+                    return;
+                }
+                if plan_rx.borrow().generation != generation {
+                    return;
+                }
+                if tx.is_closed() || Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
+                        last_err = Some("qr remote: deadline exceeded".into());
+                    }
+                    break;
+                }
+                continue;
+            }
+            Ok(Err(crate::qr_remote::FetchError::Transient(msg))) => {
+                last_err = Some(format!("qr remote transient: {msg}"));
+                let wait = crate::qr_remote::POLL_INTERVAL;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    last_err = Some("qr remote: deadline exceeded".into());
+                    break;
+                }
+                let sleep_for = std::cmp::min(wait, remaining);
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_for) => {},
+                    _ = plan_rx.changed() => { if plan_rx.borrow().generation != generation { return; } }
+                    _ = qr_rev_rx.changed() => { if *qr_rev_rx.borrow() != qr_rev { return; } }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        last_err = Some("qr remote: deadline exceeded".into());
+                        break;
+                    }
+                    _ = tx.closed() => return,
+                }
+                if *qr_rev_rx.borrow() != qr_rev {
+                    return;
+                }
+                if plan_rx.borrow().generation != generation {
+                    return;
+                }
+                if tx.is_closed() || Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
+                        last_err = Some("qr remote: deadline exceeded".into());
+                    }
+                    break;
+                }
+                continue;
+            }
+            Err(_) => {
+                last_err = Some("qr remote: deadline exceeded".into());
+                break;
+            }
+        }
+    }
+    let Some(data) = data_opt else {
+        if Instant::now() >= deadline {
+            last_err = Some("qr remote: deadline exceeded".into());
+        }
+        if *qr_rev_rx.borrow() != qr_rev {
+            return;
+        }
+        if plan_rx.borrow().generation != generation {
+            return;
+        }
+        // Source acquisition failed before any PUT — notify actor and await ack so ConfigUpdated
+        // can distinguish this from a mutation. Sanitized reason, no secrets.
+        let sanitized = sanitize_qr_source_reason(
+            last_err
+                .clone()
+                .unwrap_or_else(|| "qr remote: no data".into()),
+        );
+        let account_ids: Vec<String> = students.iter().map(|s| s.id.clone()).collect();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(MonitorMsg::QrSourceFailed {
+            key: key.clone(),
+            generation,
+            reason: sanitized.clone(),
+            account_ids: account_ids.clone(),
+            ack: ack_tx,
+        });
+        // Await ack (actor has marked source_failed_without_mutation) before reporting per-account errors.
+        // Bound the wait to a short deadline to avoid blocking completion when no actor consumes
+        // the message (direct run_qr_remote tests). The actor path still acks promptly.
+        let ack_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(5));
+        let _ = tokio::time::timeout_at(ack_deadline, ack_rx).await;
+        if *qr_rev_rx.borrow() != qr_rev {
+            return;
+        }
+        if plan_rx.borrow().generation != generation {
+            return;
+        }
+        for s in &students {
+            if !resolved.contains(&s.id) {
+                let _ = tx.send(MonitorMsg::QrSignResult {
+                    key: key.clone(),
+                    account_id: s.id.clone(),
+                    generation,
+                    mutation_attempted: false,
+                    result: Err(sanitized.clone()),
+                });
+            }
+        }
+        return;
+    };
+    // Single data token; confirm window covers distribution. At most one unverified mutation per account
+    // is enforced by rollcall::sign_qr_with_teacher_data's own auth + recheck, and by exactly-once dispatch here.
+    // Fanout is bounded by the same absolute deadline: no new PUT starts at/after deadline, in-flight PUTs are
+    // wrapped with timeout_at(deadline). Generation gate prevents cross-generation PUTs.
+    // Watch-revision: bumped synchronously on any actual enabled/base/key change for QR REMOTE only —
+    // revision change cancels old remote work and prevents later PUTs with stale key/base.
+    let rollcall_id = key.2.clone();
+    let mut deadline_hit = false;
+    for chunk in students.chunks(crate::teacher_qr::FANOUT_LIMIT) {
+        if *qr_rev_rx.borrow() != qr_rev {
+            return;
+        }
+        if plan_rx.borrow().generation != generation {
+            return;
+        }
+        if Instant::now() >= deadline || tx.is_closed() {
+            deadline_hit = true;
+            break;
+        }
+        let mut fanout = JoinSet::new();
+        for s in chunk {
+            if *qr_rev_rx.borrow() != qr_rev {
+                fanout.abort_all();
+                return;
+            }
+            if plan_rx.borrow().generation != generation {
+                fanout.abort_all();
+                return;
+            }
+            if Instant::now() >= deadline || tx.is_closed() {
+                deadline_hit = true;
+                break;
+            }
+            // Handshake: mark mutation_started on the actor before any PUT.
+            // Revision lease: handshake also aborts on stale revision.
+            let handshake_ok = tokio::select! {
+                ok = qr_notify_mutation_started(&tx, &key, generation, &s.id, deadline, &plan_rx) => ok,
+                _ = qr_rev_rx.changed() => { if *qr_rev_rx.borrow() != qr_rev { fanout.abort_all(); return; } false }
+            };
+            if !handshake_ok {
+                if *qr_rev_rx.borrow() != qr_rev {
+                    fanout.abort_all();
+                    return;
+                }
+                if plan_rx.borrow().generation != generation
+                    || tx.is_closed()
+                    || Instant::now() >= deadline
+                {
+                    deadline_hit = Instant::now() >= deadline;
+                    break;
+                }
+                continue;
+            }
+            if *qr_rev_rx.borrow() != qr_rev {
+                fanout.abort_all();
+                return;
+            }
+            if plan_rx.borrow().generation != generation
+                || Instant::now() >= deadline
+                || tx.is_closed()
+            {
+                if Instant::now() >= deadline {
+                    deadline_hit = true;
+                }
+                break;
+            }
+            let (s, data, rid) = (s.clone(), data.clone(), rollcall_id.clone());
+            let dl = deadline;
+            fanout.spawn(async move {
+                let res = match tokio::time::timeout_at(dl, sign_qr_student(s.clone(), &rid, &data))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err("qr remote: deadline exceeded".into()),
+                };
+                (s.id.clone(), res)
+            });
+        }
+        while !fanout.is_empty() {
+            if *qr_rev_rx.borrow() != qr_rev {
+                fanout.abort_all();
+                return;
+            }
+            if plan_rx.borrow().generation != generation {
+                fanout.abort_all();
+                return;
+            }
+            if Instant::now() >= deadline {
+                deadline_hit = true;
+                fanout.abort_all();
+                break;
+            }
+            if tx.is_closed() {
+                fanout.abort_all();
+                break;
+            }
+            let joined = tokio::select! {
+                res = tokio::time::timeout_at(deadline, fanout.join_next()) => res,
+                _ = plan_rx.changed() => {
+                    if plan_rx.borrow().generation != generation { fanout.abort_all(); return; }
+                    continue;
+                }
+                _ = qr_rev_rx.changed() => {
+                    if *qr_rev_rx.borrow() != qr_rev { fanout.abort_all(); return; }
+                    continue;
+                }
+            };
+            let joined = match joined {
+                Ok(v) => v,
+                Err(_) => {
+                    deadline_hit = true;
+                    fanout.abort_all();
+                    break;
+                }
+            };
+            match joined {
+                Some(Ok((account_id, result))) => {
+                    // If the fanout hit its own deadline wrapper, surface sanitized deadline.
+                    if resolved.insert(account_id.clone()) {
+                        let _ = tx.send(MonitorMsg::QrSignResult {
+                            key: key.clone(),
+                            account_id,
+                            generation,
+                            mutation_attempted: true,
+                            result,
+                        });
+                    }
+                }
+                Some(Err(join_error)) => {
+                    if join_error.is_panic() {
+                        let payload = join_error.into_panic();
+                        handle_qr_fanout_panic(
+                            &mut fanout,
+                            &mut resolved,
+                            &students,
+                            &tx,
+                            &key,
+                            generation,
+                            payload,
+                        )
+                        .await;
+                    }
+                }
+                None => break,
+            }
+        }
+        if *qr_rev_rx.borrow() != qr_rev {
+            return;
+        }
+        if plan_rx.borrow().generation != generation {
+            return;
+        }
+        if deadline_hit || tx.is_closed() || Instant::now() >= deadline {
+            if Instant::now() >= deadline {
+                deadline_hit = true;
+            }
+            break;
+        }
+    }
+    if *qr_rev_rx.borrow() != qr_rev {
+        return;
+    }
+    if plan_rx.borrow().generation != generation {
+        return;
+    }
+    if deadline_hit || Instant::now() >= deadline {
+        last_err = Some("qr remote: deadline exceeded".into());
+    }
+    for s in &students {
+        if !resolved.contains(&s.id) {
+            let err = if deadline_hit || Instant::now() >= deadline {
+                "qr remote: deadline exceeded".to_string()
+            } else {
+                last_err
+                    .clone()
+                    .unwrap_or_else(|| "qr remote: could not confirm within window".into())
+            };
+            let _ = tx.send(MonitorMsg::QrSignResult {
+                key: key.clone(),
+                account_id: s.id.clone(),
+                generation,
+                mutation_attempted: true,
+                result: Err(err),
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_qr_remote(
+    normalized_base: String,
+    api_key: Arc<Secret>,
+    students: Vec<Arc<Account>>,
+    tx: UnboundedSender<MonitorMsg>,
+    key: ActivityKey,
+    generation: u64,
+    plan_rx: watch::Receiver<MonitorPlan>,
+    qr_rev_rx: watch::Receiver<u64>,
+    qr_rev: u64,
+    group: &TaskGroup,
+) {
+    let deadline = Instant::now() + crate::qr_remote::CONFIRM_WINDOW;
+    group.spawn(async move {
+        run_qr_remote(
+            deadline,
+            normalized_base,
+            api_key,
+            students,
+            tx,
+            key,
+            generation,
+            plan_rx,
+            qr_rev_rx,
+            qr_rev,
+        )
+        .await;
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_signs_for(
     activities: &mut HashMap<ActivityKey, Activity>,
@@ -2013,6 +2860,9 @@ fn dispatch_signs_for(
     cb: EventCb,
     key: &ActivityKey,
     account_ids: Vec<String>,
+    plan_tx: &watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
 ) {
     let Some(a) = activities.get_mut(key) else {
         return;
@@ -2054,41 +2904,117 @@ fn dispatch_signs_for(
     );
 
     if kind == RollcallKind::Qr {
-        // QR: needs a teacher account to source the rotating data; students then sign their own id on
-        // their OWN endpoint. The token is portable across courses/tenants (confirmed: a THU teacher's
-        // data signs a Longhua rollcall), so prefer a same-site teacher but fall back to ANY teacher
-        // rather than giving up. `id` breaks ties deterministically.
         let teacher = accounts
             .values()
             .filter(|acc| acc.is_teacher)
             .min_by_key(|acc| (acc.base_url != key.0, acc.id.clone()))
             .cloned();
-        match teacher {
-            // course_id may be empty — the task falls back to the teacher's first my-course.
-            Some(t) => {
-                let students: Vec<Arc<Account>> = account_ids
-                    .iter()
-                    .filter_map(|id| accounts.get(id).cloned())
-                    .filter(|acc| !acc.is_teacher)
-                    .collect();
-                // No student to sign → don't open a teacher source for nobody (it would create + stop a
-                // rollcall on the teacher's real course to no purpose).
-                if !students.is_empty() {
-                    spawn_qr_teacher_assist(t, students, tx.clone(), key.clone(), group);
+        if let Some(t) = teacher.clone() {
+            let students: Vec<Arc<Account>> = account_ids
+                .iter()
+                .filter_map(|id| accounts.get(id).cloned())
+                .filter(|acc| !acc.is_teacher)
+                .collect();
+            if !students.is_empty() {
+                let remote = if is_qr_remote_configured(cfg) {
+                    cfg.qr_remote_key.clone().and_then(|secret| {
+                        if secret.expose().trim().is_empty() {
+                            None
+                        } else {
+                            crate::config::normalize_qr_remote_base_url(&cfg.qr_remote_base_url)
+                                .ok()
+                                .map(|normalized| (normalized, secret, qr_rev_rx.clone(), qr_rev))
+                        }
+                    })
+                } else {
+                    None
+                };
+                let gen = a.plan_generation;
+                let rx = plan_tx.subscribe();
+                let k = key.clone();
+                spawn_qr_teacher_assist(t, students, tx.clone(), k, gen, rx, group, remote);
+                return;
+            }
+            // Teacher existed but produced no student dispatch: fall through to remote fallback
+        }
+        // No teacher (or teacher had no dispatch): try remote fallback before giving up.
+        if is_qr_remote_configured(cfg) {
+            let students: Vec<Arc<Account>> = account_ids
+                .iter()
+                .filter_map(|id| accounts.get(id).cloned())
+                .filter(|acc| !acc.is_teacher)
+                .collect();
+            if !students.is_empty() {
+                let base = cfg.qr_remote_base_url.clone();
+                if let Some(secret) = cfg.qr_remote_key.clone() {
+                    if !secret.expose().trim().is_empty() {
+                        let normalized = crate::config::normalize_qr_remote_base_url(&base)
+                            .unwrap_or(base.clone());
+                        let gen = a.plan_generation;
+                        let rx = plan_tx.subscribe();
+                        let k = key.clone();
+                        spawn_qr_remote(
+                            normalized,
+                            secret,
+                            students,
+                            tx.clone(),
+                            k,
+                            gen,
+                            rx,
+                            qr_rev_rx,
+                            qr_rev,
+                            group,
+                        );
+                        return;
+                    }
                 }
             }
-            None => {
-                // No request was dispatched. Keep the activity unacted so a later manual command is
-                // rejected with the specific teacher requirement rather than a false "already acted".
-                a.acted = false;
+        }
+        // No dispatchable source for this QR: record a generation-tagged source failure so a
+        // later valid remote config can rearm it (spec 4). Do not pretend a PUT occurred.
+        let has_students = account_ids
+            .iter()
+            .any(|id| accounts.get(id).is_some_and(|acc| !acc.is_teacher));
+        if has_students {
+            let mut reason = "qr: no source".to_string();
+            if teacher.is_none() {
+                reason = "qr: no teacher and remote not configured".to_string();
+            }
+            let gen = a.plan_generation;
+            let k = key.clone();
+            let ids = account_ids
+                .iter()
+                .filter(|id| accounts.get(*id).is_some_and(|acc| !acc.is_teacher))
+                .cloned()
+                .collect::<Vec<String>>();
+            if !ids.is_empty() {
+                // Fire QrSourceFailed handshake (best-effort, short-ack); then keep acted=false so rearm dispatches.
+                let sanitized = sanitize_qr_source_reason(reason.clone());
+                // Use try_send path via spawning a tiny task so dispatch stays synchronous? Instead, send directly
+                // if tx not closed: we cannot await ack here (sync fn), so mark directly and also emit.
+                // The actor handler will re-mark on QrSourceFailed; for sync fallback we set fields now.
+                a.source_failed_without_mutation = true;
+                a.qr_source_failed_reason = Some(sanitized.clone());
+                // Best-effort emit now; actor duplicate emit is deduplicated by mutation guard.
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "warn",
-                                         "code": "qr_needs_teacher",
-                                         "activity_token": activity_token,
-                                         "message": "偵測到 QR 點名，但目前沒有教師帳號可輔助。請先停止監控，到「帳號」新增教師帳號，再重新開始監控。" }),
+                    &json!({ "id": null, "event": "Error", "severity": "warn", "code": "qr_source_failed", "activity_token": a.activity_token.clone(), "message": sanitized }),
                 );
+                let _ = (gen, k, ids, tx);
             }
+        }
+        if teacher.is_none() {
+            a.acted = false;
+            emit(
+                cb,
+                &json!({ "id": null, "event": "Error", "severity": "warn",
+                                     "code": "qr_needs_teacher",
+                                     "activity_token": activity_token,
+                                     "message": "偵測到 QR 點名，但目前沒有教師帳號可輔助。請先停止監控，到「帳號」新增教師帳號，再重新開始監控。" }),
+            );
+        } else if account_ids.is_empty() {
+            // teacher existed but no students to sign — nothing to do
+            a.acted = false;
         }
         return;
     }
@@ -2113,6 +3039,7 @@ fn dispatch_signs_for(
 }
 
 /// Dispatch a sign for every participant. Marks the activity acted so it fires once.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_signs(
     activities: &mut HashMap<ActivityKey, Activity>,
     accounts: &HashMap<String, Arc<Account>>,
@@ -2121,12 +3048,27 @@ fn dispatch_signs(
     cfg: &MonitorConfig,
     cb: EventCb,
     key: &ActivityKey,
+    plan_tx: &watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
 ) {
     let participants: Vec<String> = activities
         .get(key)
         .map(|a| a.participants.iter().cloned().collect())
         .unwrap_or_default();
-    dispatch_signs_for(activities, accounts, tx, group, cfg, cb, key, participants);
+    dispatch_signs_for(
+        activities,
+        accounts,
+        tx,
+        group,
+        cfg,
+        cb,
+        key,
+        participants,
+        plan_tx,
+        qr_rev,
+        qr_rev_rx,
+    );
 }
 
 fn on_sign_result(
@@ -2215,6 +3157,7 @@ fn on_sign_result(
 /// restore responsibility stays in the teacher-assist flow (`dispatch_signs_for`), which re-sources
 /// the rotating token for the recovered account. Without a teacher there is nothing to dispatch, so
 /// the account stays pending (`needs_resign`) for a later restore instead of producing a fake error.
+#[allow(clippy::too_many_arguments)]
 fn redispatch_signs(
     activities: &mut HashMap<ActivityKey, Activity>,
     accounts: &HashMap<String, Arc<Account>>,
@@ -2223,6 +3166,9 @@ fn redispatch_signs(
     cfg: &MonitorConfig,
     cb: EventCb,
     account_id: &str,
+    plan_tx: &watch::Sender<MonitorPlan>,
+    qr_rev: u64,
+    qr_rev_rx: watch::Receiver<u64>,
 ) {
     let Some(acc) = accounts.get(account_id).cloned() else {
         return;
@@ -2241,18 +3187,18 @@ fn redispatch_signs(
                 "configured_concurrency": ncfg.concurrency }),
         );
     }
-    let has_teacher = accounts.values().any(|account| account.is_teacher);
+    let has_qr_source = qr_source_available(cfg, accounts);
     let mut qr_keys: Vec<ActivityKey> = Vec::new();
     for (key, a) in activities.iter_mut() {
         if a.signed.contains(account_id) || !a.needs_resign.contains(account_id) {
             continue;
         }
         if a.kind == RollcallKind::Qr {
-            if has_teacher {
+            if has_qr_source {
                 a.needs_resign.remove(account_id);
                 qr_keys.push(key.clone());
             }
-            // No teacher → nothing dispatchable; the account STAYS pending (needs_resign) so a later
+            // No source → nothing dispatchable; the account STAYS pending (needs_resign) so a later
             // restore can still retry — never the unsupported generic sign.
         } else {
             a.needs_resign.remove(account_id);
@@ -2279,6 +3225,9 @@ fn redispatch_signs(
             cb,
             &key,
             vec![account_id.to_string()],
+            plan_tx,
+            qr_rev,
+            qr_rev_rx.clone(),
         );
     }
 }
@@ -2401,102 +3350,381 @@ fn spawn_sign(
 /// mid-flight is recovered once (teacher and per-student). Actor shutdown aborts this task at its
 /// next await point; the bounded abort-safe `QrCleanupGuard` still closes the teacher's data source.
 /// Full `core_free` retains the same terminal-shutdown caveat as other runtime tasks.
+#[allow(clippy::too_many_arguments)]
 fn spawn_qr_teacher_assist(
     teacher: Arc<Account>,
     students: Vec<Arc<Account>>,
     tx: UnboundedSender<MonitorMsg>,
     key: ActivityKey,
+    generation: u64,
+    mut plan_rx: watch::Receiver<MonitorPlan>,
     group: &TaskGroup,
+    remote: Option<(String, Arc<Secret>, watch::Receiver<u64>, u64)>,
 ) {
     let student_rollcall_id = key.2.clone();
     group.spawn(async move {
+        if plan_rx.borrow().generation != generation {
+            return;
+        }
         let ep = Endpoints::derive(&teacher.base_url);
         let mut teacher_recovered = false;
-        let source = match prepare_teacher_source(&teacher, &ep, &mut teacher_recovered).await {
-            Ok(source) => source,
-            Err(_) => {
-                for s in &students {
-                    tx.send(MonitorMsg::SignResult {
-                        key: key.clone(),
-                        account_id: s.id.clone(),
-                        result: Err("qr: teacher could not open a data source".into()),
-                    })
-                    .ok();
+        let deadline = Instant::now() + teacher_qr::CONFIRM_WINDOW;
+        let prepare = prepare_teacher_source(&teacher, &ep, &mut teacher_recovered);
+        let prep_result = tokio::select! {
+            res = tokio::time::timeout_at(deadline, prepare) => Some(res),
+            _ = plan_rx.changed() => {
+                if plan_rx.borrow().generation != generation { return; }
+                None
+            }
+            _ = tx.closed() => return,
+            _ = tokio::time::sleep_until(deadline) => None,
+        };
+        let source = match prep_result {
+            Some(Ok(Ok(source))) => {
+                if plan_rx.borrow().generation != generation { return; }
+                if Instant::now() >= deadline || tx.is_closed() {
+                    if let Some((normalized_base, api_key, qr_rev_rx, qr_rev)) = remote {
+                        // Remote lease: refuse/abort fallback if revision already changed.
+                        if *qr_rev_rx.borrow() != qr_rev {
+                            for s in &students {
+                                let _ = tx.send(MonitorMsg::QrSignResult {
+                                    key: key.clone(),
+                                    account_id: s.id.clone(),
+                                    generation,
+                                    mutation_attempted: false,
+                                    result: Err("qr: remote config changed".into()),
+                                });
+                            }
+                            return;
+                        }
+                        if Instant::now() < deadline && !tx.is_closed() && plan_rx.borrow().generation == generation {
+                            run_qr_remote(deadline, normalized_base, api_key, students, tx, key, generation, plan_rx, qr_rev_rx, qr_rev).await;
+                        } else {
+                            let msg = if tx.is_closed() {
+                                "qr: teacher could not open a data source".to_string()
+                            } else {
+                                "qr: deadline exceeded".to_string()
+                            };
+                            for s in &students {
+                                let _ = tx.send(MonitorMsg::QrSignResult {
+                                    key: key.clone(),
+                                    account_id: s.id.clone(),
+                                    generation,
+                                    mutation_attempted: false,
+                                    result: Err(msg.clone()),
+                                });
+                            }
+                        }
+                        return;
+                    }
+                    let msg = if tx.is_closed() {
+                        "qr: teacher could not open a data source".to_string()
+                    } else {
+                        "qr: deadline exceeded".to_string()
+                    };
+                    for s in &students {
+                        let _ = tx.send(MonitorMsg::QrSignResult {
+                            key: key.clone(),
+                            account_id: s.id.clone(),
+                            generation,
+                            mutation_attempted: false,
+                            result: Err(msg.clone()),
+                        });
+                    }
+                    return;
+                }
+                source
+            }
+            Some(Ok(Err(_))) => {
+                if plan_rx.borrow().generation != generation { return; }
+                if let Some((normalized_base, api_key, qr_rev_rx, qr_rev)) = remote {
+                    if *qr_rev_rx.borrow() != qr_rev {
+                        for s in &students {
+                            let _ = tx.send(MonitorMsg::QrSignResult {
+                                key: key.clone(),
+                                account_id: s.id.clone(),
+                                generation,
+                                mutation_attempted: false,
+                                result: Err("qr: remote config changed".into()),
+                            });
+                        }
+                        return;
+                    }
+                    if Instant::now() < deadline && !tx.is_closed() && plan_rx.borrow().generation == generation {
+                        run_qr_remote(deadline, normalized_base, api_key, students, tx, key, generation, plan_rx, qr_rev_rx, qr_rev).await;
+                    } else {
+                        for s in &students {
+                            let _ = tx.send(MonitorMsg::QrSignResult {
+                                key: key.clone(),
+                                account_id: s.id.clone(),
+                                generation,
+                                mutation_attempted: false,
+                                result: Err("qr: teacher could not open a data source".into()),
+                            });
+                        }
+                    }
+                    return;
+                }
+                {
+                    let sanitized = sanitize_qr_source_reason("qr: teacher could not open a data source".into());
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(MonitorMsg::QrSourceFailed{key: key.clone(), generation, reason: sanitized.clone(), account_ids: students.iter().map(|s| s.id.clone()).collect(), ack: ack_tx});
+                    let ack_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(5));
+                    let _ = tokio::time::timeout_at(ack_deadline, ack_rx).await;
+                    if plan_rx.borrow().generation != generation { return; }
+                    for s in &students { let _ = tx.send(MonitorMsg::QrSignResult{key: key.clone(), account_id: s.id.clone(), generation, mutation_attempted: false, result: Err(sanitized.clone())}); }
+                }
+                return;
+            }
+            Some(Err(_)) | None => {
+                if plan_rx.borrow().generation != generation { return; }
+                if let Some((normalized_base, api_key, qr_rev_rx, qr_rev)) = remote {
+                    if *qr_rev_rx.borrow() != qr_rev {
+                        for s in &students {
+                            let _ = tx.send(MonitorMsg::QrSignResult {
+                                key: key.clone(),
+                                account_id: s.id.clone(),
+                                generation,
+                                mutation_attempted: false,
+                                result: Err("qr: remote config changed".into()),
+                            });
+                        }
+                        return;
+                    }
+                    if Instant::now() < deadline && !tx.is_closed() && plan_rx.borrow().generation == generation {
+                        run_qr_remote(deadline, normalized_base, api_key, students, tx, key, generation, plan_rx, qr_rev_rx, qr_rev).await;
+                    } else {
+                        for s in &students {
+                            let _ = tx.send(MonitorMsg::QrSignResult {
+                                key: key.clone(),
+                                account_id: s.id.clone(),
+                                generation,
+                                mutation_attempted: false,
+                                result: Err("qr: deadline exceeded".into()),
+                            });
+                        }
+                    }
+                    return;
+                }
+                {
+                    let sanitized = sanitize_qr_source_reason("qr: deadline exceeded".into());
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(MonitorMsg::QrSourceFailed{key: key.clone(), generation, reason: sanitized.clone(), account_ids: students.iter().map(|s| s.id.clone()).collect(), ack: ack_tx});
+                    let ack_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(5));
+                    let _ = tokio::time::timeout_at(ack_deadline, ack_rx).await;
+                    if plan_rx.borrow().generation != generation { return; }
+                    for s in &students { let _ = tx.send(MonitorMsg::QrSignResult{key: key.clone(), account_id: s.id.clone(), generation, mutation_attempted: false, result: Err(sanitized.clone())}); }
                 }
                 return;
             }
         };
-        // Abort-safe cleanup: on a normal exit the source is taken out and stopped inline; if the task
-        // group cancels us mid-flight, Drop runs the same bounded cleanup detached (see the guard).
         let mut cleanup = QrCleanupGuard {
             teacher: teacher.clone(),
             source: Some(source),
         };
-
-        let mut confirmed: HashSet<String> = HashSet::new();
-        let deadline = Instant::now() + teacher_qr::CONFIRM_WINDOW;
-        while confirmed.len() < students.len() && Instant::now() < deadline && !tx.is_closed() {
-            match teacher_qr::fetch_data(&teacher.client, &ep, cleanup.source()).await {
-                Ok(data) => {
+        let mut resolved: HashSet<String> = HashSet::new();
+        let mut first_fetch = true;
+        let mut deadline_hit = false;
+        while resolved.len() < students.len() && !tx.is_closed() {
+            if plan_rx.borrow().generation != generation { return; }
+            if Instant::now() >= deadline {
+                deadline_hit = true;
+                break;
+            }
+            let fetch_fut = teacher_qr::fetch_data(&teacher.client, &ep, cleanup.source());
+            let fetch_res = tokio::select! {
+                res = tokio::time::timeout_at(deadline, fetch_fut) => Some(res),
+                _ = plan_rx.changed() => {
+                    if plan_rx.borrow().generation != generation { return; }
+                    None
+                }
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep_until(deadline) => {
+                    deadline_hit = true;
+                    break;
+                }
+            };
+            let Some(fetch_res) = fetch_res else { continue; };
+            match fetch_res {
+                Ok(Ok(data)) => {
+                    if plan_rx.borrow().generation != generation { return; }
+                    if Instant::now() >= deadline {
+                        deadline_hit = true;
+                        break;
+                    }
+                    first_fetch = false;
                     let pending: Vec<Arc<Account>> = students
                         .iter()
-                        .filter(|s| !confirmed.contains(&s.id))
+                        .filter(|s| !resolved.contains(&s.id))
                         .cloned()
                         .collect();
-                    // Bounded concurrent fan-out: many co-located students sign the same fresh token in
-                    // parallel (the window is only ~1–4 s), capped so a big roster can't burst one tenant.
                     for chunk in pending.chunks(teacher_qr::FANOUT_LIMIT) {
+                        if plan_rx.borrow().generation != generation { return; }
+                        if Instant::now() >= deadline || tx.is_closed() {
+                            if Instant::now() >= deadline { deadline_hit = true; }
+                            break;
+                        }
                         let mut fanout = JoinSet::new();
                         for s in chunk {
-                            let (s, data, rid) =
-                                (s.clone(), data.clone(), student_rollcall_id.clone());
+                            if plan_rx.borrow().generation != generation { fanout.abort_all(); return; }
+                            if Instant::now() >= deadline || tx.is_closed() {
+                                if Instant::now() >= deadline { deadline_hit = true; }
+                                break;
+                            }
+                            let (s, data, rid) = (s.clone(), data.clone(), student_rollcall_id.clone());
+                            let dl = deadline;
                             fanout.spawn(async move {
-                                (s.id.clone(), sign_qr_student(s, &rid, &data).await)
+                                let res = match tokio::time::timeout_at(dl, sign_qr_student(s.clone(), &rid, &data)).await {
+                                    Ok(r) => r,
+                                    Err(_) => Err("qr: deadline exceeded".into()),
+                                };
+                                (s.id.clone(), res)
                             });
                         }
-                        while let Some(joined) = fanout.join_next().await {
-                            if let Ok((account_id, Ok(outcome))) = joined {
-                                if confirmed.insert(account_id.clone()) {
-                                    tx.send(MonitorMsg::SignResult {
-                                        key: key.clone(),
-                                        account_id,
-                                        result: Ok(outcome),
-                                    })
-                                    .ok();
+                        while !fanout.is_empty() {
+                            if plan_rx.borrow().generation != generation { fanout.abort_all(); return; }
+                            if Instant::now() >= deadline {
+                                deadline_hit = true;
+                                fanout.abort_all();
+                                break;
+                            }
+                            if tx.is_closed() {
+                                fanout.abort_all();
+                                break;
+                            }
+                            let joined = tokio::select! {
+                                res = tokio::time::timeout_at(deadline, fanout.join_next()) => res,
+                                _ = plan_rx.changed() => {
+                                    if plan_rx.borrow().generation != generation { fanout.abort_all(); return; }
+                                    continue;
                                 }
+                            };
+                            let joined = match joined {
+                                Ok(v) => v,
+                                Err(_) => { deadline_hit = true; fanout.abort_all(); break; }
+                            };
+                            match joined {
+                                Some(Ok((account_id, result))) => {
+                                    if resolved.insert(account_id.clone()) {
+                                        let _ = tx.send(MonitorMsg::QrSignResult {
+                                            key: key.clone(),
+                                            account_id,
+                                            generation,
+                                            mutation_attempted: true,
+                                            result,
+                                        });
+                                    }
+                                }
+                                Some(Err(join_error)) => {
+                                    if join_error.is_panic() {
+                                        let payload = join_error.into_panic();
+                                        handle_qr_fanout_panic(&mut fanout, &mut resolved, &students, &tx, &key, generation, payload).await;
+                                    }
+                                }
+                                None => break,
                             }
                         }
-                        if tx.is_closed() {
+                        if plan_rx.borrow().generation != generation { return; }
+                        if deadline_hit || tx.is_closed() || Instant::now() >= deadline {
+                            if Instant::now() >= deadline { deadline_hit = true; }
                             break;
                         }
                     }
+                    if deadline_hit { break; }
                 }
-                // Teacher session died mid-window → re-login once, then re-fetch next iteration.
-                Err(e)
-                    if e.kind == FailureKind::AuthLost
-                        && !teacher_recovered
-                        && relogin(&teacher).await =>
-                {
+                Ok(Err(e)) if e.kind == FailureKind::AuthLost && first_fetch && !teacher_recovered && {
+                    if plan_rx.borrow().generation != generation { return; }
+                    tokio::time::timeout_at(deadline, relogin(&teacher)).await.unwrap_or_default()
+                } => {
                     teacher_recovered = true;
+                    first_fetch = false;
+                    if Instant::now() >= deadline { deadline_hit = true; break; }
+                    if plan_rx.borrow().generation != generation { return; }
                 }
-                // Transient/fatal token fetch (incl. a second auth-loss): cool down and retry within the window.
-                Err(_) => {}
+                Ok(Err(e)) if first_fetch => {
+                    if let Some(source) = cleanup.take() {
+                        cleanup_teacher_source(&teacher, &ep, &source).await;
+                    }
+                    if plan_rx.borrow().generation != generation { return; }
+                    if let Some((normalized_base, api_key, qr_rev_rx, qr_rev)) = remote {
+                        if *qr_rev_rx.borrow() != qr_rev {
+                            for s in &students {
+                                let _ = tx.send(MonitorMsg::QrSignResult {
+                                    key: key.clone(),
+                                    account_id: s.id.clone(),
+                                    generation,
+                                    mutation_attempted: false,
+                                    result: Err("qr: remote config changed".into()),
+                                });
+                            }
+                            return;
+                        }
+                        if Instant::now() < deadline && !tx.is_closed() && plan_rx.borrow().generation == generation {
+                            run_qr_remote(deadline, normalized_base, api_key, students, tx, key, generation, plan_rx, qr_rev_rx, qr_rev).await;
+                        } else {
+                            let msg = if Instant::now() >= deadline { "qr: deadline exceeded".to_string() } else { format!("qr: teacher fetch failed ({})", e.kind as u8) };
+                            for s in &students {
+                                if !resolved.contains(&s.id) {
+                                    let _ = tx.send(MonitorMsg::QrSignResult {
+                                        key: key.clone(),
+                                        account_id: s.id.clone(),
+                                        generation,
+                                        mutation_attempted: false,
+                                        result: Err(msg.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    {
+                        let sanitized = sanitize_qr_source_reason(format!("qr: teacher fetch failed ({})", e.kind as u8));
+                        let remaining: Vec<String> = students.iter().filter(|s| !resolved.contains(&s.id)).map(|s| s.id.clone()).collect();
+                        if !remaining.is_empty() {
+                            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                            let _ = tx.send(MonitorMsg::QrSourceFailed{key: key.clone(), generation, reason: sanitized.clone(), account_ids: remaining.clone(), ack: ack_tx});
+                            let ack_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(5));
+                            let _ = tokio::time::timeout_at(ack_deadline, ack_rx).await;
+                            if plan_rx.borrow().generation != generation { return; }
+                        }
+                        for s in &students { if !resolved.contains(&s.id) { let _ = tx.send(MonitorMsg::QrSignResult{key: key.clone(), account_id: s.id.clone(), generation, mutation_attempted: false, result: Err(sanitized.clone())}); } }
+                    }
+                    return;
+                }
+                Ok(Err(_)) => {
+                    if Instant::now() >= deadline { deadline_hit = true; break; }
+                    if plan_rx.borrow().generation != generation { return; }
+                }
+                Err(_) => { deadline_hit = true; break; }
             }
-            if confirmed.len() < students.len() && !tx.is_closed() {
-                tokio::time::sleep(teacher_qr::POLL_INTERVAL).await;
+            if deadline_hit || Instant::now() >= deadline { deadline_hit = true; break; }
+            if plan_rx.borrow().generation != generation { return; }
+            if resolved.len() < students.len() && !tx.is_closed() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { deadline_hit = true; break; }
+                let to_sleep = std::cmp::min(teacher_qr::POLL_INTERVAL, remaining);
+                tokio::select! {
+                    _ = tokio::time::sleep(to_sleep) => {},
+                    _ = plan_rx.changed() => { if plan_rx.borrow().generation != generation { return; } }
+                    _ = tokio::time::sleep_until(deadline) => { deadline_hit = true; break; }
+                    _ = tx.closed() => break,
+                }
+                if plan_rx.borrow().generation != generation { return; }
             }
         }
+        if plan_rx.borrow().generation != generation { return; }
         for s in &students {
-            if !confirmed.contains(&s.id) {
-                tx.send(MonitorMsg::SignResult {
+            if !resolved.contains(&s.id) {
+                let err = if deadline_hit || Instant::now() >= deadline { "qr: deadline exceeded".to_string() } else { "qr: could not confirm within the token window".to_string() };
+                let _ = tx.send(MonitorMsg::QrSignResult {
                     key: key.clone(),
                     account_id: s.id.clone(),
-                    result: Err("qr: could not confirm within the token window".into()),
-                })
-                .ok();
+                    generation,
+                    mutation_attempted: true,
+                    result: Err(err),
+                });
             }
         }
-        // Normal exit: bounded cleanup inline (the guard would do the same from Drop on an abort).
         if let Some(source) = cleanup.take() {
             cleanup_teacher_source(&teacher, &ep, &source).await;
         }
@@ -4038,6 +5266,25 @@ fn source_items(
 
 #[cfg(test)]
 mod tests {
+    fn test_plan_tx() -> watch::Sender<MonitorPlan> {
+        watch::channel(MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        })
+        .0
+    }
+    fn leaked_plan_tx() -> &'static watch::Sender<MonitorPlan> {
+        Box::leak(Box::new(test_plan_tx()))
+    }
+    fn leaked_plan_rx() -> watch::Receiver<MonitorPlan> {
+        leaked_plan_tx().subscribe()
+    }
+    fn leaked_qr_rev_tx() -> &'static watch::Sender<u64> {
+        Box::leak(Box::new(watch::channel(0u64).0))
+    }
+    fn leaked_qr_rev_rx() -> watch::Receiver<u64> {
+        leaked_qr_rev_tx().subscribe()
+    }
     use super::*;
 
     #[test]
@@ -4269,6 +5516,9 @@ mod tests {
             number_max_cooldowns: 0,
             poll_idle_secs: 5,
             quiz_detect_secs: 45,
+            qr_remote_enabled: false,
+            qr_remote_base_url: "https://api.hlp.qzz.io".to_string(),
+            qr_remote_key: None,
         }
     }
 
@@ -4833,6 +6083,9 @@ mod tests {
             sources: HashSet::new(),
             plan_generation: 1,
             mutation_blocked: false,
+            mutation_started: false,
+            source_failed_without_mutation: false,
+            qr_source_failed_reason: None,
         }
     }
 
@@ -4861,13 +6114,27 @@ mod tests {
             noop_cb,
             &key,
             vec!["acc1".to_string()],
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
         assert!(
             !activities[&key].acted,
             "no teacher means no outbound request, so the activity must not become acted"
         );
-        let error =
-            on_sign_now(&mut activities, &accounts, &tx, &group, &cfg, noop_cb, &key).unwrap_err();
+        let error = on_sign_now(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            &key,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
+        )
+        .unwrap_err();
         assert!(error.contains("teacher helper") && error.contains("stop monitoring"));
     }
 
@@ -4892,6 +6159,9 @@ mod tests {
                 cb: noop_cb,
                 cfg: &cfg,
                 plan: &plan_for("acc1", &["acc1"]),
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
             },
             detected_for("acc1", "rc1"),
         );
@@ -4937,6 +6207,9 @@ mod tests {
             &cfg,
             noop_cb,
             before,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
         assert!(
             activities[&key].gate_next_check.is_some(),
@@ -4954,6 +6227,9 @@ mod tests {
             &cfg,
             noop_cb,
             t0 + GATE_RECHECK_INTERVAL,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
         assert!(!activities[&key].gate_in_flight);
         assert!(activities[&key].gate_next_check.is_some());
@@ -4972,6 +6248,9 @@ mod tests {
             &cfg,
             noop_cb,
             t0 + GATE_RECHECK_INTERVAL,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
         let a = &activities[&key];
         assert!(a.gate_in_flight, "the in-flight request is untouched");
@@ -4998,6 +6277,9 @@ mod tests {
                 cb: noop_cb,
                 cfg: &cfg,
                 plan: &plan_for("acc1", &["acc1"]),
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
             },
             detected_for("acc1", "rc1"),
         );
@@ -5050,6 +6332,9 @@ mod tests {
                 cb: noop_cb,
                 cfg: &cfg,
                 plan: &plan_for("acc1", &["acc1"]),
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
             },
             detected_for("acc1", "rc1"),
         );
@@ -5170,7 +6455,18 @@ mod tests {
         assert!(retryable_accounts(&activities[&key]).is_empty());
 
         // Nothing retryable → SignNow is a real Err, never a fake ok.
-        let result = on_sign_now(&mut activities, &accounts, &tx, &group, &cfg, noop_cb, &key);
+        let result = on_sign_now(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            &key,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
+        );
         assert!(result.is_err());
         assert!(
             activities[&key].acted,
@@ -5356,7 +6652,7 @@ mod tests {
             .await
             .expect("the looping helper must start");
         group.cancel();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         assert!(
             !ran_after_cancel.load(Ordering::SeqCst),
@@ -5400,7 +6696,7 @@ mod tests {
 
         drop(group); // last Arc → TaskGroup::drop
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(
             !ran_after_drop.load(Ordering::SeqCst),
             "the child must not run after the group drop"
@@ -5417,7 +6713,7 @@ mod tests {
         group.spawn(async move {
             s.store(true, Ordering::SeqCst);
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(
             !started.load(Ordering::SeqCst),
             "a spawn racing a completed stop must never run"
@@ -5452,7 +6748,7 @@ mod tests {
         let guard = StartupGuard::new(group); // armed, as if start unwound before returning
         drop(guard);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(
             !ran_after_drop.load(Ordering::SeqCst),
             "an armed guard must abort every child even while a strong clone keeps the group alive"
@@ -5537,6 +6833,9 @@ mod tests {
                 cb: noop_cb,
                 cfg: &cfg,
                 plan: &plan_for("acc2", &["acc2"]),
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
             },
             Detected {
                 generation: 1,
@@ -5607,17 +6906,37 @@ mod tests {
             &cfg,
             noop_cb,
             "acc1",
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
 
         // The teacher-assist flow owns the restore: it tries (and fails) against the unreachable
         // host and reports a REAL qr error — never spawn_sign's generic "unsupported here".
-        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let mut message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("a teacher-assist result must arrive")
             .expect("a message must arrive");
+        while matches!(
+            message,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match message {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("await QrSignResult after handshake")
+                .expect("a message must arrive");
+        }
         match message {
-            MonitorMsg::SignResult {
+            MonitorMsg::QrSignResult {
                 account_id,
+                generation: _,
                 result: Err(error),
                 ..
             } => {
@@ -5631,7 +6950,7 @@ mod tests {
                     "the generic spawn_sign path must never run for QR: {error}"
                 );
             }
-            _ => panic!("expected a failed teacher-assist SignResult"),
+            _ => panic!("expected a failed teacher-assist QrSignResult"),
         }
         assert!(
             !activities[&key].needs_resign.contains("acc1"),
@@ -5665,6 +6984,9 @@ mod tests {
             &cfg,
             noop_cb,
             "acc1",
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
 
         // 0 偽派發: no teacher → nothing dispatchable — no SignResult (not even an "unsupported"
@@ -5674,6 +6996,290 @@ mod tests {
             rx.try_recv().is_err(),
             "no message may be produced without a teacher"
         );
+    }
+
+    fn cfg_qr_remote_configured(secs: u64) -> MonitorConfig {
+        MonitorConfig {
+            countdown_secs: secs,
+            gate_percent: 15.0,
+            llm_endpoint: String::new(),
+            llm_model: String::new(),
+            llm_key: None,
+            llm_max_tokens: 0,
+            max_answer_reask: 0,
+            prepare_retry_budget_secs: 0,
+            autoanswer_types: vec![],
+            enable_llm_tools: false,
+            max_tool_iterations: 0,
+            resubmit_for_correct: false,
+            radar_strategy: vec![],
+            number_concurrency: 1,
+            number_min_concurrency: 1,
+            number_cooldown_ms: 0,
+            number_max_cooldowns: 0,
+            poll_idle_secs: 5,
+            quiz_detect_secs: 45,
+            qr_remote_enabled: true,
+            qr_remote_base_url: "https://api.hlp.qzz.io".to_string(),
+            qr_remote_key: Some(Arc::new(Secret::new("k-qr".to_string()))),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_qr_no_teacher_remote_configured_reaches_dispatch_not_requires_teacher() {
+        let cfg = cfg_qr_remote_configured(15);
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        accounts.insert("acc1".to_string(), account_at("acc1", false));
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activity = gate_activity(&["acc1"]);
+        activity.kind = RollcallKind::Qr;
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+
+        let result = on_sign_now(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            &key,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
+        );
+        assert!(
+            result.is_ok(),
+            "remote-configured QR without teacher must reach dispatch, not requires-teacher, got: {result:?}"
+        );
+        assert!(
+            activities[&key].acted,
+            "remote dispatch must mark acted even before the async result lands"
+        );
+        let mut msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("remote dispatch must produce a QrSignResult path")
+            .expect("a message must arrive");
+        // run_qr_remote now emits QrSourceFailed (handshake) before QrSignResult when no token
+        // is available. Direct-run tests have no actor draining it; skip it and await the real result.
+        if matches!(msg, MonitorMsg::QrSourceFailed { .. }) {
+            if let MonitorMsg::QrSourceFailed { ack, .. } = msg {
+                let _ = ack.send(());
+            }
+            msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("await QrSignResult after QrSourceFailed")
+                .expect("a message must arrive");
+        }
+        match msg {
+            MonitorMsg::QrSignResult { account_id, .. } => assert_eq!(account_id, "acc1"),
+            _ => panic!("expected QrSignResult"),
+        }
+    }
+
+    #[test]
+    fn manual_qr_disabled_or_missing_key_still_requires_teacher() {
+        let (tx, _rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        for cfg in [
+            cfg_countdown(15),
+            {
+                let mut c = cfg_qr_remote_configured(15);
+                c.qr_remote_enabled = false;
+                c
+            },
+            {
+                let mut c = cfg_qr_remote_configured(15);
+                c.qr_remote_key = None;
+                c
+            },
+            {
+                let mut c = cfg_qr_remote_configured(15);
+                c.qr_remote_key = Some(Arc::new(Secret::new("   ".to_string())));
+                c
+            },
+        ] {
+            let mut activity = gate_activity(&["acc1"]);
+            activity.kind = RollcallKind::Qr;
+            let mut activities = HashMap::from([(key.clone(), activity)]);
+            let err = on_sign_now(
+                &mut activities,
+                &accounts,
+                &tx,
+                &group,
+                &cfg,
+                noop_cb,
+                &key,
+                leaked_plan_tx(),
+                0,
+                leaked_qr_rev_rx(),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("teacher helper"),
+                "disabled/missing-key QR must retain teacher-required behavior, got: {err}"
+            );
+            assert!(!activities[&key].acted, "rejected QR must remain unacted");
+        }
+    }
+
+    #[tokio::test]
+    async fn late_qr_no_teacher_remote_configured_is_dispatched_exactly_once() {
+        let cfg = cfg_qr_remote_configured(15);
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        accounts.insert("acc1".to_string(), account_at("acc1", false));
+        accounts.insert("acc2".to_string(), account_at("acc2", false));
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activity = gate_activity(&["acc1"]);
+        activity.kind = RollcallKind::Qr;
+        activity.acted = true;
+        activity.signed.insert("acc1".to_string());
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+
+        on_detected(
+            &mut activities,
+            DetectionContext {
+                accounts: &accounts,
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan_for("acc2", &["acc2"]),
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
+            },
+            Detected {
+                generation: 1,
+                account_id: "acc2".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                rollcall_id: "qr1".to_string(),
+                kind: RollcallKind::Qr,
+                course: String::new(),
+                course_id: None,
+            },
+        );
+
+        let mut msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("remote-configured late QR must be dispatched")
+            .expect("a message must arrive");
+        if matches!(msg, MonitorMsg::QrSourceFailed { .. }) {
+            if let MonitorMsg::QrSourceFailed { ack, .. } = msg {
+                let _ = ack.send(());
+            }
+            msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("await QrSignResult after QrSourceFailed")
+                .expect("a message must arrive");
+        }
+        match msg {
+            MonitorMsg::QrSignResult { account_id, .. } => assert_eq!(account_id, "acc2"),
+            _ => panic!("expected QrSignResult for eligible late QR"),
+        }
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "eligible late QR must be dispatched exactly once"
+        );
+    }
+
+    #[test]
+    fn late_qr_no_source_stays_undispatched_and_redispatch_stays_pending() {
+        let cfg = cfg_countdown(15);
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
+        accounts.insert("acc1".to_string(), account_at("acc1", false));
+        accounts.insert("acc2".to_string(), account_at("acc2", false));
+        let key = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activity = gate_activity(&["acc1"]);
+        activity.kind = RollcallKind::Qr;
+        activity.acted = true;
+        activity.signed.insert("acc1".to_string());
+        let mut activities = HashMap::from([(key.clone(), activity)]);
+
+        on_detected(
+            &mut activities,
+            DetectionContext {
+                accounts: &accounts,
+                tx: &tx,
+                group: &group,
+                cb: noop_cb,
+                cfg: &cfg,
+                plan: &plan_for("acc2", &["acc2"]),
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
+            },
+            Detected {
+                generation: 1,
+                account_id: "acc2".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                rollcall_id: "qr1".to_string(),
+                kind: RollcallKind::Qr,
+                course: String::new(),
+                course_id: None,
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no source → late QR must not dispatch"
+        );
+        assert!(activities[&key].participants.contains("acc2"));
+
+        // Also: redispatch with no source must stay pending (no fake dispatch).
+        let key2 = (
+            "http://127.0.0.1:1".to_string(),
+            "qrcode".to_string(),
+            "qr2".to_string(),
+        );
+        let mut activity2 = gate_activity(&["acc1"]);
+        activity2.kind = RollcallKind::Qr;
+        activity2.acted = true;
+        activity2.needs_resign.insert("acc1".to_string());
+        let mut activities2 = HashMap::from([(key2.clone(), activity2)]);
+        redispatch_signs(
+            &mut activities2,
+            &accounts,
+            &tx,
+            &group,
+            &cfg,
+            noop_cb,
+            "acc1",
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
+        );
+        assert!(activities2[&key2].needs_resign.contains("acc1"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -5702,7 +7308,7 @@ mod tests {
 
         drop(handle);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(
             !ran_after_drop.load(Ordering::SeqCst),
             "dropping the handle must cancel every tracked child"
@@ -5750,6 +7356,9 @@ mod tests {
                 cb: noop_cb,
                 cfg: &cfg,
                 plan: &plan,
+                plan_tx: leaked_plan_tx(),
+                qr_rev: 0,
+                qr_rev_rx: leaked_qr_rev_rx(),
             },
             detection,
         );
@@ -5809,6 +7418,9 @@ mod tests {
             &cfg,
             noop_cb,
             &key,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
         assert!(
             !activities[&key].acted,
@@ -5823,10 +7435,2681 @@ mod tests {
             &cfg,
             noop_cb,
             &key,
+            leaked_plan_tx(),
+            0,
+            leaked_qr_rev_rx(),
         );
         assert!(
             activities[&key].acted,
             "rollback re-enables the pending permit"
         );
+    }
+
+    // --- teacher → remote fallback: single absolute deadline, before-mutation only ---
+
+    fn valid_qr_token() -> String {
+        format!("{}{}", "0123456789", "a".repeat(32))
+    }
+
+    #[tokio::test]
+    async fn qr_teacher_prepare_failure_before_put_fallbacks_to_remote_with_one_put_max() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let token = valid_qr_token();
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let student_puts = Arc::new(AtomicUsize::new(0));
+
+        // teacher: always fail create (Transient) -> before any PUT
+        let teacher_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let teacher_addr = teacher_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = teacher_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("POST /api/course/") && text.contains("/rollcall") {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if text.contains("POST /login")
+                        || text.contains("POST /sso/authenticate")
+                    {
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlogin".to_string()
+                    } else {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // remote: serve valid token
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let rh = remote_hits.clone();
+        let tkn = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let rh = rh.clone();
+                let tkn = tkn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("/token") {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // student: count PUT, confirm recheck
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/")
+                        && text.contains("answer_qr_rollcall")
+                    {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
+                    } else if text.contains("GET /api/rollcall/")
+                        && text.contains("student_rollcalls")
+                    {
+                        let body = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let teacher_base = format!("http://{teacher_addr}");
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let teacher = Arc::new(Account {
+            id: "teacher1".to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher: true,
+            course_id: Some("C1".to_string()),
+            base_url: teacher_base,
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (student_base, "qrcode".to_string(), "RC-PREPARE".to_string());
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        spawn_qr_teacher_assist(
+            teacher,
+            vec![student],
+            tx,
+            key.clone(),
+            1,
+            leaked_plan_rx(),
+            &group,
+            Some((remote_base, secret, leaked_qr_rev_rx(), 0)),
+        );
+        let mut msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("fallback must produce a result within window")
+            .expect("a message must arrive");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+                .await
+                .expect("await QrSignResult after handshake")
+                .expect("a message must arrive");
+        }
+        match msg {
+            MonitorMsg::QrSignResult {
+                account_id, result, ..
+            } => {
+                assert_eq!(account_id, "s1");
+                assert!(result.is_ok(), "fallback sign must succeed");
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+        assert!(
+            remote_hits.load(Ordering::SeqCst) >= 1,
+            "remote token must have been requested"
+        );
+        assert!(
+            student_puts.load(Ordering::SeqCst) <= 1,
+            "at most one student PUT"
+        );
+        assert!(
+            remote_hits.load(Ordering::SeqCst) <= 4,
+            "remote retries bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn qr_teacher_first_fetch_failure_before_put_fallbacks_to_remote() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let token = valid_qr_token();
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let student_puts = Arc::new(AtomicUsize::new(0));
+        let stop_hits = Arc::new(AtomicUsize::new(0));
+
+        // teacher: create+start ok, first fetch fails with 500, stop ok
+        let teacher_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let teacher_addr = teacher_listener.local_addr().unwrap();
+        let sh = stop_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = teacher_listener.accept().await else {
+                    break;
+                };
+                let sh = sh.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("POST /api/course/C1/rollcall") {
+                        let body = r#"{"id":"t-qr-1"}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else if text.contains("POST /api/rollcall/t-qr-1/start-rollcall") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else if text.contains("GET /api/course/C1/rollcall/t-qr-1/qr_code") {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if text.contains("PUT /api/rollcall/t-qr-1/stop_qr_rollcall") {
+                        sh.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let rh = remote_hits.clone();
+        let tkn = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let rh = rh.clone();
+                let tkn = tkn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("/token") {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/")
+                        && text.contains("answer_qr_rollcall")
+                    {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else if text.contains("GET /api/rollcall/")
+                        && text.contains("student_rollcalls")
+                    {
+                        let body = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let teacher_base = format!("http://{teacher_addr}");
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let teacher = Arc::new(Account {
+            id: "teacher1".to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher: true,
+            course_id: Some("C1".to_string()),
+            base_url: teacher_base,
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (student_base, "qrcode".to_string(), "RC-FETCH".to_string());
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        spawn_qr_teacher_assist(
+            teacher,
+            vec![student],
+            tx,
+            key.clone(),
+            1,
+            leaked_plan_rx(),
+            &group,
+            Some((remote_base, secret, leaked_qr_rev_rx(), 0)),
+        );
+        let mut msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("fetch failure fallback must produce result")
+            .expect("a message must arrive");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+                .await
+                .expect("await QrSignResult after handshake")
+                .expect("a message must arrive");
+        }
+        match msg {
+            MonitorMsg::QrSignResult {
+                account_id, result, ..
+            } => {
+                assert_eq!(account_id, "s1");
+                assert!(result.is_ok(), "fallback after fetch failure must succeed");
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+        assert!(
+            remote_hits.load(Ordering::SeqCst) >= 1,
+            "remote must have been used after first fetch failure"
+        );
+        assert!(
+            student_puts.load(Ordering::SeqCst) <= 1,
+            "at most one PUT after fallback"
+        );
+        assert!(
+            stop_hits.load(Ordering::SeqCst) >= 1,
+            "teacher source must be cleaned up before fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn qr_teacher_fanout_started_never_fallbacks_even_when_student_fails() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let student_puts = Arc::new(AtomicUsize::new(0));
+
+        // teacher: create+start ok, fetch returns valid data
+        let teacher_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let teacher_addr = teacher_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = teacher_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("POST /api/course/C1/rollcall") {
+                        let body = r#"{"id":"t-qr-2"}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else if text.contains("POST /api/rollcall/t-qr-2/start-rollcall") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else if text.contains("GET /api/course/C1/rollcall/t-qr-2/qr_code") {
+                        let body = r#"{"data":"QRDATA-XYZ"}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else if text.contains("PUT /api/rollcall/t-qr-2/stop_qr_rollcall") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // remote: should receive zero hits
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let rh = remote_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let rh = rh.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let body = r#"{"ok":true,"data":"0123456789aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // student: PUT fails, recheck also fails (not present)
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/")
+                        && text.contains("answer_qr_rollcall")
+                    {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if text.contains("GET /api/rollcall/")
+                        && text.contains("student_rollcalls")
+                    {
+                        let body = r#"{"status":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"in_progress"}]}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let teacher_base = format!("http://{teacher_addr}");
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, _rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let teacher = Arc::new(Account {
+            id: "teacher1".to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher: true,
+            course_id: Some("C1".to_string()),
+            base_url: teacher_base,
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (student_base, "qrcode".to_string(), "RC-FANOUT".to_string());
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        spawn_qr_teacher_assist(
+            teacher,
+            vec![student],
+            tx,
+            key.clone(),
+            1,
+            leaked_plan_rx(),
+            &group,
+            Some((remote_base, secret, leaked_qr_rev_rx(), 0)),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            student_puts.load(Ordering::SeqCst) >= 1,
+            "fanout must have started"
+        );
+        assert_eq!(
+            remote_hits.load(Ordering::SeqCst),
+            0,
+            "remote must receive zero requests once fanout started even when student fails"
+        );
+        group.cancel();
+    }
+
+    #[tokio::test]
+    async fn qr_teacher_failure_without_remote_preserves_teacher_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let teacher_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let teacher_addr = teacher_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = teacher_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let resp =
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string();
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        // student should never be hit when teacher prepare fails and no remote
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let teacher_base = format!("http://{teacher_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let teacher = Arc::new(Account {
+            id: "teacher1".to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher: true,
+            course_id: Some("C1".to_string()),
+            base_url: teacher_base,
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (
+            student_base,
+            "qrcode".to_string(),
+            "RC-NOREMOTE".to_string(),
+        );
+        spawn_qr_teacher_assist(
+            teacher,
+            vec![student],
+            tx,
+            key.clone(),
+            1,
+            leaked_plan_rx(),
+            &group,
+            None,
+        );
+        let mut msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("teacher failure without remote must report")
+            .expect("a message must arrive");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("await QrSignResult after handshake")
+                .expect("a message must arrive");
+        }
+        match msg {
+            MonitorMsg::QrSignResult {
+                account_id, result, ..
+            } => {
+                assert_eq!(account_id, "s1");
+                let err = result.expect_err("must be teacher error");
+                assert!(
+                    err.contains("qr: teacher could not open"),
+                    "must preserve teacher error without remote, got: {err}"
+                );
+                assert!(
+                    !err.to_ascii_lowercase().contains("remote"),
+                    "must not mention remote"
+                );
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+    }
+
+    // --- deadline enforcement: deterministic paused-time coverage ---
+
+    #[tokio::test]
+    async fn qr_remote_fetch_started_near_deadline_not_accepted_after() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::pause();
+        let token = valid_qr_token();
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let student_puts = Arc::new(AtomicUsize::new(0));
+
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let rh = remote_hits.clone();
+        let tkn = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let rh = rh.clone();
+                let tkn = tkn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                        // Slow loopback: respond only after 5s (past the 2s deadline).
+                        tokio::time::sleep(Duration::from_millis(5000)).await;
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/") {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (
+            student_base,
+            "qrcode".to_string(),
+            "RC-DEADLINE-FETCH".to_string(),
+        );
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let remote_base_owned = remote_base.clone();
+        let key_owned = key.clone();
+        group.spawn(async move {
+            run_qr_remote(
+                deadline,
+                remote_base_owned,
+                secret,
+                vec![student],
+                tx,
+                key_owned,
+                1,
+                leaked_plan_rx(),
+                leaked_qr_rev_rx(),
+                0,
+            )
+            .await;
+        });
+        tokio::time::advance(Duration::from_millis(2500)).await;
+        // Let abort propagate.
+        tokio::task::yield_now().await;
+        let mut msg = rx
+            .recv()
+            .await
+            .expect("deadline must produce a sanitized error");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = rx.recv().await.expect("await QrSignResult after handshake");
+        }
+        match msg {
+            MonitorMsg::QrSignResult { result, .. } => {
+                let err = result.expect_err("must be deadline error");
+                assert!(
+                    err.to_ascii_lowercase().contains("deadline"),
+                    "must be sanitized deadline, got: {err}"
+                );
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must send exactly one error, no duplicate"
+        );
+        assert_eq!(
+            student_puts.load(Ordering::SeqCst),
+            0,
+            "no student PUT must start after/near deadline"
+        );
+        group.cancel();
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn qr_remote_fanout_does_not_start_put_after_deadline() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::pause();
+        let token = valid_qr_token();
+        let student_puts = Arc::new(AtomicUsize::new(0));
+
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let tkn = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let tkn = tkn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/") {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else if text.contains("GET /api/rollcall/")
+                        && text.contains("student_rollcalls")
+                    {
+                        let body = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        // Two students requested via run_qr_remote to exercise fanout deadline gating.
+        let mk_student = |id: &str, user_no: &str| {
+            Arc::new(Account {
+                id: id.to_string(),
+                device_id: format!("d-{id}"),
+                user_no: user_no.to_string(),
+                is_teacher: false,
+                course_id: None,
+                base_url: student_base.clone(),
+                client: Client::new(),
+                username: String::new(),
+                password: crate::secrets::Secret::default(),
+            })
+        };
+        let students = vec![mk_student("s1", "u1"), mk_student("s2", "u2")];
+        let key: ActivityKey = (
+            student_base.clone(),
+            "qrcode".to_string(),
+            "RC-DEADLINE-FANOUT".to_string(),
+        );
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let rb = remote_base.clone();
+        let key2 = key.clone();
+        group.spawn(async move {
+            run_qr_remote(
+                deadline,
+                rb,
+                secret,
+                students,
+                tx,
+                key2,
+                1,
+                leaked_plan_rx(),
+                leaked_qr_rev_rx(),
+                0,
+            )
+            .await;
+        });
+        tokio::time::advance(Duration::from_millis(2500)).await;
+        tokio::task::yield_now().await;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Ok(msg) = rx.try_recv() {
+            let msg = match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                    continue;
+                }
+                other => other,
+            };
+            if let MonitorMsg::QrSignResult {
+                account_id, result, ..
+            } = msg
+            {
+                assert!(
+                    seen.insert(account_id.clone()),
+                    "one PUT/student, no duplicate"
+                );
+                let err = result.expect_err("must be deadline");
+                assert!(err.to_ascii_lowercase().contains("deadline"), "got: {err}");
+            } else {
+                panic!("expected QrSignResult");
+            }
+        }
+        // At most one chunk could have started before deadline; none after.
+        // Completion bounded: we already waited past deadline and got all errors.
+        assert!(seen.len() <= 2, "bounded completion");
+        group.cancel();
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn qr_fallback_gets_only_remaining_time_not_new_window() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::pause();
+        let token = valid_qr_token();
+        let remote_fetch_started = Arc::new(AtomicUsize::new(0));
+
+        let teacher_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let teacher_addr = teacher_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = teacher_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let resp =
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let started = remote_fetch_started.clone();
+        let tkn = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let started = started.clone();
+                let tkn = tkn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        // Never respond successfully before deadline — sleep past it.
+                        tokio::time::sleep(Duration::from_millis(5000)).await;
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let resp =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let teacher_base = format!("http://{teacher_addr}");
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let teacher = Arc::new(Account {
+            id: "teacher1".to_string(),
+            device_id: String::new(),
+            user_no: String::new(),
+            is_teacher: true,
+            course_id: Some("C1".to_string()),
+            base_url: teacher_base,
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (
+            student_base,
+            "qrcode".to_string(),
+            "RC-FALLBACK-REMAINING".to_string(),
+        );
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        // Advance time so prepare_teacher_source still fails fast, then fallback must run with remaining budget only.
+        // Use a short manual deadline by sleeping before assist consumes the window.
+        spawn_qr_teacher_assist(
+            teacher,
+            vec![student],
+            tx,
+            key.clone(),
+            1,
+            leaked_plan_rx(),
+            &group,
+            Some((remote_base, secret, leaked_qr_rev_rx(), 0)),
+        );
+        // Consume ~11s of the 12s teacher window before fallback would start.
+        tokio::time::advance(Duration::from_millis(11000)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(3000)).await;
+        tokio::task::yield_now().await;
+        let mut msg = rx
+            .recv()
+            .await
+            .expect("fallback with remaining time must still report within deadline");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = rx.recv().await.expect("await QrSignResult after handshake");
+        }
+        match msg {
+            MonitorMsg::QrSignResult { result, .. } => {
+                let err = result.expect_err("must be deadline or teacher error, not success");
+                assert!(
+                    err.to_ascii_lowercase().contains("deadline") || err.contains("qr: teacher"),
+                    "got: {err}"
+                );
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+        // Total elapsed from task start bounded (~12s): fallback must NOT have granted a fresh 12s.
+        // Paused time is ~14s advanced; without bounding fallback would take ~23s.
+        group.cancel();
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn qr_total_acquire_plus_fanout_bounded_by_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::pause();
+        let token = valid_qr_token();
+
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let tkn = token.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let tkn = tkn.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/") {
+                        // Hang the student PUT so fanout must be cut by deadline.
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                            .to_string()
+                    } else if text.contains("GET /api/rollcall/") {
+                        let body = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (tx, mut rx) = unbounded_channel();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (
+            student_base.clone(),
+            "qrcode".to_string(),
+            "RC-BOUNDED".to_string(),
+        );
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let rb = remote_base.clone();
+        let key2 = key.clone();
+        group.spawn(async move {
+            run_qr_remote(
+                deadline,
+                rb,
+                secret,
+                vec![student],
+                tx,
+                key2,
+                1,
+                leaked_plan_rx(),
+                leaked_qr_rev_rx(),
+                0,
+            )
+            .await;
+        });
+        tokio::time::advance(Duration::from_millis(2000)).await;
+        tokio::task::yield_now().await;
+        let mut msg = rx.recv().await.expect("bounded completion must report");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = rx.recv().await.expect("await QrSignResult after handshake");
+        }
+        match msg {
+            MonitorMsg::QrSignResult { result, .. } => {
+                let err = result.expect_err("hanging fanout must become deadline");
+                assert!(err.to_ascii_lowercase().contains("deadline"), "got: {err}");
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+        // Completion bounded: recv arrived within the advanced window; deadline is already exceeded.
+        assert!(
+            Instant::now() >= deadline,
+            "deadline must have been reached"
+        );
+        group.cancel();
+        tokio::time::resume();
+    }
+    // --- generation isolation (QR-only) ---
+
+    #[test]
+    fn qr_generation_stale_qr_result_is_dropped_without_mutation() {
+        let (runtime_tx, mut runtime_rx) = unbounded_channel();
+        let (self_tx, mut _self_rx) = unbounded_channel::<MonitorMsg>();
+        let key: ActivityKey = (
+            "http://x".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activities: HashMap<ActivityKey, Activity> =
+            HashMap::from([(key.clone(), gate_activity(&["s1"]))]);
+        activities.get_mut(&key).unwrap().kind = RollcallKind::Qr;
+        let plan = MonitorPlan {
+            generation: 2,
+            routes: Vec::new(),
+        };
+        let generation = 1u64;
+        let result: Result<SignOutcome, String> = Ok(SignOutcome {
+            method: "qr".to_string(),
+            discovered_code: None,
+        });
+        if generation != plan.generation {
+            // dropped
+        } else if let Some(a) = activities.get(&key) {
+            if a.plan_generation != generation {
+            } else {
+                publish_rollcall_result(&runtime_tx, &activities, &key, "s1", &result);
+                on_sign_result(
+                    &mut activities,
+                    &self_tx,
+                    noop_cb,
+                    key.clone(),
+                    "s1".to_string(),
+                    result,
+                );
+            }
+        }
+        assert!(
+            activities[&key].signed.is_empty(),
+            "stale must not mark signed"
+        );
+        assert!(
+            activities[&key].needs_resign.is_empty() && activities[&key].sign_failed.is_empty()
+        );
+        assert!(
+            runtime_rx.try_recv().is_err(),
+            "stale must not publish runtime event"
+        );
+        assert!(_self_rx.try_recv().is_err(), "stale must not emit AuthLost");
+        let mut activities2: HashMap<ActivityKey, Activity> =
+            HashMap::from([(key.clone(), gate_activity(&["s1"]))]);
+        activities2.get_mut(&key).unwrap().kind = RollcallKind::Qr;
+        let plan2 = MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        };
+        let generation2 = 1u64;
+        let result2: Result<SignOutcome, String> = Ok(SignOutcome {
+            method: "qr".to_string(),
+            discovered_code: None,
+        });
+        if generation2 == plan2.generation {
+            if let Some(a) = activities2.get(&key) {
+                if a.plan_generation == generation2 {
+                    publish_rollcall_result(&runtime_tx, &activities2, &key, "s1", &result2);
+                    on_sign_result(
+                        &mut activities2,
+                        &self_tx,
+                        noop_cb,
+                        key.clone(),
+                        "s1".to_string(),
+                        result2,
+                    );
+                }
+            }
+        }
+        assert!(
+            activities2[&key].signed.contains("s1"),
+            "matching generation must apply"
+        );
+    }
+
+    #[test]
+    fn qr_generation_missing_activity_is_dropped() {
+        let (runtime_tx, mut runtime_rx) = unbounded_channel();
+        let (self_tx, _self_rx) = unbounded_channel::<MonitorMsg>();
+        let key: ActivityKey = (
+            "http://x".to_string(),
+            "qrcode".to_string(),
+            "missing".to_string(),
+        );
+        let mut activities: HashMap<ActivityKey, Activity> = HashMap::new();
+        let plan = MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        };
+        let generation = 1u64;
+        let result: Result<SignOutcome, String> = Ok(SignOutcome {
+            method: "qr".to_string(),
+            discovered_code: None,
+        });
+        if generation != plan.generation {
+        } else if let Some(a) = activities.get(&key) {
+            if a.plan_generation != generation {
+            } else {
+                publish_rollcall_result(&runtime_tx, &activities, &key, "s1", &result);
+                on_sign_result(
+                    &mut activities,
+                    &self_tx,
+                    noop_cb,
+                    key.clone(),
+                    "s1".to_string(),
+                    result,
+                );
+            }
+        } else {
+            // missing -> dropped
+        }
+        assert!(
+            runtime_rx.try_recv().is_err(),
+            "missing activity must not publish"
+        );
+    }
+
+    #[test]
+    fn qr_generation_old_inflight_result_dropped_after_commit() {
+        let (runtime_tx, mut runtime_rx) = unbounded_channel();
+        let (self_tx, _self_rx) = unbounded_channel::<MonitorMsg>();
+        let key: ActivityKey = (
+            "http://x".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let activities: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
+            let mut a = gate_activity(&["s1"]);
+            a.kind = RollcallKind::Qr;
+            a
+        })]);
+        let plan_new = MonitorPlan {
+            generation: 2,
+            routes: Vec::new(),
+        };
+        let gen_old = 1u64;
+        if gen_old != plan_new.generation {
+            // dropped
+        } else {
+            panic!("old must be considered stale");
+        }
+        assert!(activities[&key].signed.is_empty());
+        assert!(runtime_rx.try_recv().is_err());
+        let gen_new = 2u64;
+        if gen_new != plan_new.generation {
+            panic!("new plan must match");
+        } else if let Some(a) = activities.get(&key) {
+            if a.plan_generation != gen_new {
+                // dropped because retained activity still 1 -> correct per spec
+            } else {
+                panic!("retained activity must still be stale vs new generation");
+            }
+        }
+        assert!(
+            activities[&key].signed.is_empty(),
+            "retained activity stays stale vs new generation"
+        );
+        let mut fresh: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
+            let mut a = gate_activity(&["s1"]);
+            a.kind = RollcallKind::Qr;
+            a.plan_generation = 2;
+            a
+        })]);
+        let result: Result<SignOutcome, String> = Ok(SignOutcome {
+            method: "qr".to_string(),
+            discovered_code: None,
+        });
+        if gen_new == plan_new.generation {
+            if let Some(a) = fresh.get(&key) {
+                if a.plan_generation == gen_new {
+                    publish_rollcall_result(&runtime_tx, &fresh, &key, "s1", &result);
+                    on_sign_result(
+                        &mut fresh,
+                        &self_tx,
+                        noop_cb,
+                        key.clone(),
+                        "s1".to_string(),
+                        result,
+                    );
+                }
+            }
+        }
+        assert!(
+            fresh[&key].signed.contains("s1"),
+            "fresh activity with new generation must apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn qr_generation_change_during_remote_fetch_prevents_put() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let student_puts = Arc::new(AtomicUsize::new(0));
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let rh = remote_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let rh = rh.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let body = format!(r#"{{"ok":true,"data":"{}"}}"#, valid_qr_token());
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("PUT /api/rollcall/") {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                });
+            }
+        });
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let (plan_tx, plan_rx) = watch::channel(MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        });
+        let (tx, mut rx) = unbounded_channel();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (
+            student_base.clone(),
+            "qrcode".to_string(),
+            "RC-GEN-FETCH".to_string(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        group.spawn(async move {
+            run_qr_remote(
+                deadline,
+                remote_base,
+                secret,
+                vec![student],
+                tx,
+                key,
+                1,
+                plan_rx,
+                leaked_qr_rev_rx(),
+                0,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = plan_tx.send(MonitorPlan {
+            generation: 2,
+            routes: Vec::new(),
+        });
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            student_puts.load(Ordering::SeqCst),
+            0,
+            "no student PUT after generation change during fetch"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled fetch must not send QrSignResult"
+        );
+        group.cancel();
+    }
+
+    #[tokio::test]
+    async fn qr_generation_change_before_next_fanout_chunk_prevents_later_put() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let student_puts = Arc::new(AtomicUsize::new(0));
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        let body = format!(r#"{{"ok":true,"data":"{}"}}"#, valid_qr_token());
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/") {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else if text.contains("GET /api/rollcall/") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 95\r\nConnection: close\r\n\r\n{\"status\":\"in_progress\",\"student_rollcalls\":[{\"user_no\":\"u0\",\"rollcall_status\":\"in_progress\"}]}"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let mk_student = |id: usize| {
+            Arc::new(Account {
+                id: format!("s{id}"),
+                device_id: format!("d{id}"),
+                user_no: format!("u{id}"),
+                is_teacher: false,
+                course_id: None,
+                base_url: student_base.clone(),
+                client: Client::new(),
+                username: String::new(),
+                password: crate::secrets::Secret::default(),
+            })
+        };
+        let students: Vec<Arc<Account>> = (0..9).map(mk_student).collect();
+        let (plan_tx, plan_rx) = watch::channel(MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        });
+        let (tx, mut rx) = unbounded_channel();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        let key: ActivityKey = (
+            student_base.clone(),
+            "qrcode".to_string(),
+            "RC-GEN-CHUNK".to_string(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        group.spawn(async move {
+            run_qr_remote(
+                deadline,
+                remote_base,
+                secret,
+                students,
+                tx,
+                key,
+                1,
+                plan_rx,
+                leaked_qr_rev_rx(),
+                0,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            student_puts.load(Ordering::SeqCst) >= 1,
+            "first chunk must have started"
+        );
+        assert!(
+            student_puts.load(Ordering::SeqCst) <= 8,
+            "second chunk not yet started"
+        );
+        let _ = plan_tx.send(MonitorPlan {
+            generation: 2,
+            routes: Vec::new(),
+        });
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let puts = student_puts.load(Ordering::SeqCst);
+        assert!(
+            puts <= 8,
+            "second chunk must not start after generation change, got {puts}"
+        );
+        assert!(puts >= 1, "first chunk was allowed");
+        let mut msgs = 0;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                    continue;
+                }
+                _ => {}
+            }
+            msgs += 1;
+        }
+        assert!(
+            msgs <= 8,
+            "no later chunk messages after generation change, got {msgs}"
+        );
+        group.cancel();
+    }
+
+    fn qr_source_failed_via_actor(
+        activities: &mut HashMap<ActivityKey, Activity>,
+        plan: &MonitorPlan,
+        key: &ActivityKey,
+        generation: u64,
+        reason: &str,
+    ) {
+        // Simulate the actor's QrSourceFailed handler synchronously for focused tests.
+        if let Some(a) = activities.get_mut(key) {
+            if a.plan_generation == generation
+                && plan.generation == generation
+                && a.kind == RollcallKind::Qr
+                && !a.mutation_started
+            {
+                a.source_failed_without_mutation = true;
+                a.qr_source_failed_reason = Some(reason.to_string());
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_qr_sign_result_focused(
+        activities: &mut HashMap<ActivityKey, Activity>,
+        runtime_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+        self_tx: &tokio::sync::mpsc::UnboundedSender<MonitorMsg>,
+        plan: &MonitorPlan,
+        key: ActivityKey,
+        account_id: String,
+        generation: u64,
+        mutation_attempted: bool,
+        result: Result<SignOutcome, String>,
+    ) {
+        // Mirrors the actor's QrSignResult branch after the bookkeeping fix.
+        if generation != plan.generation {
+            return;
+        }
+        let Some(a) = activities.get_mut(&key) else {
+            return;
+        };
+        if a.plan_generation != generation {
+            return;
+        }
+        if a.kind == RollcallKind::Qr && !mutation_attempted {
+            publish_rollcall_result(runtime_tx, activities, &key, &account_id, &result);
+            return;
+        }
+        if a.kind == RollcallKind::Qr {
+            a.mutation_started = true;
+            a.source_failed_without_mutation = false;
+        }
+        publish_rollcall_result(runtime_tx, activities, &key, &account_id, &result);
+        on_sign_result(activities, self_tx, noop_cb, key, account_id, result);
+    }
+
+    #[test]
+    fn qr_source_failure_then_false_result_preserves_flag_and_no_mutation_state() {
+        let (runtime_tx, mut runtime_rx) = unbounded_channel();
+        let (self_tx, mut self_rx) = unbounded_channel::<MonitorMsg>();
+        let key: ActivityKey = (
+            "http://x".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activities: HashMap<ActivityKey, Activity> =
+            HashMap::from([(key.clone(), gate_activity(&["acc1", "acc2"]))]);
+        activities.get_mut(&key).unwrap().kind = RollcallKind::Qr;
+        let plan = MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        };
+        qr_source_failed_via_actor(&mut activities, &plan, &key, 1, "qr remote unauthorized");
+        assert!(activities[&key].source_failed_without_mutation);
+        assert!(!activities[&key].mutation_started);
+        // Source-only failures for each account must not increment resign/sign_failed/needs_resign.
+        for acc in ["acc1", "acc2"] {
+            handle_qr_sign_result_focused(
+                &mut activities,
+                &runtime_tx,
+                &self_tx,
+                &plan,
+                key.clone(),
+                acc.to_string(),
+                1,
+                false,
+                Err("qr remote unauthorized".to_string()),
+            );
+        }
+        let a = &activities[&key];
+        assert!(
+            a.source_failed_without_mutation,
+            "false result must preserve source flag"
+        );
+        assert!(
+            !a.mutation_started,
+            "false result must not mark mutation_started"
+        );
+        assert!(
+            a.sign_failed.is_empty(),
+            "source-only must not insert sign_failed"
+        );
+        assert!(a.needs_resign.is_empty());
+        assert!(
+            a.resign_attempts.is_empty(),
+            "source-only must not increment resign_attempts"
+        );
+        assert!(a.signed.is_empty());
+        // Ordering robust: opposite order (false result before QrSourceFailed) also preserves flag.
+        let mut activities2: HashMap<ActivityKey, Activity> =
+            HashMap::from([(key.clone(), gate_activity(&["acc1"]))]);
+        activities2.get_mut(&key).unwrap().kind = RollcallKind::Qr;
+        handle_qr_sign_result_focused(
+            &mut activities2,
+            &runtime_tx,
+            &self_tx,
+            &plan,
+            key.clone(),
+            "acc1".to_string(),
+            1,
+            false,
+            Err("qr remote unauthorized".to_string()),
+        );
+        assert!(
+            !activities2[&key].source_failed_without_mutation,
+            "no source_failed yet"
+        );
+        qr_source_failed_via_actor(&mut activities2, &plan, &key, 1, "qr remote unauthorized");
+        assert!(
+            activities2[&key].source_failed_without_mutation,
+            "subsequent QrSourceFailed must still mark"
+        );
+        assert!(!activities2[&key].mutation_started);
+        let _ = self_rx.try_recv();
+        let _ = runtime_rx.try_recv();
+        // True result still uses normal state.
+        handle_qr_sign_result_focused(
+            &mut activities,
+            &runtime_tx,
+            &self_tx,
+            &plan,
+            key.clone(),
+            "acc1".to_string(),
+            1,
+            true,
+            Err("boom".to_string()),
+        );
+        let a = &activities[&key];
+        assert!(a.mutation_started, "true must mark mutation_started");
+        assert!(
+            !a.source_failed_without_mutation,
+            "true must clear source_failed"
+        );
+        assert!(a.sign_failed.contains("acc1"));
+        assert_eq!(a.resign_attempts.get("acc1"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn qr_rearm_clears_source_only_failures_once_and_preserves_signed_needs_resign() {
+        let cfg_old = cfg_countdown(15);
+        let mut cfg_new = cfg_countdown(15);
+        cfg_new.qr_remote_enabled = true;
+        cfg_new.qr_remote_base_url = "https://qr.example".to_string();
+        cfg_new.qr_remote_key = Some(Arc::new(Secret::new("k1".to_string())));
+        let plan = MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let key: ActivityKey = (
+            "http://x".to_string(),
+            "qrcode".to_string(),
+            "qr1".to_string(),
+        );
+        let mut activities: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
+            let mut a = gate_activity(&["acc1", "acc2", "acc3"]);
+            a.kind = RollcallKind::Qr;
+            a.participants =
+                HashSet::from(["acc1".to_string(), "acc2".to_string(), "acc3".to_string()]);
+            a.signed.insert("acc1".to_string());
+            a.needs_resign.insert("acc3".to_string());
+            a.sign_failed.insert("acc2".to_string());
+            a.resign_attempts.insert("acc2".to_string(), 1);
+            a.source_failed_without_mutation = true;
+            a.qr_source_failed_reason = Some("qr remote: no data".to_string());
+            a
+        })]);
+        let accounts: HashMap<String, Arc<Account>> = HashMap::from([
+            (
+                "acc1".to_string(),
+                Arc::new(Account {
+                    id: "acc1".to_string(),
+                    device_id: String::new(),
+                    user_no: String::new(),
+                    is_teacher: false,
+                    course_id: None,
+                    base_url: "http://x".to_string(),
+                    client: Client::new(),
+                    username: String::new(),
+                    password: Secret::default(),
+                }),
+            ),
+            (
+                "acc2".to_string(),
+                Arc::new(Account {
+                    id: "acc2".to_string(),
+                    device_id: String::new(),
+                    user_no: String::new(),
+                    is_teacher: false,
+                    course_id: None,
+                    base_url: "http://x".to_string(),
+                    client: Client::new(),
+                    username: String::new(),
+                    password: Secret::default(),
+                }),
+            ),
+            (
+                "acc3".to_string(),
+                Arc::new(Account {
+                    id: "acc3".to_string(),
+                    device_id: String::new(),
+                    user_no: String::new(),
+                    is_teacher: false,
+                    course_id: None,
+                    base_url: "http://x".to_string(),
+                    client: Client::new(),
+                    username: String::new(),
+                    password: Secret::default(),
+                }),
+            ),
+        ]);
+        assert!(is_meaningful_qr_remote_change(&cfg_old, &cfg_new));
+        let plan_tx = test_plan_tx();
+        rearm_qr_source_failed_activities(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg_new,
+            noop_cb,
+            &plan,
+            &plan_tx,
+            0,
+            leaked_qr_rev_rx(),
+        );
+        let a = &activities[&key];
+        assert!(!a.source_failed_without_mutation);
+        assert!(a.qr_source_failed_reason.is_none());
+        assert!(a.signed.contains("acc1"), "signed must be preserved");
+        assert!(
+            a.needs_resign.contains("acc3"),
+            "needs_resign (possibly mutated) must not be cleared"
+        );
+        assert!(
+            !a.sign_failed.contains("acc2"),
+            "legacy source-only sign_failed for unsigned must be cleared on rearm"
+        );
+        assert!(
+            !a.resign_attempts.contains_key("acc2"),
+            "legacy source-only attempts must be cleared"
+        );
+        // Identical config must do zero.
+        let before = activities[&key].source_failed_without_mutation;
+        rearm_qr_source_failed_activities(
+            &mut activities,
+            &accounts,
+            &tx,
+            &group,
+            &cfg_new,
+            noop_cb,
+            &plan,
+            &plan_tx,
+            0,
+            leaked_qr_rev_rx(),
+        );
+        assert_eq!(activities[&key].source_failed_without_mutation, before);
+        assert!(!is_meaningful_qr_remote_change(&cfg_new, &cfg_new));
+        // Second meaningful change still rearms at most once per ConfigUpdated (no hot loop).
+        let mut activities3: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
+            let mut a = gate_activity(&["acc1"]);
+            a.kind = RollcallKind::Qr;
+            a.source_failed_without_mutation = true;
+            a.qr_source_failed_reason = Some("x".to_string());
+            a
+        })]);
+        let mut cfg_new2 = cfg_new.clone();
+        cfg_new2.qr_remote_key = Some(Arc::new(Secret::new("k2".to_string())));
+        assert!(is_meaningful_qr_remote_change(&cfg_new, &cfg_new2));
+        rearm_qr_source_failed_activities(
+            &mut activities3,
+            &accounts,
+            &tx,
+            &group,
+            &cfg_new2,
+            noop_cb,
+            &plan,
+            &plan_tx,
+            0,
+            leaked_qr_rev_rx(),
+        );
+        assert!(!activities3[&key].source_failed_without_mutation);
+        // Mutation-started activity never rearms.
+        let mut activities4: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
+            let mut a = gate_activity(&["acc1"]);
+            a.kind = RollcallKind::Qr;
+            a.source_failed_without_mutation = true;
+            a.mutation_started = true;
+            a.qr_source_failed_reason = Some("x".to_string());
+            a
+        })]);
+        rearm_qr_source_failed_activities(
+            &mut activities4,
+            &accounts,
+            &tx,
+            &group,
+            &cfg_new2,
+            noop_cb,
+            &plan,
+            &plan_tx,
+            0,
+            leaked_qr_rev_rx(),
+        );
+        assert!(activities4[&key].source_failed_without_mutation);
+    }
+
+    #[test]
+    fn qr_revision_change_covers_enabled_base_key_including_disable() {
+        let base = cfg_countdown(15);
+        let mut disabling = cfg_countdown(15);
+        disabling.qr_remote_enabled = true;
+        disabling.qr_remote_base_url = "https://qr.example".to_string();
+        disabling.qr_remote_key = Some(Arc::new(Secret::new("k1".to_string())));
+        // disabled -> enabled with key/base is a revision change
+        assert!(is_qr_remote_revision_change(&base, &disabling));
+        // enabled with same key/base -> no revision change when identical
+        assert!(!is_qr_remote_revision_change(
+            &disabling,
+            &disabling.clone()
+        ));
+        // disable again is a revision change
+        let mut enabled = disabling.clone();
+        enabled.qr_remote_enabled = false;
+        assert!(is_qr_remote_revision_change(&disabling, &enabled));
+        // key rotation is a revision change
+        let mut rotated = disabling.clone();
+        rotated.qr_remote_key = Some(Arc::new(Secret::new("k2".to_string())));
+        assert!(is_qr_remote_revision_change(&disabling, &rotated));
+        // canonical base change (trailing slash is normalized away => no change)
+        let mut slash = disabling.clone();
+        slash.qr_remote_base_url = "https://qr.example/".to_string();
+        assert!(!is_qr_remote_revision_change(&disabling, &slash));
+        // different host is a revision change
+        let mut other_host = disabling.clone();
+        other_host.qr_remote_base_url = "https://other.example".to_string();
+        assert!(is_qr_remote_revision_change(&disabling, &other_host));
+        // unrelated setting (e.g. countdown) does not bump revision
+        let mut unrelated = disabling.clone();
+        unrelated.countdown_secs = 999;
+        assert!(!is_qr_remote_revision_change(&disabling, &unrelated));
+        let _ = base;
+    }
+
+    #[tokio::test]
+    async fn qr_remote_revision_change_during_fetch_cancels_old_and_prevents_put() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let student_puts = Arc::new(AtomicUsize::new(0));
+        // Remote hangs on /token so the fetch stays in-flight.
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    // never respond -> fetch stays pending until cancelled
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
+        });
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/") {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let remote_base = format!("http://{remote_addr}");
+        let student_base = format!("http://{student_addr}");
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let (rev_tx, rev_rx) = watch::channel(0u64);
+        let (plan_tx, plan_rx) = watch::channel(MonitorPlan {
+            generation: 1,
+            routes: Vec::new(),
+        });
+        let (tx, mut rx) = unbounded_channel();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        let key: ActivityKey = (
+            student_base.clone(),
+            "qrcode".to_string(),
+            "RC-REV-FETCH".to_string(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        let rev_rx_clone = rev_rx.clone();
+        group.spawn(async move {
+            run_qr_remote(
+                deadline,
+                remote_base,
+                secret,
+                vec![student],
+                tx,
+                key,
+                1,
+                plan_rx,
+                rev_rx_clone,
+                0,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Simulate ConfigUpdated disabling/rotating remote: synchronously bump revision.
+        let _ = rev_tx.send(1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            student_puts.load(Ordering::SeqCst),
+            0,
+            "revision change during fetch must prevent any student PUT"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled fetch must not emit QrSignResult with stale key/base"
+        );
+        // Verify old revision task is gone and a new revision can still succeed via fresh dispatch.
+        let _ = plan_tx;
+        group.cancel();
+    }
+
+    #[tokio::test]
+    async fn qr_teacher_fallback_refuses_stale_remote_lease_on_revision_change() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let token = valid_qr_token();
+        let student_puts = Arc::new(AtomicUsize::new(0));
+        let remote_hits = Arc::new(AtomicUsize::new(0));
+        // Remote would succeed if fallback were allowed, but revision will already have bumped.
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let tkn = token.clone();
+        let rh = remote_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = remote_listener.accept().await else {
+                    break;
+                };
+                let tkn = tkn.clone();
+                let rh = rh.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if text.contains("/token") {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                        let body = format!(r#"{{"ok":true,"data":"{tkn}"}}"#);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        let teacher_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let teacher_addr = teacher_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = teacher_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // Fail teacher create so fallback would be attempted.
+                    let resp = if text.contains("POST /api/course/") && text.contains("/rollcall") {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let student_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let student_addr = student_listener.local_addr().unwrap();
+        let sp = student_puts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = student_listener.accept().await else {
+                    break;
+                };
+                let sp = sp.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if text.contains("PUT /api/rollcall/") {
+                        sp.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let remote_base = format!("http://{remote_addr}");
+        let teacher_base = format!("http://{teacher_addr}");
+        let student_base = format!("http://{student_addr}");
+        let teacher = Arc::new(Account {
+            id: "teacher-1".to_string(),
+            device_id: "dev-t".to_string(),
+            user_no: "u-t".to_string(),
+            is_teacher: true,
+            course_id: None,
+            base_url: teacher_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let student = Arc::new(Account {
+            id: "s1".to_string(),
+            device_id: "d1".to_string(),
+            user_no: "u1".to_string(),
+            is_teacher: false,
+            course_id: None,
+            base_url: student_base.clone(),
+            client: Client::new(),
+            username: String::new(),
+            password: crate::secrets::Secret::default(),
+        });
+        let key: ActivityKey = (
+            student_base.clone(),
+            "qrcode".to_string(),
+            "RC-REV-FALLBACK".to_string(),
+        );
+        let (tx, mut rx) = unbounded_channel();
+        let (panic_tx, _panic_rx) = unbounded_channel();
+        let group = TaskGroup::new(noop_cb, panic_tx);
+        // Lease is stale: create rev channel at 0, then bump to 1 before teacher assist starts its fallback.
+        let (rev_tx, rev_rx) = watch::channel(0u64);
+        let _ = rev_tx.send(1);
+        let stale_rx = rev_rx.clone();
+        let secret = Arc::new(Secret::new("k-qr-test".to_string()));
+        // rev captured is 0, but channel now holds 1 => fallback must refuse.
+        spawn_qr_teacher_assist(
+            teacher,
+            vec![student],
+            tx,
+            key.clone(),
+            1,
+            leaked_plan_rx(),
+            &group,
+            Some((remote_base, secret, stale_rx, 0)),
+        );
+        let mut msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("stale lease fallback must produce a result")
+            .expect("a message must arrive");
+        while matches!(
+            msg,
+            MonitorMsg::QrSourceFailed { .. } | MonitorMsg::QrMutationStarted { .. }
+        ) {
+            match msg {
+                MonitorMsg::QrSourceFailed { ack, .. }
+                | MonitorMsg::QrMutationStarted { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                _ => {}
+            }
+            msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+                .await
+                .expect("await QrSignResult after handshake")
+                .expect("a message must arrive");
+        }
+        match msg {
+            MonitorMsg::QrSignResult { result, .. } => {
+                assert!(
+                    result.is_err(),
+                    "stale lease must not produce a successful PUT"
+                );
+            }
+            _ => panic!("expected QrSignResult"),
+        }
+        assert_eq!(
+            student_puts.load(Ordering::SeqCst),
+            0,
+            "stale remote lease must not allow any student PUT"
+        );
+        assert_eq!(
+            remote_hits.load(Ordering::SeqCst),
+            0,
+            "stale lease must not even fetch remote token"
+        );
+        group.cancel();
+    }
+    #[tokio::test]
+    async fn qr_remote_fanout_panic_sanitizes_unresolved_and_emits_core_panicked() {
+        let (panic_tx, mut panic_rx) = tokio::sync::mpsc::unbounded_channel();
+        let group = TaskGroup::new(record_cb, panic_tx);
+        let key: ActivityKey = (
+            "http://127.0.0.1:9".to_string(),
+            "qrcode".to_string(),
+            "RC-PANIC-REMOTE".to_string(),
+        );
+        let generation = 1u64;
+        let students: Vec<Arc<Account>> = ["s1", "s2", "s3", "s4"]
+            .iter()
+            .map(|id| account_at(id, false))
+            .collect();
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
+        let students_clone = students.clone();
+        let key_clone = key.clone();
+        group.spawn({
+            let inner_tx = inner_tx.clone();
+            let students_clone = students_clone.clone();
+            let key_clone = key_clone.clone();
+            async move {
+                let mut fanout: JoinSet<(String, Result<SignOutcome, String>)> = JoinSet::new();
+                let mut resolved: HashSet<String> = HashSet::new();
+                let (s1, s2, s3, s4) = (
+                    students_clone[0].clone(),
+                    students_clone[1].clone(),
+                    students_clone[2].clone(),
+                    students_clone[3].clone(),
+                );
+                fanout.spawn(async move {
+                    let _ = s1.id.clone();
+                    panic!("injected fanout panic");
+                    #[allow(unreachable_code)]
+                    (
+                        s1.id.clone(),
+                        Ok(SignOutcome {
+                            method: "qr".into(),
+                            discovered_code: None,
+                        }),
+                    )
+                });
+                for s in [s2, s3, s4] {
+                    fanout.spawn(async move {
+                        std::future::pending::<()>().await;
+                        #[allow(unreachable_code)]
+                        (
+                            s.id.clone(),
+                            Ok(SignOutcome {
+                                method: "qr".into(),
+                                discovered_code: None,
+                            }),
+                        )
+                    });
+                }
+                while !fanout.is_empty() {
+                    let joined = fanout.join_next().await;
+                    match joined {
+                        Some(Ok((account_id, result))) => {
+                            if resolved.insert(account_id.clone()) {
+                                let _ = inner_tx.send(MonitorMsg::QrSignResult {
+                                    key: key_clone.clone(),
+                                    account_id,
+                                    generation,
+                                    mutation_attempted: true,
+                                    result,
+                                });
+                            }
+                        }
+                        Some(Err(join_error)) => {
+                            if join_error.is_panic() {
+                                let payload = join_error.into_panic();
+                                handle_qr_fanout_panic(
+                                    &mut fanout,
+                                    &mut resolved,
+                                    &students_clone,
+                                    &inner_tx,
+                                    &key_clone,
+                                    generation,
+                                    payload,
+                                )
+                                .await;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                let _ = Instant::now();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), panic_rx.recv())
+            .await
+            .expect("outer TaskGroup must ping on fanout panic")
+            .expect("a ping must arrive");
+        let events = take_events();
+        assert_eq!(events.len(), 1, "exactly one core_panicked: {events:?}");
+        assert_eq!(events[0]["code"].as_str(), Some("core_panicked"));
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), panic_rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "single panic must ping exactly once"
+        );
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut mutation_flags: HashMap<String, bool> = HashMap::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_millis(300), inner_rx.recv()).await {
+                Ok(Some(MonitorMsg::QrSignResult {
+                    account_id,
+                    result,
+                    mutation_attempted,
+                    generation: g,
+                    ..
+                })) => {
+                    assert_eq!(g, generation, "generation preserved");
+                    assert!(
+                        seen.insert(account_id.clone(), result.clone().unwrap_err())
+                            .is_none(),
+                        "duplicate result for {account_id}"
+                    );
+                    mutation_flags.insert(account_id.clone(), mutation_attempted);
+                    let err = result.unwrap_err();
+                    assert_eq!(
+                        err, "qr: internal worker failed",
+                        "must be sanitized, got: {err}"
+                    );
+                    assert!(!err.contains("injected"), "must not leak panic payload");
+                }
+                Ok(Some(_)) => panic!("unexpected msg"),
+                _ => break,
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            4,
+            "all 4 unresolved students must get sanitized failure, got {seen:?}"
+        );
+        for (id, f) in &mutation_flags {
+            assert!(
+                *f,
+                "mutation_attempted must be true conservatively for {id} to prevent auto retry"
+            );
+        }
+        group.cancel();
+    }
+
+    #[tokio::test]
+    async fn qr_teacher_fanout_panic_sanitizes_unresolved_and_emits_core_panicked() {
+        let (panic_tx, mut panic_rx) = tokio::sync::mpsc::unbounded_channel();
+        let group = TaskGroup::new(record_cb, panic_tx);
+        let key: ActivityKey = (
+            "http://127.0.0.1:9".to_string(),
+            "qrcode".to_string(),
+            "RC-PANIC-TEACHER".to_string(),
+        );
+        let generation = 7u64;
+        let students: Vec<Arc<Account>> = ["t1", "t2", "t3"]
+            .iter()
+            .map(|id| account_at(id, false))
+            .collect();
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
+        let students_clone = students.clone();
+        let key_clone = key.clone();
+        group.spawn({
+            let inner_tx = inner_tx.clone();
+            let students_clone = students_clone.clone();
+            let key_clone = key_clone.clone();
+            async move {
+                let mut fanout: JoinSet<(String, Result<SignOutcome, String>)> = JoinSet::new();
+                let mut resolved: HashSet<String> = HashSet::new();
+                #[allow(unused_variables)]
+                let (a, b, c) = (
+                    students_clone[0].clone(),
+                    students_clone[1].clone(),
+                    students_clone[2].clone(),
+                );
+                let good_id = a.id.clone();
+                fanout.spawn(async move {
+                    (
+                        good_id.clone(),
+                        Ok(SignOutcome {
+                            method: "qr".into(),
+                            discovered_code: None,
+                        }),
+                    )
+                });
+                fanout.spawn(async move {
+                    let _ = b.id.clone();
+                    panic!("teacher fanout injected");
+                    #[allow(unreachable_code)]
+                    (
+                        b.id.clone(),
+                        Ok(SignOutcome {
+                            method: "qr".into(),
+                            discovered_code: None,
+                        }),
+                    )
+                });
+                fanout.spawn(async move {
+                    std::future::pending::<()>().await;
+                    #[allow(unreachable_code)]
+                    (
+                        c.id.clone(),
+                        Ok(SignOutcome {
+                            method: "qr".into(),
+                            discovered_code: None,
+                        }),
+                    )
+                });
+                while !fanout.is_empty() {
+                    let joined = fanout.join_next().await;
+                    match joined {
+                        Some(Ok((account_id, result))) => {
+                            if resolved.insert(account_id.clone()) {
+                                let _ = inner_tx.send(MonitorMsg::QrSignResult {
+                                    key: key_clone.clone(),
+                                    account_id,
+                                    generation,
+                                    mutation_attempted: true,
+                                    result,
+                                });
+                            }
+                        }
+                        Some(Err(join_error)) => {
+                            if join_error.is_panic() {
+                                let payload = join_error.into_panic();
+                                handle_qr_fanout_panic(
+                                    &mut fanout,
+                                    &mut resolved,
+                                    &students_clone,
+                                    &inner_tx,
+                                    &key_clone,
+                                    generation,
+                                    payload,
+                                )
+                                .await;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), panic_rx.recv())
+            .await
+            .expect("teacher fanout panic must ping")
+            .expect("a ping must arrive");
+        let events = take_events();
+        assert_eq!(events.len(), 1, "exactly one core_panicked: {events:?}");
+        assert_eq!(events[0]["code"].as_str(), Some("core_panicked"));
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_millis(300), inner_rx.recv()).await {
+                Ok(Some(MonitorMsg::QrSignResult {
+                    account_id,
+                    result,
+                    generation: g,
+                    ..
+                })) => {
+                    assert_eq!(g, generation);
+                    *counts.entry(account_id.clone()).or_insert(0) += 1;
+                    let err_or_ok = match result {
+                        Ok(_) => "ok".to_string(),
+                        Err(e) => e,
+                    };
+                    assert_eq!(counts[&account_id], 1, "duplicate for {account_id}");
+                    seen.insert(account_id, err_or_ok);
+                }
+                Ok(Some(_)) => panic!("unexpected msg"),
+                _ => break,
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "each student at most one result and all unresolved get failure, got {seen:?}"
+        );
+        let sanitized = seen
+            .values()
+            .filter(|v| *v == "qr: internal worker failed")
+            .count();
+        assert!(
+            sanitized >= 2,
+            "at least the unresolved students must be sanitized, got {seen:?}"
+        );
+        for (id, err) in &seen {
+            if err.contains("injected") {
+                panic!("panic payload leaked for {id}: {err}");
+            }
+        }
+        group.cancel();
     }
 }

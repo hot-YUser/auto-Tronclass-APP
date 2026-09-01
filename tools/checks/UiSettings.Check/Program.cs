@@ -106,6 +106,45 @@ Assert(llm.IsDirty, "另一張卡回填不得清除 LLM 卡的 dirty");
 llm.Saved();
 Assert(llm.ShouldPopulate, "LLM 卡儲存後重新允許核心回填");
 
+// --- QR 遠端 hint：僅最小必填與 http(s) 絕對 URL，正規化留給 core ---
+Assert(SettingsSync.TryHintQrRemoteBaseUrl("https://example.com", out _), "hint https accepted");
+Assert(SettingsSync.TryHintQrRemoteBaseUrl("https://example.com/path", out _), "hint https path accepted");
+Assert(SettingsSync.TryHintQrRemoteBaseUrl("http://localhost:8080/", out _), "hint http localhost accepted");
+Assert(SettingsSync.TryHintQrRemoteBaseUrl("http://127.0.0.1:3000", out _), "hint http 127 accepted");
+Assert(!SettingsSync.TryHintQrRemoteBaseUrl("", out _), "hint empty rejected");
+Assert(!SettingsSync.TryHintQrRemoteBaseUrl("   ", out _), "hint whitespace rejected");
+Assert(!SettingsSync.TryHintQrRemoteBaseUrl("not-a-url", out _), "hint malformed rejected");
+Assert(!SettingsSync.TryHintQrRemoteBaseUrl("ftp://example.com/v1", out _), "hint ftp rejected");
+Assert(!SettingsSync.TryHintQrRemoteBaseUrl("example.com", out _), "hint relative rejected");
+// default-port 輸入 https://example.com:443/ 在 UI 僅視為 hint 通過（不視為 canonical），core 才正規化為 https://example.com
+Assert(SettingsSync.TryHintQrRemoteBaseUrl("https://example.com:443/", out _), "hint default-port input accepted as raw, not canonical");
+Assert(SettingsSync.TryHintQrRemoteBaseUrl("https://example.com:443/", out var hintErr2) && hintErr2 == "", "hint default-port error empty on success");
+
+// --- QR 遠端 per-card dirty 隔離：_qrRemoteSync 與 _llmSync / _monitorSync 彼此獨立 ---
+{
+    var qr = new SettingsCardSync();
+    var otherLlm = new SettingsCardSync();
+    var otherMonitor = new SettingsCardSync();
+    qr.Populated();
+    otherLlm.Populated();
+    otherMonitor.Populated();
+    qr.MarkEdited();
+    Assert(!qr.ShouldPopulate && qr.IsDirty, "qr edited blocks its own populate");
+    Assert(otherLlm.ShouldPopulate && !otherLlm.IsDirty, "llm card unaffected by qr dirty");
+    Assert(otherMonitor.ShouldPopulate && !otherMonitor.IsDirty, "monitor card unaffected by qr dirty");
+    otherLlm.MarkEdited();
+    Assert(otherLlm.IsDirty && !otherLlm.ShouldPopulate, "llm dirty independent");
+    Assert(qr.IsDirty, "qr dirty still held after llm edit");
+    qr.Saved();
+    Assert(qr.ShouldPopulate && !qr.IsDirty, "qr saved clears only its own dirty");
+    Assert(otherLlm.IsDirty, "llm dirty survives qr save");
+    otherMonitor.Populated();
+    Assert(otherLlm.IsDirty, "monitor repopulate must not clear llm/qr dirty");
+    otherLlm.Saved();
+    otherMonitor.MarkEdited();
+    Assert(otherMonitor.IsDirty && !otherMonitor.ShouldPopulate, "monitor dirty after save+edit");
+}
+
 var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
 var spring = new WeeklyScheduleSpec(sunday:
 [

@@ -244,6 +244,10 @@ pub enum Command {
         id: u64,
         key: String,
     },
+    SetQrRemoteKey {
+        id: u64,
+        key: String,
+    },
     UpdateConfig {
         id: u64,
         patch: serde_json::Value,
@@ -287,6 +291,7 @@ impl Command {
             | Self::DiscardAnswer { id, .. }
             | Self::SetAnswer { id, .. }
             | Self::SetLlmKey { id, .. }
+            | Self::SetQrRemoteKey { id, .. }
             | Self::UpdateConfig { id, .. }
             | Self::Shutdown { id } => *id,
         }

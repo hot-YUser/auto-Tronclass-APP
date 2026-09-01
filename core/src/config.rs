@@ -75,6 +75,10 @@ pub struct Settings {
     pub quiz_detect_secs: u64,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default = "default_qr_remote_enabled")]
+    pub qr_remote_enabled: bool,
+    #[serde(default = "default_qr_remote_base_url")]
+    pub qr_remote_base_url: String,
 }
 
 impl Default for Settings {
@@ -99,6 +103,8 @@ impl Default for Settings {
             poll_idle_secs: default_poll_idle_secs(),
             quiz_detect_secs: default_quiz_detect_secs(),
             log_level: default_log_level(),
+            qr_remote_enabled: default_qr_remote_enabled(),
+            qr_remote_base_url: default_qr_remote_base_url(),
         }
     }
 }
@@ -177,6 +183,7 @@ impl Settings {
         )?;
         validate_range("poll_idle_secs", self.poll_idle_secs, 1, 86_400)?;
         validate_range("quiz_detect_secs", self.quiz_detect_secs, 1, 86_400)?;
+        validate_qr_remote(&self.qr_remote_enabled, &self.qr_remote_base_url)?;
         Ok(())
     }
 }
@@ -732,6 +739,113 @@ fn valid_http_url(value: &str) -> bool {
     })
 }
 
+pub fn normalize_qr_remote_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("qr_remote_base_url 不得為空".to_string());
+    }
+    // No backtracking: empty string before/after? already checked
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|_| "qr_remote_base_url 必須是有效的 http(s) URL".to_string())?;
+    let scheme = url.scheme().to_string();
+    if scheme != "http" && scheme != "https" {
+        return Err("qr_remote_base_url 僅支援 http/https".to_string());
+    }
+    if url.host_str().is_none_or(|host| host.trim().is_empty()) {
+        return Err("qr_remote_base_url 必須包含 host".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("qr_remote_base_url 不得包含帳號資訊".to_string());
+    }
+    if url.query().is_some() {
+        return Err("qr_remote_base_url 不得包含 query".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("qr_remote_base_url 不得包含 fragment".to_string());
+    }
+    if scheme == "http" && !is_qr_remote_allowed_http_host(url.host_str().unwrap_or("")) {
+        return Err("http 僅允許 localhost 或 127.0.0.0/8、::1".to_string());
+    }
+    // Normalize: remove trailing slash unless it's bare origin with path "/"
+    // Store without trailing slash for consistent /token join; url crate keeps path "/".
+    let path = url.path().to_string();
+    let normalized = if path == "/" {
+        // origin only: keep origin (e.g. https://api.example)
+        let origin = url.origin().ascii_serialization();
+        // preserve non-default port already in origin
+        origin
+    } else {
+        // Keep origin + path without trailing slash
+        let origin = url.origin().ascii_serialization();
+        let trimmed_path = path.trim_end_matches('/');
+        if trimmed_path.is_empty() {
+            origin
+        } else {
+            format!("{}{}", origin, trimmed_path)
+        }
+    };
+    // Validate final shape still has no userinfo/query/fragment
+    let check = reqwest::Url::parse(&normalized)
+        .map_err(|_| "qr_remote_base_url 必須是有效的 http(s) URL".to_string())?;
+    if check.query().is_some()
+        || check.fragment().is_some()
+        || !check.username().is_empty()
+        || check.password().is_some()
+    {
+        return Err("qr_remote_base_url 必須是有效的 http(s) URL".to_string());
+    }
+    // Re-enforce http loopback on normalized host (normalized parsing may bracket IPv6)
+    if check.scheme() == "http" && !is_qr_remote_allowed_http_host(check.host_str().unwrap_or("")) {
+        return Err("http 僅允許 localhost 或 127.0.0.0/8、::1".to_string());
+    }
+    Ok(normalized)
+}
+
+pub fn is_qr_remote_allowed_http_host(host: &str) -> bool {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "localhost" || lower == "localhost." {
+        return true;
+    }
+    if let Ok(ip) = lower
+        .trim_matches(|character| character == '[' || character == ']')
+        .parse::<std::net::IpAddr>()
+    {
+        return is_qr_remote_loopback_ip(ip);
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        return is_qr_remote_loopback_ip(ip);
+    }
+    false
+}
+
+fn is_qr_remote_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets()[0] == 127,
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+fn validate_qr_remote(enabled: &bool, base_url: &str) -> Result<(), String> {
+    let trimmed = base_url.trim();
+    if !enabled {
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        // Even when disabled the stored URL must be a syntactically valid allowed URL when non-empty.
+        normalize_qr_remote_base_url(base_url).map(|_| ())?;
+        return Ok(());
+    }
+    if trimmed.is_empty() {
+        return Err("qr_remote_enabled 為 true 時 qr_remote_base_url 不得為空".to_string());
+    }
+    normalize_qr_remote_base_url(base_url).map(|_| ())?;
+    Ok(())
+}
+
 fn default_countdown() -> u64 {
     15
 }
@@ -791,6 +905,13 @@ fn default_quiz_detect_secs() -> u64 {
 }
 fn default_log_level() -> String {
     "normal".to_string()
+}
+
+fn default_qr_remote_enabled() -> bool {
+    false
+}
+fn default_qr_remote_base_url() -> String {
+    "https://api.hlp.qzz.io".to_string()
 }
 
 #[derive(Deserialize)]
@@ -1223,5 +1344,160 @@ mod tests {
             .chain(group.chars())
             .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)));
         assert_ne!(account, group);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn qr_remote_old_json_defaults_and_validation() {
+        // Old schema v1 config without qr fields must load with defaults (enabled false, default base).
+        let old = json!({
+            "schema_version": 1,
+            "config_revision": 0,
+            "schedule_revision": 0,
+            "accounts": [],
+            "settings": { "countdown_secs": 30 },
+            "groups": [],
+            "monitoring": { "global_schedule": { "monday": [], "tuesday": [], "wednesday": [], "thursday": [], "friday": [], "saturday": [], "sunday": [] }, "time_zone": { "kind": "device" }, "all_suspended": false },
+            "runtime": { "manual_overrides": [], "group_rotation": {}, "platform_block": null }
+        });
+        let config: Config = serde_json::from_value(old).unwrap();
+        assert!(!config.settings.qr_remote_enabled);
+        assert_eq!(config.settings.qr_remote_base_url, "https://api.hlp.qzz.io");
+        assert!(config.settings.validate().is_ok());
+
+        // Valid HTTPS and loopback HTTP accepted
+        for url in [
+            "https://api.example.com",
+            "https://api.example.com:8443/path",
+            "http://localhost:8080",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            assert!(normalize_qr_remote_base_url(url).is_ok(), "{url}");
+        }
+        // Invalid: scheme, userinfo, query, fragment, non-loopback http
+        for url in [
+            "ftp://example.com",
+            "https://user:pass@example.com",
+            "https://example.com?x=1",
+            "https://example.com#frag",
+            "http://example.com",
+            "http://192.168.1.1:8080",
+            "http://10.0.0.1",
+            "https://",
+        ] {
+            assert!(
+                normalize_qr_remote_base_url(url).is_err(),
+                "{url} must be invalid"
+            );
+        }
+        // Non-loopback HTTP rejected even with path
+        assert!(normalize_qr_remote_base_url("http://8.8.8.8/token").is_err());
+
+        // Strict patch typing is enforced via apply_config_patch; verify normalize rejects wrong types via Settings validate boundary
+        // Direct validation of wrong-typed patch is exercised via engine::tests::update_config_rejects_malformed; here verify URL normalization errors
+
+        // Validation/save failure leaves disk unchanged is covered by existing persisted_settings tests; here verify enabled true with empty URL fails validation
+        let mut s = Settings::default();
+        s.qr_remote_enabled = true;
+        s.qr_remote_base_url = "".to_string();
+        assert!(s.validate().is_err());
+        s.qr_remote_base_url = "https://api.hlp.qzz.io".to_string();
+        assert!(s.validate().is_ok());
+        // Disabled may retain default/valid URL
+        let mut s2 = Settings::default();
+        s2.qr_remote_enabled = false;
+        s2.qr_remote_base_url = "https://api.hlp.qzz.io".to_string();
+        assert!(s2.validate().is_ok());
+        #[allow(clippy::field_reassign_with_default)]
+        {
+            let mut s3 = Settings::default();
+            s3.qr_remote_enabled = true;
+            s3.qr_remote_base_url = "http://127.0.0.1:8080".to_string();
+            assert!(s3.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn qr_remote_normalization_trims_and_strips_trailing_slash() {
+        assert_eq!(
+            normalize_qr_remote_base_url(" https://example.com/ ").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_qr_remote_base_url("https://example.com///").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_qr_remote_base_url("https://example.com/path/").unwrap(),
+            "https://example.com/path"
+        );
+        assert_eq!(
+            normalize_qr_remote_base_url("http://localhost:8080/").unwrap(),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn qr_remote_disabled_empty_symmetry_and_enabled_empty_rejects() {
+        // Disabled + trimmed empty base is valid through load/save/validate
+        let mut disabled_empty = Settings::default();
+        disabled_empty.qr_remote_enabled = false;
+        disabled_empty.qr_remote_base_url = "".to_string();
+        assert!(disabled_empty.validate().is_ok());
+        disabled_empty.qr_remote_base_url = "   ".to_string();
+        assert!(disabled_empty.validate().is_ok());
+
+        // Enabled + empty (or whitespace) is rejected
+        let mut enabled_empty = Settings::default();
+        enabled_empty.qr_remote_enabled = true;
+        enabled_empty.qr_remote_base_url = "".to_string();
+        assert!(enabled_empty.validate().is_err());
+        enabled_empty.qr_remote_base_url = "   ".to_string();
+        assert!(enabled_empty.validate().is_err());
+
+        // Old JSON without qr fields defaults correctly and validates
+        let old = serde_json::json!({
+            "schema_version": 1, "config_revision": 0, "schedule_revision": 0,
+            "accounts": [],
+            "settings": { "countdown_secs": 30 },
+            "groups": [], "monitoring": { "global_schedule": { "monday": [], "tuesday": [], "wednesday": [], "thursday": [], "friday": [], "saturday": [], "sunday": [] }, "time_zone": { "kind": "device" }, "all_suspended": false },
+            "runtime": { "manual_overrides": [], "group_rotation": {}, "platform_block": null }
+        });
+        let c: Config = serde_json::from_value(old).unwrap();
+        assert!(!c.settings.qr_remote_enabled);
+        assert_eq!(c.settings.qr_remote_base_url, "https://api.hlp.qzz.io");
+
+        // Disabled+empty persists through save/load symmetry; enabled+empty rejected at save
+        {
+            let path = temporary_path("qr-disabled-empty-sym");
+            let mut cfg = Config::default();
+            cfg.settings.qr_remote_enabled = false;
+            cfg.settings.qr_remote_base_url = "".to_string();
+            cfg.save(&path).unwrap();
+            let loaded = Config::load(&path).unwrap();
+            assert_eq!(loaded.settings.qr_remote_base_url, "");
+            assert!(loaded.settings.validate().is_ok());
+            let mut cfg2 = Config::default();
+            cfg2.settings.qr_remote_enabled = true;
+            cfg2.settings.qr_remote_base_url = "".to_string();
+            assert!(cfg2.save(&path).is_err());
+            let mut cfg3 = Config::default();
+            cfg3.settings.qr_remote_enabled = true;
+            cfg3.settings.qr_remote_base_url = "   ".to_string();
+            assert!(cfg3.save(&path).is_err());
+            let _ = fs::remove_file(&path);
+        }
+
+        // Disabled+empty patch accepted; enabled+empty patch rejected at final validate (smoke via validate)
+        // Nonempty core normalization shape — core strips trailing slash, not UI
+        assert!(normalize_qr_remote_base_url("https://example.com/path/")
+            .unwrap()
+            .ends_with("/path"));
+        assert_eq!(
+            normalize_qr_remote_base_url("https://example.com:443/").unwrap(),
+            "https://example.com"
+        );
     }
 }
