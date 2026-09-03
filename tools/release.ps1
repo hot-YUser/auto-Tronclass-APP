@@ -636,7 +636,7 @@ if (-not $SkipWindows) {
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $stage), $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
     Remove-Item -LiteralPath $stage -Recurse -Force
-    Write-Host ("  ✓ dist\$winName.zip ({0:N0} MB)" -f ((Get-Item -LiteralPath $zip).Length / 1MB)) -ForegroundColor Green
+    Write-Host ("  ✓ dist\$winName.zip ({0:N0} MB, {1:N0} bytes)" -f ((Get-Item -LiteralPath $zip).Length / 1MB), (Get-Item -LiteralPath $zip).Length) -ForegroundColor Green
 
     if (-not $SkipInstaller) {
         $iscc = @(
@@ -654,7 +654,7 @@ if (-not $SkipWindows) {
         ) -FailureMessage "Inno 安裝檔建置失敗"
         $setup = Join-Path $dist "$setupName.exe"
         if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "沒產出 setup.exe" }
-        Write-Host ("  ✓ dist\$setupName.exe ({0:N0} MB)" -f ((Get-Item -LiteralPath $setup).Length / 1MB)) -ForegroundColor Green
+        Write-Host ("  ✓ dist\$setupName.exe ({0:N0} MB, {1:N0} bytes)" -f ((Get-Item -LiteralPath $setup).Length / 1MB), (Get-Item -LiteralPath $setup).Length) -ForegroundColor Green
     }
 }
 
@@ -736,7 +736,7 @@ if (-not $SkipAndroid) {
         throw "APK versionName 不符：實際 $($vnMatch.Groups[1].Value)；預期 $($version.DisplayVersion)"
     }
     Write-Host ("  ✓ APK versionCode=$($vcMatch.Groups[1].Value) versionName=$($vnMatch.Groups[1].Value)") -ForegroundColor Green
-    Write-Host ("  ✓ dist\$apkName ({0:N0} MB)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB)) -ForegroundColor Green
+    Write-Host ("  ✓ dist\$apkName ({0:N0} MB, {1:N0} bytes)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB), $apk.Length) -ForegroundColor Green
 }
 
 # 長時間雙平台建置期間若 HEAD、tracked source 或要求的 tag 被移動，先前記下的 SHA 已不再
@@ -769,7 +769,7 @@ foreach ($asset in $expectedAssets) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "缺少預期發行資產：$asset" }
     $item = Get-Item -LiteralPath $asset
     if ($item.Length -le 0) { throw "發行資產為空：$asset" }
-    Write-Host ("  {0}  {1:N0} MB" -f $item.Name, ($item.Length / 1MB))
+    Write-Host ("  {0}  {1:N0} MB ({2:N0} bytes)" -f $item.Name, ($item.Length / 1MB), $item.Length)
 }
 $noteLines = @(
     "# Auto-Tronclass $Tag",
@@ -797,6 +797,15 @@ $toolchains = [ordered]@{
     dotnet = Get-ToolVersion -Name $dotnet
 }
 if (-not $SkipAndroid) { $toolchains["ndk"] = [string]$androidMarker.ndkVersion }
+# 產物位元組數：此處所有平台產物皆已是最終形態(上方的存在性＋非空斷言剛跑完)，
+# 無需第二次建置即可記錄；僅新增 assets 欄位(檔名＋bytes)，既有欄位與 schema=1 不動，
+# 無任何解析此檔的程式碼(僅 CI/README 列檔名)，故不構成 schema break。無尺寸硬閘門。
+$assetSizes = @(
+    foreach ($file in @($expectedAssets + $metadataPath)) {
+        [ordered]@{ name = [IO.Path]::GetFileName($file); bytes = (Get-Item -LiteralPath $file).Length }
+    }
+    [ordered]@{ name = [IO.Path]::GetFileName($sumsPath); bytes = $null }
+)
 $metadata = [ordered]@{
     schema         = 1
     tag            = $version.Tag
@@ -808,6 +817,7 @@ $metadata = [ordered]@{
     commit         = $headSha
     builtAtUtc     = [DateTime]::UtcNow.ToString("o")
     toolchains     = $toolchains
+    assets         = @($assetSizes)
 }
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding UTF8
 
@@ -816,6 +826,20 @@ foreach ($file in @($expectedAssets + $metadataPath)) {
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
     $sumLines += "{0}  {1}" -f $hash, [IO.Path]::GetFileName($file)
 }
+$sumLines = @($sumLines | Sort-Object)
+Set-Content -LiteralPath $sumsPath -Encoding ASCII -Value ($sumLines -join "`n")
+# SHA256SUMS 定稿後回填自己的位元組數：metadata 內容隨之變更，故僅重算它自己的
+# hash 行並重寫 sums；其餘產物 hash 一律不動，SHA256SUMS 仍是準確的 manifest。
+$metadataSumsBytes = (Get-Item -LiteralPath $sumsPath).Length
+$metadataJson = Get-Content -Raw -LiteralPath $metadataPath | ConvertFrom-Json
+foreach ($entry in @($metadataJson.assets)) {
+    if ($entry.name -eq [IO.Path]::GetFileName($sumsPath)) { $entry.bytes = $metadataSumsBytes }
+}
+$metadataJson | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding UTF8
+$metadataName = [IO.Path]::GetFileName($metadataPath)
+$metadataRehash = (Get-FileHash -LiteralPath $metadataPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$sumLines = @($sumLines | Where-Object { -not $_.EndsWith("  $metadataName") })
+$sumLines += "{0}  {1}" -f $metadataRehash, $metadataName
 $sumLines = @($sumLines | Sort-Object)
 Set-Content -LiteralPath $sumsPath -Encoding ASCII -Value ($sumLines -join "`n")
 foreach ($asset in $releaseAssets) {
