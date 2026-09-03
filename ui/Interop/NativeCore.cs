@@ -24,6 +24,16 @@ public sealed class NativeCore : ICore, IDisposable
     private static int _disposed;     // 1 = 已釋放:不再接受 core_send/事件
     private static readonly object SendGate = new(); // 序列化 core_send;與 core_free 互斥
     private static readonly ConcurrentDictionary<ulong, TaskCompletionSource<JsonElement>> Pending = new();
+    // 進行中命令上限(fail-closed):UI 併發常態是個位數——AppState 以 key 去重同時命令、
+    // ScheduleCoordinator 一次只發一條 clock、boot 一條 Init；32 留足餘量。配額以
+    // SemaphoreSlim 精確執行:admission 成功才配 id；callback/timeout/dispose/Send 失敗
+    // 四條移除路徑,成功 TryRemove 者 Release 恰一次。300s captcha-safe timeout 與
+    // SendGate/core_free 互斥語義一律不動。
+    // internal 可見性是給 DeviceKey.Check 的:該檢查以 Link 方式直接編入本檔,
+    // 同組件內可做來源級契約斷言(上限範圍＋剩餘配額),免走 P/Invoke。
+    internal const int MaxPendingCommands = 32;
+    private static readonly SemaphoreSlim PendingGate = new(MaxPendingCommands, MaxPendingCommands);
+    internal static int PendingSlotsAvailable => PendingGate.CurrentCount;
     private static readonly ConcurrentQueue<JsonElement> EventQueue = new();
     private static int _eventDrainScheduled;
 
@@ -62,7 +72,10 @@ public sealed class NativeCore : ICore, IDisposable
         // 完成所有 pending:等待中的 SendAsync 立刻以失敗收尾,不會懸住 caller。
         foreach (var (id, tcs) in Pending)
             if (Pending.TryRemove(id, out var t))
+            {
+                PendingGate.Release();
                 t.TrySetResult(DisposedReply(id));
+            }
         lock (SendGate)
         {
             unsafe
@@ -147,9 +160,13 @@ public sealed class NativeCore : ICore, IDisposable
 
     public async Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields)
     {
+        // 早退(已釋放／未啟動)不配 id、不碰配額:合成回覆的 id 固定 0,永不與 Pending 中的真實 id 碰撞。
+        if (Volatile.Read(ref _disposed) == 1) return DisposedReply(0);
+        if (!HasNativeHandle()) return CoreUnavailableReply(0, cmd);
+        // 配額先行:滿了立刻 fail-closed(不排隊)。id 在准入之後才配；配額的釋放與
+        // Pending 移除嚴格同生共死——TryRemove 成功者釋放恰一次,共四處:回呼／逾時／釋放／傳送失敗。
+        if (!PendingGate.Wait(TimeSpan.Zero)) return PendingFullReply(cmd);
         var id = (ulong)Interlocked.Increment(ref _nextId);
-        if (Volatile.Read(ref _disposed) == 1) return DisposedReply(id);
-        if (!HasNativeHandle()) return CoreUnavailableReply(id, cmd);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = tcs;
 
@@ -159,7 +176,7 @@ public sealed class NativeCore : ICore, IDisposable
         }
         catch
         {
-            Pending.TryRemove(id, out _);
+            if (Pending.TryRemove(id, out _)) PendingGate.Release();
             throw;
         }
 
@@ -167,10 +184,16 @@ public sealed class NativeCore : ICore, IDisposable
         using var reg = cts.Token.Register(() =>
         {
             if (Pending.TryRemove(id, out var t))
+            {
+                PendingGate.Release();
                 t.TrySetResult(TimeoutReply(id, cmd));
+            }
         });
         return await tcs.Task;
     }
+
+    private static JsonElement PendingFullReply(string cmd) =>
+        FailedReply(0, $"進行中命令已滿（{MaxPendingCommands}），拒絕新命令（{cmd}）。");
 
     private static JsonElement TimeoutReply(ulong id, string cmd) =>
         FailedReply(id, $"命令逾時：核心未在 {CommandTimeout.TotalSeconds:0} 秒內回覆（{cmd}）");
@@ -267,7 +290,11 @@ public sealed class NativeCore : ICore, IDisposable
         // A numeric id is a command reply → complete the awaiting Task. (Events carry id == null.)
         if (root.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.Number)
         {
-            if (Pending.TryRemove(idEl.GetUInt64(), out var tcs)) tcs.SetResult(root.Clone());
+            if (Pending.TryRemove(idEl.GetUInt64(), out var tcs))
+            {
+                PendingGate.Release();
+                tcs.SetResult(root.Clone());
+            }
             return;
         }
 
