@@ -12,6 +12,7 @@ try
     CheckConflictingLegacyKeyIsPreserved(Path.Combine(root, "conflict"));
     CheckCorruptLegacyKeyIsPreserved(Path.Combine(root, "corrupt-legacy"));
     CheckNativeCoreLifecycle();
+    CheckNativeCorePendingCap();
     Console.WriteLine("DeviceKey.Check：全部通過");
 }
 finally
@@ -95,6 +96,14 @@ static void CheckCorruptLegacyKeyIsPreserved(string directory)
     Assert(!File.Exists(Path.Combine(directory, "device.key.os")), "損毀 key 不得建立新 envelope");
 }
 
+/// <summary>Pending 命令上限的來源級契約(免 native DLL):上限落在低十位數、閒置時配額全滿。</summary>
+static void CheckNativeCorePendingCap()
+{
+    Assert(NativeCore.MaxPendingCommands >= 8 && NativeCore.MaxPendingCommands <= 64,
+        $"Pending 上限必須是低十位數(合法 UI 併發為個位數)：{NativeCore.MaxPendingCommands}");
+    Assert(NativeCore.PendingSlotsAvailable == NativeCore.MaxPendingCommands,
+        "閒置時剩餘配額必須等於上限");
+}
 /// <summary>NativeCore 生命週期契約(免 native DLL):單一實例、dispose 後 fail-closed、命令/啟動不假成功。</summary>
 static void CheckNativeCoreLifecycle()
 {

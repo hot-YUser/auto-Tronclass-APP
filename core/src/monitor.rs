@@ -2948,24 +2948,27 @@ fn dispatch_signs_for(
                 let base = cfg.qr_remote_base_url.clone();
                 if let Some(secret) = cfg.qr_remote_key.clone() {
                     if !secret.expose().trim().is_empty() {
-                        let normalized = crate::config::normalize_qr_remote_base_url(&base)
-                            .unwrap_or(base.clone());
-                        let gen = a.plan_generation;
-                        let rx = plan_tx.subscribe();
-                        let k = key.clone();
-                        spawn_qr_remote(
-                            normalized,
-                            secret,
-                            students,
-                            tx.clone(),
-                            k,
-                            gen,
-                            rx,
-                            qr_rev_rx,
-                            qr_rev,
-                            group,
-                        );
-                        return;
+                        // Fail closed: the guard above already validated this URL, but if
+                        // normalization ever fails here, fall through to the source-failure
+                        // path below — never dispatch with a raw unnormalized URL.
+                        if let Ok(normalized) = crate::config::normalize_qr_remote_base_url(&base) {
+                            let gen = a.plan_generation;
+                            let rx = plan_tx.subscribe();
+                            let k = key.clone();
+                            spawn_qr_remote(
+                                normalized,
+                                secret,
+                                students,
+                                tx.clone(),
+                                k,
+                                gen,
+                                rx,
+                                qr_rev_rx,
+                                qr_rev,
+                                group,
+                            );
+                            return;
+                        }
                     }
                 }
             }

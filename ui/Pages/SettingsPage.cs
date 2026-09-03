@@ -159,7 +159,7 @@ public sealed class SettingsPage : ContentPage
                 {
                     var baseUrl = _qrBaseUrl.Text?.Trim() ?? "";
                     if (_qrEnabled.IsToggled && baseUrl.Length == 0) { state.Notify("error", "啟用時遠端位址不可空白"); return; }
-                    if (_qrEnabled.IsToggled && !TryHintQrRemoteBaseUrl(baseUrl, out var err))
+                    if (_qrEnabled.IsToggled && !SettingsSync.TryHintQrRemoteBaseUrl(baseUrl, out var err))
                     {
                         state.Notify("error", err);
                         return;
@@ -339,17 +339,6 @@ public sealed class SettingsPage : ContentPage
         control.VerticalOptions = LayoutOptions.Center;
         g.Add(control, 1, 0);
         return g;
-    }
-
-    static bool TryHintQrRemoteBaseUrl(string text, out string error)
-    {
-        error = "";
-        var trimmed = text.Trim();
-        if (trimmed.Length == 0) { error = "遠端位址不得為空"; return false; }
-        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)) { error = "遠端位址格式不正確"; return false; }
-        if (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp) { error = "僅支援 http/https"; return false; }
-        if (string.IsNullOrEmpty(uri.Host)) { error = "必須包含 host"; return false; }
-        return true;
     }
 
     void BuildCaps()

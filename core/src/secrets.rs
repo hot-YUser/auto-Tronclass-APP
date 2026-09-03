@@ -296,14 +296,6 @@ impl VaultFile {
         key.zeroize();
         result
     }
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub fn get_qr_remote_key(&self) -> Option<String> {
-        self.key.as_ref()?;
-        self.data
-            .get(QR_REMOTE_KEY_ID)
-            .map(|secret| secret.password.clone())
-            .filter(|key| !key.is_empty())
-    }
     pub fn get_qr_remote_key_secret(&self) -> Option<Secret> {
         self.key.as_ref()?;
         self.data
@@ -606,7 +598,10 @@ mod tests {
         vault.set_qr_remote_key("qr-secret-value".into()).unwrap();
         assert!(vault.has_qr_remote_key());
         assert_eq!(
-            vault.get_qr_remote_key().as_deref(),
+            vault
+                .get_qr_remote_key_secret()
+                .as_ref()
+                .map(|secret| secret.expose()),
             Some("qr-secret-value")
         );
         // Redaction must hide the raw key
@@ -621,7 +616,7 @@ mod tests {
         // Empty clears
         vault.set_qr_remote_key(String::new()).unwrap();
         assert!(!vault.has_qr_remote_key());
-        assert!(vault.get_qr_remote_key().is_none());
+        assert!(vault.get_qr_remote_key_secret().is_none());
         // Wrong key fails to unlock
         let wrong = [9u8; 32];
         assert!(VaultFile::unlock_with_key(&dir.join("vault.bin"), wrong).is_err());
@@ -650,14 +645,20 @@ mod tests {
             "bad\u{00}key",
             "bad\u{1f}key",
         ] {
-            let before = vault.get_qr_remote_key();
+            let before = vault
+                .get_qr_remote_key_secret()
+                .as_ref()
+                .map(|secret| secret.expose().to_string());
             let err = vault.set_qr_remote_key(bad.to_string()).unwrap_err();
             assert!(
                 err.contains("空白") || err.contains("格式"),
                 "bad {bad:?} err {err}"
             );
             assert_eq!(
-                vault.get_qr_remote_key(),
+                vault
+                    .get_qr_remote_key_secret()
+                    .as_ref()
+                    .map(|secret| secret.expose().to_string()),
                 before,
                 "vault unchanged for {bad:?}"
             );
@@ -670,7 +671,10 @@ mod tests {
         ] {
             vault.set_qr_remote_key(raw.to_string()).unwrap();
             assert_eq!(
-                vault.get_qr_remote_key().as_deref(),
+                vault
+                    .get_qr_remote_key_secret()
+                    .as_ref()
+                    .map(|secret| secret.expose()),
                 Some(canonical),
                 "surrounding whitespace must trim for {raw:?}"
             );
@@ -680,7 +684,6 @@ mod tests {
         // Whitespace-only clears (empty means clear)
         vault.set_qr_remote_key("   ".into()).unwrap();
         assert!(!vault.has_qr_remote_key());
-        assert!(vault.get_qr_remote_key().is_none());
         assert!(vault.get_qr_remote_key_secret().is_none());
         // Set again and verify zeroizing Secret accessor
         vault.set_qr_remote_key("qr-secret-value".into()).unwrap();

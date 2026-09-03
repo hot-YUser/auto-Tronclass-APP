@@ -768,6 +768,11 @@ pub fn normalize_qr_remote_base_url(value: &str) -> Result<String, String> {
     }
     // Normalize: remove trailing slash unless it's bare origin with path "/"
     // Store without trailing slash for consistent /token join; url crate keeps path "/".
+    // Single-parse construction: origin() keeps scheme/host/port only — userinfo, query and
+    // fragment are dropped and default ports canonicalized by construction — and the appended
+    // path slice comes from url.path(), which cannot contain '?' or '#'. The http loopback
+    // rule was already enforced on this same parsed value above (the host helper also accepts
+    // bracketed IPv6), so no second parse is needed.
     let path = url.path().to_string();
     let normalized = if path == "/" {
         // origin only: keep origin (e.g. https://api.example)
@@ -784,20 +789,6 @@ pub fn normalize_qr_remote_base_url(value: &str) -> Result<String, String> {
             format!("{}{}", origin, trimmed_path)
         }
     };
-    // Validate final shape still has no userinfo/query/fragment
-    let check = reqwest::Url::parse(&normalized)
-        .map_err(|_| "qr_remote_base_url 必須是有效的 http(s) URL".to_string())?;
-    if check.query().is_some()
-        || check.fragment().is_some()
-        || !check.username().is_empty()
-        || check.password().is_some()
-    {
-        return Err("qr_remote_base_url 必須是有效的 http(s) URL".to_string());
-    }
-    // Re-enforce http loopback on normalized host (normalized parsing may bracket IPv6)
-    if check.scheme() == "http" && !is_qr_remote_allowed_http_host(check.host_str().unwrap_or("")) {
-        return Err("http 僅允許 localhost 或 127.0.0.0/8、::1".to_string());
-    }
     Ok(normalized)
 }
 
@@ -1420,6 +1411,25 @@ mod tests {
 
     #[test]
     fn qr_remote_normalization_trims_and_strips_trailing_slash() {
+        // Exact canonical outputs — single-parse construction must hold every row.
+        for (raw, canonical) in [
+            (" https://example.com/ ", "https://example.com"),
+            ("https://example.com///", "https://example.com"),
+            ("https://example.com/path/", "https://example.com/path"),
+            ("https://example.com/a//b///", "https://example.com/a//b"),
+            ("http://localhost:8080/", "http://localhost:8080"),
+            ("http://127.0.0.1:8080/base/", "http://127.0.0.1:8080/base"),
+            ("http://[::1]:9000/", "http://[::1]:9000"),
+            ("https://example.com:443/", "https://example.com"),
+            ("https://example.com:8443/", "https://example.com:8443"),
+            ("http://localhost:80/", "http://localhost"),
+        ] {
+            assert_eq!(
+                normalize_qr_remote_base_url(raw).unwrap(),
+                canonical,
+                "raw {raw:?}"
+            );
+        }
         assert_eq!(
             normalize_qr_remote_base_url(" https://example.com/ ").unwrap(),
             "https://example.com"

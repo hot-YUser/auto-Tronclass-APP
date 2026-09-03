@@ -636,7 +636,7 @@ if (-not $SkipWindows) {
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $stage), $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
     Remove-Item -LiteralPath $stage -Recurse -Force
-    Write-Host ("  ✓ dist\$winName.zip ({0:N0} MB)" -f ((Get-Item -LiteralPath $zip).Length / 1MB)) -ForegroundColor Green
+    Write-Host ("  ✓ dist\$winName.zip ({0:N0} MB, {1:N0} bytes)" -f ((Get-Item -LiteralPath $zip).Length / 1MB), (Get-Item -LiteralPath $zip).Length) -ForegroundColor Green
 
     if (-not $SkipInstaller) {
         $iscc = @(
@@ -654,7 +654,7 @@ if (-not $SkipWindows) {
         ) -FailureMessage "Inno 安裝檔建置失敗"
         $setup = Join-Path $dist "$setupName.exe"
         if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "沒產出 setup.exe" }
-        Write-Host ("  ✓ dist\$setupName.exe ({0:N0} MB)" -f ((Get-Item -LiteralPath $setup).Length / 1MB)) -ForegroundColor Green
+        Write-Host ("  ✓ dist\$setupName.exe ({0:N0} MB, {1:N0} bytes)" -f ((Get-Item -LiteralPath $setup).Length / 1MB), (Get-Item -LiteralPath $setup).Length) -ForegroundColor Green
     }
 }
 
@@ -736,7 +736,7 @@ if (-not $SkipAndroid) {
         throw "APK versionName 不符：實際 $($vnMatch.Groups[1].Value)；預期 $($version.DisplayVersion)"
     }
     Write-Host ("  ✓ APK versionCode=$($vcMatch.Groups[1].Value) versionName=$($vnMatch.Groups[1].Value)") -ForegroundColor Green
-    Write-Host ("  ✓ dist\$apkName ({0:N0} MB)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB)) -ForegroundColor Green
+    Write-Host ("  ✓ dist\$apkName ({0:N0} MB, {1:N0} bytes)，簽章 fingerprint 已核對" -f ($apk.Length / 1MB), $apk.Length) -ForegroundColor Green
 }
 
 # 長時間雙平台建置期間若 HEAD、tracked source 或要求的 tag 被移動，先前記下的 SHA 已不再
@@ -769,7 +769,7 @@ foreach ($asset in $expectedAssets) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "缺少預期發行資產：$asset" }
     $item = Get-Item -LiteralPath $asset
     if ($item.Length -le 0) { throw "發行資產為空：$asset" }
-    Write-Host ("  {0}  {1:N0} MB" -f $item.Name, ($item.Length / 1MB))
+    Write-Host ("  {0}  {1:N0} MB ({2:N0} bytes)" -f $item.Name, ($item.Length / 1MB), $item.Length)
 }
 $noteLines = @(
     "# Auto-Tronclass $Tag",
@@ -790,6 +790,29 @@ $noteLines += ($releaseAssets | ForEach-Object { "- ``$([IO.Path]::GetFileName($
 Set-Content -LiteralPath $notesPath -Encoding UTF8 -Value ($noteLines -join "`n")
 if ((Get-Item -LiteralPath $notesPath).Length -le 0) { throw "release notes 為空：$notesPath" }
 
+# ── 資產尺寸契約自檢（source check，零新依賴） ──
+# 在寫 metadata／sums 前 fail-closed；只讀自身源碼，不碰產物、不反序列化 metadata。
+$selfText = Get-Content -Raw -LiteralPath $MyInvocation.MyCommand.Path
+function Assert-SelfPattern([string]$Pattern, [int]$Expected, [string]$Label) {
+    $hits = ([regex]::Matches($selfText, $Pattern)).Count
+    if ($hits -ne $Expected) { throw "release.ps1 契約自檢失敗：$Label（期望 $Expected，實際 $hits）" }
+}
+# 每個輸出恰一次寫入。
+Assert-SelfPattern 'Set-Content\s+-LiteralPath\s+\$metadataPath\b' 1 'metadata 寫入次數'
+Assert-SelfPattern 'Set-Content\s+-LiteralPath\s+\$sumsPath\b' 1 'sums 寫入次數'
+# 嵌入尺寸只列 release plan 的 payload（$expectedAssets，隨 skip 模式增減）；
+# metadata／sums 自身永不列入。
+Assert-SelfPattern 'foreach\s*\(\$file\s+in\s+@\(\$expectedAssets\)\)' 1 'payload 尺寸列舉'
+Assert-SelfPattern 'bytes\s*=\s*\(Get-Item\s+-LiteralPath\s+\$file\)\.Length' 1 '尺寸嵌入點'
+# stat 不早於物化：尺寸取值在源碼順序上必須晚於資產備妥存在性斷言
+#（該斷言覆蓋的正是 $expectedAssets，故 skipped 產物不可能被 stat）。
+# 針字串分段拼接，避免在自檢源碼內自匹配，確保命中真實程式碼。
+$readyAt = $selfText.IndexOf('資產備妥於')
+$sizedAt = $selfText.IndexOf('foreach ($file ' + 'in @($expectedAssets))')
+if ($readyAt -lt 0 -or $sizedAt -lt 0 -or $sizedAt -le $readyAt) {
+    throw 'release.ps1 契約自檢失敗：尺寸 stat 必須晚於資產備妥斷言'
+}
+
 # machine-readable 建置中繼資料；與所有平台產物一起列入 SHA256SUMS，並作為 Release 資產。
 $toolchains = [ordered]@{
     rustc  = Get-ToolVersion -Name "rustc"
@@ -797,6 +820,16 @@ $toolchains = [ordered]@{
     dotnet = Get-ToolVersion -Name $dotnet
 }
 if (-not $SkipAndroid) { $toolchains["ndk"] = [string]$androidMarker.ndkVersion }
+# 產物位元組數：只記錄 metadata 建立前已是最終形態的 payload（$expectedAssets；
+# 上方的存在性＋非空斷言剛跑完，故此處的 Get-Item 不會在物化前執行）。
+# metadata 與 SHA256SUMS 自身的位元組數在最終序列化完成前無法得知（自指循環），
+# 故永不嵌入 assets；順序沿用 $expectedAssets（即 release plan 的確定性資產順序）。
+# 既有欄位與 schema=1 不動；無任何解析此檔的程式碼（僅 CI 列檔名），不構成 schema break。
+$assetSizes = @(
+    foreach ($file in @($expectedAssets)) {
+        [ordered]@{ name = [IO.Path]::GetFileName($file); bytes = (Get-Item -LiteralPath $file).Length }
+    }
+)
 $metadata = [ordered]@{
     schema         = 1
     tag            = $version.Tag
@@ -808,9 +841,13 @@ $metadata = [ordered]@{
     commit         = $headSha
     builtAtUtc     = [DateTime]::UtcNow.ToString("o")
     toolchains     = $toolchains
+    assets         = @($assetSizes)
 }
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding UTF8
 
+# metadata 一次建構、一次寫入：payload hash 在此一次算出、一次寫入 SHA256SUMS
+#（payload＋metadata，不含 SHA256SUMS 自身——自身 hash 無法自含）。
+# 之後只允許印出最終 metadata／sums 的位元組數，不得再反序列化或重寫 metadata。
 $sumLines = @()
 foreach ($file in @($expectedAssets + $metadataPath)) {
     $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -823,6 +860,8 @@ foreach ($asset in $releaseAssets) {
     if ((Get-Item -LiteralPath $asset).Length -le 0) { throw "GitHub Release 資產為空：$asset" }
 }
 Write-Host ("  ✓ build-metadata.json + SHA256SUMS.txt（{0} 個檔）" -f $sumLines.Count) -ForegroundColor Green
+# 僅印出最終位元組數（stat 落盤產物，不反序列化、不重寫 metadata）。
+Write-Host ("  ✓ build-metadata.json {0:N0} bytes；SHA256SUMS.txt {1:N0} bytes" -f (Get-Item -LiteralPath $metadataPath).Length, (Get-Item -LiteralPath $sumsPath).Length) -ForegroundColor Green
 
 $assets = ($releaseAssets | ForEach-Object { "dist/$([IO.Path]::GetFileName($_))" }) -join " "
 Write-Host "`n下一步（使用者決定後）：" -ForegroundColor Yellow
