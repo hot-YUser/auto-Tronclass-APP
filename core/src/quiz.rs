@@ -8,6 +8,7 @@
 //!  2. matching applies a leaked correct id only if it's genuinely a real option of that subject
 //!     (member validation), else it keeps the first answer.
 
+use crate::json;
 use serde_json::Value;
 
 const GROUP_TYPES: [&str; 2] = ["media", "analysis"];
@@ -70,7 +71,7 @@ pub fn validate_answer(subject: &Value, answer: &Answer, vote: bool) -> Result<(
     }
 }
 
-fn subject_has_option(subject: &Value, id: &str) -> bool {
+pub fn subject_has_option(subject: &Value, id: &str) -> bool {
     subject
         .get("options")
         .and_then(Value::as_array)
@@ -93,15 +94,14 @@ pub struct SubjectPlan {
     pub decision: Decision,
 }
 
-pub fn subject_id(s: &Value) -> String {
-    s.get("subject_id")
-        .or_else(|| s.get("id"))
-        .and_then(|x| {
-            x.as_str()
-                .map(str::to_string)
-                .or_else(|| x.as_i64().map(|n| n.to_string()))
-        })
-        .unwrap_or_default()
+pub fn subject_id(subject: &Value) -> String {
+    json::id_at(subject, &["subject_id", "id"]).unwrap_or_default()
+}
+
+/// The question text. Tenants put it in `description`, `content` or `stem`; a blank field falls
+/// through to the next.
+pub fn stem(subject: &Value) -> &str {
+    json::text_at(subject, &["description", "content", "stem"])
 }
 
 /// Serialize an id as a JSON **number** when it's a plain non-negative integer, else a string. The real
@@ -122,14 +122,8 @@ pub fn id_values(ids: &[String]) -> Vec<Value> {
     ids.iter().map(|s| id_value(s)).collect()
 }
 
-fn option_id(o: &Value) -> String {
-    o.get("id")
-        .and_then(|x| {
-            x.as_str()
-                .map(str::to_string)
-                .or_else(|| x.as_i64().map(|n| n.to_string()))
-        })
-        .unwrap_or_default()
+pub fn option_id(option: &Value) -> String {
+    json::id_at(option, &["id"]).unwrap_or_default()
 }
 
 /// The type a subject is answered by: matching decides as a selection; everything else is its type.

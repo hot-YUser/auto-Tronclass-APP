@@ -8,8 +8,9 @@ use crate::protocol::{
     MergePrompt, MonitoringSnapshot, Notice, ScheduleClockEntry, SessionState, TargetRef,
     TargetRuntimeState, TargetSnapshot, WakeMode, WireError,
 };
+use crate::time;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const CLOCK_GRACE_SECONDS: i64 = 120;
@@ -122,7 +123,7 @@ impl TargetSupervisor {
                     entry
                         .next_boundary_utc
                         .as_deref()
-                        .and_then(parse_rfc3339_utc)
+                        .and_then(time::parse_rfc3339_utc)
                 })
                 .min()
                 .map(|boundary| boundary + CLOCK_GRACE_SECONDS)
@@ -171,7 +172,7 @@ impl TargetSupervisor {
         course_name: Option<String>,
         error: Option<WireError>,
     ) {
-        let updated_at_utc = Some(format_rfc3339_utc(now_epoch_seconds()));
+        let updated_at_utc = Some(time::format_rfc3339_utc(time::now()));
         for source in sources {
             self.account_results.insert(
                 (source.clone(), account_id.to_string()),
@@ -209,9 +210,9 @@ impl TargetSupervisor {
         {
             return Err("schedule_clock_not_monotonic".to_string());
         }
-        let evaluated_at_epoch = parse_rfc3339_utc(evaluated_at_utc)
+        let evaluated_at_epoch = time::parse_rfc3339_utc(evaluated_at_utc)
             .ok_or_else(|| "schedule_clock_invalid_timestamp".to_string())?;
-        if (now_epoch_seconds() - evaluated_at_epoch).abs() > CLOCK_GRACE_SECONDS {
+        if (time::now() - evaluated_at_epoch).abs() > CLOCK_GRACE_SECONDS {
             return Err("schedule_clock_stale".to_string());
         }
 
@@ -300,7 +301,7 @@ impl TargetSupervisor {
     pub fn suspend_for_platform_limit(&mut self, config: &mut Config, reason: String) {
         config.runtime.platform_block = Some(PlatformBlock {
             reason,
-            observed_at_utc: format_rfc3339_utc(now_epoch_seconds()),
+            observed_at_utc: time::format_rfc3339_utc(time::now()),
         });
         self.bump_plan_revision();
     }
@@ -337,11 +338,12 @@ impl TargetSupervisor {
     /// Reconciles clock, persisted runtime and group detector rotation into one immutable plan.
     /// Returns true when a runtime cursor changed and config must be persisted.
     pub fn reconcile(&mut self, config: &mut Config) -> bool {
-        let now = now_epoch_seconds();
+        let now = time::now();
         let before_override_count = config.runtime.manual_overrides.len();
         config.runtime.manual_overrides.retain(|manual| {
             manual.schedule_revision == config.schedule_revision
-                && parse_rfc3339_utc(&manual.expires_at_utc).is_some_and(|expiry| expiry > now)
+                && time::parse_rfc3339_utc(&manual.expires_at_utc)
+                    .is_some_and(|expiry| expiry > now)
         });
         self.process_overrides
             .retain(|_, manual| manual.schedule_revision == config.schedule_revision);
@@ -435,7 +437,7 @@ impl TargetSupervisor {
         config: &Config,
         login_in_flight: &HashSet<String>,
     ) -> MonitoringSnapshot {
-        let now = now_epoch_seconds();
+        let now = time::now();
         let mut in_use = HashMap::<String, Vec<TargetRef>>::new();
         for route in &self.plan.routes {
             for account_id in route
@@ -673,7 +675,8 @@ impl TargetSupervisor {
         let persisted = config.runtime.manual_overrides.iter().find(|manual| {
             &manual.target == target
                 && manual.schedule_revision == config.schedule_revision
-                && parse_rfc3339_utc(&manual.expires_at_utc).is_some_and(|expiry| expiry > now)
+                && time::parse_rfc3339_utc(&manual.expires_at_utc)
+                    .is_some_and(|expiry| expiry > now)
         });
         let process = self
             .process_overrides
@@ -733,9 +736,9 @@ impl TargetSupervisor {
         if let Some(boundary) = entry
             .next_boundary_utc
             .as_deref()
-            .and_then(parse_rfc3339_utc)
+            .and_then(time::parse_rfc3339_utc)
         {
-            if now_epoch_seconds() > boundary + CLOCK_GRACE_SECONDS {
+            if time::now() > boundary + CLOCK_GRACE_SECONDS {
                 return Err("schedule_clock_unavailable".to_string());
             }
         }
@@ -919,13 +922,13 @@ fn validate_clock_entry(
     let current = entry
         .current_window_start_utc
         .as_deref()
-        .map(parse_rfc3339_utc)
+        .map(time::parse_rfc3339_utc)
         .transpose_option()
         .ok_or_else(|| "schedule_clock_invalid_timestamp".to_string())?;
     let next = entry
         .next_boundary_utc
         .as_deref()
-        .map(parse_rfc3339_utc)
+        .map(time::parse_rfc3339_utc)
         .transpose_option()
         .ok_or_else(|| "schedule_clock_invalid_timestamp".to_string())?;
     if entry
@@ -1131,94 +1134,6 @@ fn coalesce_acknowledged(
     }
 }
 
-pub fn now_epoch_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-pub fn parse_rfc3339_utc(value: &str) -> Option<i64> {
-    let value = value.strip_suffix('Z')?;
-    let (date, time) = value.split_once('T')?;
-    let mut date = date.split('-');
-    let year: i32 = date.next()?.parse().ok()?;
-    let month: u32 = date.next()?.parse().ok()?;
-    let day: u32 = date.next()?.parse().ok()?;
-    if date.next().is_some()
-        || !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-    {
-        return None;
-    }
-    let time = time.split_once('.').map_or(time, |(whole, fraction)| {
-        if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-            ""
-        } else {
-            whole
-        }
-    });
-    if time.is_empty() {
-        return None;
-    }
-    let mut time = time.split(':');
-    let hour: i64 = time.next()?.parse().ok()?;
-    let minute: i64 = time.next()?.parse().ok()?;
-    let second: i64 = time.next()?.parse().ok()?;
-    if time.next().is_some() || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-pub fn format_rfc3339_utc(epoch: i64) -> String {
-    let days = epoch.div_euclid(86_400);
-    let seconds = epoch.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        seconds / 3_600,
-        seconds % 3_600 / 60,
-        seconds % 60
-    )
-}
-
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-// Howard Hinnant's civil calendar conversion, with Unix epoch 1970-01-01.
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = year - i32::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let month = month as i32;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    i64::from(era * 146_097 + doe - 719_468)
-}
-
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let days = days + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let doe = days - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year as i32, month as u32, day as u32)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,16 +1165,6 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_round_trip_handles_leap_day_and_negative_epoch() {
-        for value in ["1969-12-31T23:59:59Z", "2028-02-29T12:34:56.1234567Z"] {
-            let epoch = parse_rfc3339_utc(value).unwrap();
-            assert_eq!(parse_rfc3339_utc(&format_rfc3339_utc(epoch)), Some(epoch));
-        }
-        assert!(parse_rfc3339_utc("2026-02-29T00:00:00Z").is_none());
-        assert!(parse_rfc3339_utc("2026-01-01T00:00:00+00:00").is_none());
-    }
-
-    #[test]
     fn clock_requires_exact_targets_matching_revisions() {
         let mut config = Config::default();
         config
@@ -1268,7 +1173,7 @@ mod tests {
         config.config_revision = 2;
         config.schedule_revision = 3;
         let mut supervisor = TargetSupervisor::new(None);
-        let now = format_rfc3339_utc(now_epoch_seconds());
+        let now = time::format_rfc3339_utc(time::now());
         assert!(supervisor
             .apply_clock(&config, 1, 2, 3, &now, vec![])
             .is_err());
@@ -1290,7 +1195,7 @@ mod tests {
             .accounts
             .push(student("a", ScheduleBinding::Disabled));
         let mut supervisor = TargetSupervisor::new(None);
-        let now = format_rfc3339_utc(now_epoch_seconds());
+        let now = time::format_rfc3339_utc(time::now());
         supervisor
             .apply_clock(&config, 1, 0, 0, &now, vec![disabled_entry("a")])
             .unwrap();
@@ -1321,7 +1226,7 @@ mod tests {
             schedule: ScheduleBinding::Disabled,
         });
         let mut supervisor = TargetSupervisor::new(None);
-        let now = format_rfc3339_utc(now_epoch_seconds());
+        let now = time::format_rfc3339_utc(time::now());
         supervisor
             .apply_clock(
                 &config,
@@ -1378,7 +1283,7 @@ mod tests {
             schedule: ScheduleBinding::Disabled,
         });
         let mut supervisor = TargetSupervisor::new(None);
-        let now = format_rfc3339_utc(now_epoch_seconds());
+        let now = time::format_rfc3339_utc(time::now());
         supervisor
             .apply_clock(
                 &config,

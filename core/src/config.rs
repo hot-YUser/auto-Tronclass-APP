@@ -35,76 +35,56 @@ pub struct AccountMeta {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    #[serde(default = "default_countdown")]
     pub countdown_secs: u64,
-    #[serde(default = "default_gate")]
     pub attendance_gate_percent: f64,
-    #[serde(default = "default_llm_endpoint")]
     pub llm_endpoint: String,
-    #[serde(default = "default_llm_model")]
     pub llm_model: String,
-    #[serde(default = "default_llm_max_tokens")]
     pub llm_max_tokens: u32,
-    #[serde(default = "default_true")]
     pub resubmit_for_correct: bool,
-    #[serde(default = "default_reask")]
     pub max_answer_reask: u32,
-    #[serde(default = "default_prepare_retry_budget")]
     pub prepare_retry_budget_secs: u64,
-    #[serde(default = "default_autoanswer_types")]
     pub autoanswer_types: Vec<String>,
-    #[serde(default = "default_true")]
     pub enable_llm_tools: bool,
-    #[serde(default = "default_tool_iterations")]
     pub max_tool_iterations: u32,
-    #[serde(default = "default_radar_strategy")]
     pub radar_strategy: Vec<String>,
-    #[serde(default = "default_number_concurrency")]
     pub number_concurrency: u32,
-    #[serde(default = "default_number_min_concurrency")]
     pub number_min_concurrency: u32,
-    #[serde(default = "default_number_cooldown_ms")]
     pub number_cooldown_ms: u64,
-    #[serde(default = "default_number_max_cooldowns")]
     pub number_max_cooldowns: u32,
-    #[serde(default = "default_poll_idle_secs")]
     pub poll_idle_secs: u64,
-    #[serde(default = "default_quiz_detect_secs")]
     pub quiz_detect_secs: u64,
-    #[serde(default = "default_log_level")]
     pub log_level: String,
-    #[serde(default = "default_qr_remote_enabled")]
     pub qr_remote_enabled: bool,
-    #[serde(default = "default_qr_remote_base_url")]
     pub qr_remote_base_url: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let all = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
         Self {
-            countdown_secs: default_countdown(),
-            attendance_gate_percent: default_gate(),
-            llm_endpoint: default_llm_endpoint(),
-            llm_model: default_llm_model(),
-            llm_max_tokens: default_llm_max_tokens(),
-            resubmit_for_correct: default_true(),
-            max_answer_reask: default_reask(),
-            prepare_retry_budget_secs: default_prepare_retry_budget(),
-            autoanswer_types: default_autoanswer_types(),
-            enable_llm_tools: default_true(),
-            max_tool_iterations: default_tool_iterations(),
-            radar_strategy: default_radar_strategy(),
-            number_concurrency: default_number_concurrency(),
-            number_min_concurrency: default_number_min_concurrency(),
-            number_cooldown_ms: default_number_cooldown_ms(),
-            number_max_cooldowns: default_number_max_cooldowns(),
-            poll_idle_secs: default_poll_idle_secs(),
-            quiz_detect_secs: default_quiz_detect_secs(),
-            log_level: default_log_level(),
-            qr_remote_enabled: default_qr_remote_enabled(),
-            qr_remote_base_url: default_qr_remote_base_url(),
+            countdown_secs: 15,
+            attendance_gate_percent: 15.0,
+            llm_endpoint: "https://integrate.api.nvidia.com/v1/chat/completions".to_string(),
+            llm_model: "minimaxai/minimax-m3".to_string(),
+            llm_max_tokens: 16_384,
+            resubmit_for_correct: true,
+            max_answer_reask: 4,
+            prepare_retry_budget_secs: 300,
+            autoanswer_types: all(AUTOANSWER_TYPES),
+            enable_llm_tools: true,
+            max_tool_iterations: 3,
+            radar_strategy: all(RADAR_STRATEGIES),
+            number_concurrency: 100,
+            number_min_concurrency: 5,
+            number_cooldown_ms: 5_000,
+            number_max_cooldowns: 3,
+            poll_idle_secs: 5,
+            quiz_detect_secs: 45,
+            log_level: "normal".to_string(),
+            qr_remote_enabled: false,
+            qr_remote_base_url: "https://api.hlp.qzz.io".to_string(),
         }
     }
 }
@@ -835,74 +815,6 @@ fn validate_qr_remote(enabled: &bool, base_url: &str) -> Result<(), String> {
     }
     normalize_qr_remote_base_url(base_url).map(|_| ())?;
     Ok(())
-}
-
-fn default_countdown() -> u64 {
-    15
-}
-fn default_gate() -> f64 {
-    15.0
-}
-fn default_llm_endpoint() -> String {
-    "https://integrate.api.nvidia.com/v1/chat/completions".to_string()
-}
-fn default_llm_model() -> String {
-    "minimaxai/minimax-m3".to_string()
-}
-fn default_llm_max_tokens() -> u32 {
-    16_384
-}
-fn default_true() -> bool {
-    true
-}
-fn default_reask() -> u32 {
-    4
-}
-fn default_prepare_retry_budget() -> u64 {
-    300
-}
-fn default_tool_iterations() -> u32 {
-    3
-}
-fn default_autoanswer_types() -> Vec<String> {
-    AUTOANSWER_TYPES
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect()
-}
-fn default_radar_strategy() -> Vec<String> {
-    RADAR_STRATEGIES
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect()
-}
-fn default_number_concurrency() -> u32 {
-    100
-}
-fn default_number_min_concurrency() -> u32 {
-    5
-}
-fn default_number_cooldown_ms() -> u64 {
-    5_000
-}
-fn default_number_max_cooldowns() -> u32 {
-    3
-}
-fn default_poll_idle_secs() -> u64 {
-    5
-}
-fn default_quiz_detect_secs() -> u64 {
-    45
-}
-fn default_log_level() -> String {
-    "normal".to_string()
-}
-
-fn default_qr_remote_enabled() -> bool {
-    false
-}
-fn default_qr_remote_base_url() -> String {
-    "https://api.hlp.qzz.io".to_string()
 }
 
 #[derive(Deserialize)]

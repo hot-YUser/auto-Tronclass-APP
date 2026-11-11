@@ -13,12 +13,14 @@
 
 use crate::answer::{self, Source};
 use crate::config::TargetId;
+use crate::json;
 use crate::llm::LlmConfig;
 use crate::login;
 use crate::protocol::AccountResultPhase;
 use crate::protocol::AnswerWire;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
+use crate::redaction::{emit, EventCb};
 use crate::rollcall::{self, RollcallKind, SignOutcome};
 use crate::secrets::Secret;
 use crate::teacher_qr::{self, FailureKind};
@@ -33,13 +35,6 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
-
-pub type EventCb = extern "C" fn(*const u8, usize);
-
-/// All events cross the seam through the single audited redaction pass (docs 90 §4).
-fn emit(cb: EventCb, v: &Value) {
-    crate::redaction::emit(cb, v);
-}
 
 fn command_reply(cb: EventCb, command_id: u64, result: Result<(), String>) {
     match result {
@@ -568,13 +563,6 @@ struct PollTuning {
     wanted_types: Vec<String>, // R4 auto-answer family allowlist (empty = all)
 }
 
-fn now_epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Classified GET result for the poll canary: a genuine JSON body, an auth-lost signal, or a plain
 /// transport/5xx failure.
 enum Fetched {
@@ -757,10 +745,9 @@ async fn poller(
 
         let interval = match fetch_classified(&acc.client, &ep.rollcalls()).await {
             Fetched::Ok(value) => {
-                let list = extract_rollcalls(&value);
-                let active = !list.is_empty();
+                let list = json::array_at(&value, &["rollcalls"]);
                 for rollcall in list {
-                    let Some(id) = rollcall_id(&rollcall) else {
+                    let Some(id) = rollcall_id(rollcall) else {
                         continue;
                     };
                     if !seen.insert(id.clone()) {
@@ -771,13 +758,13 @@ async fn poller(
                         account_id: acc.id.clone(),
                         base_url: acc.base_url.clone(),
                         rollcall_id: id,
-                        kind: rollcall::classify(&rollcall),
-                        course: course_name(&rollcall),
-                        course_id: rollcall_course_id(&rollcall),
+                        kind: rollcall::classify(rollcall),
+                        course: course_name(rollcall),
+                        course_id: rollcall_course_id(rollcall),
                     }))
                     .ok();
                 }
-                if active {
+                if !list.is_empty() {
                     Duration::from_secs(1)
                 } else {
                     tune.idle
@@ -839,9 +826,9 @@ async fn detect_quizzes(
 ) {
     if last_courses.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) || courses.is_empty() {
         if let Ok(v) = get_json(&acc.client, &ep.my_courses()).await {
-            let fresh: Vec<String> = first_array(&v, &["courses", "items", "data"])
+            let fresh: Vec<String> = json::array_at(&v, &["courses", "items", "data"])
                 .iter()
-                .filter_map(course_id_of)
+                .filter_map(course_id)
                 .collect();
             if !fresh.is_empty() {
                 *courses = fresh;
@@ -850,7 +837,7 @@ async fn detect_quizzes(
         }
     }
     let want = |f: &str| wanted.is_empty() || wanted.iter().any(|w| w == f);
-    let now = now_epoch_secs();
+    let now = crate::time::now();
     for cid in courses.clone() {
         if want("exam") {
             for a in family_list(acc, &ep.course_exam_list(&cid), "exams").await {
@@ -873,8 +860,8 @@ async fn detect_quizzes(
         if want("questionnaire") {
             for a in family_list(acc, &ep.course_questionnaire_list(&cid), "questionnaires").await {
                 // v1: absent is_started → not started → skip.
-                if field_or(&a, "is_started", false)
-                    && !field_or(&a, "is_closed", false)
+                if json::flag(&a, "is_started", false)
+                    && !json::flag(&a, "is_closed", false)
                     && !already_submitted(&a)
                 {
                     emit_quiz(
@@ -951,7 +938,7 @@ async fn detect_quizzes(
 /// GET a family list endpoint and return its items (by `key`, bare-array fallback); [] on any error.
 async fn family_list(acc: &Arc<Account>, url: &str, key: &str) -> Vec<Value> {
     match get_json(&acc.client, url).await {
-        Ok(v) => extract_array(&v, key),
+        Ok(v) => json::array_at(&v, &[key]).to_vec(),
         Err(_) => Vec::new(),
     }
 }
@@ -985,7 +972,7 @@ fn emit_quiz(
         stem,
         generation,
     } = detection;
-    let Some(aid) = id_of(a) else { return };
+    let Some(aid) = activity_id(a) else { return };
     if !seen.insert(quiz_seen_key(source, cid, &aid)) {
         return;
     }
@@ -1006,44 +993,23 @@ fn emit_quiz(
     .ok();
 }
 
-/// First present array among `keys`, else a bare top-level array.
-fn first_array(v: &Value, keys: &[&str]) -> Vec<Value> {
-    for k in keys {
-        if let Some(a) = v.get(*k).and_then(Value::as_array) {
-            return a.clone();
-        }
-    }
-    v.as_array().cloned().unwrap_or_default()
-}
-
-/// A course id from `id | course_id | courseId` (string or integer).
-fn course_id_of(v: &Value) -> Option<String> {
-    ["id", "course_id", "courseId"].iter().find_map(|k| {
-        v.get(*k).and_then(|x| {
-            x.as_str()
-                .map(str::to_string)
-                .or_else(|| x.as_i64().map(|n| n.to_string()))
-        })
-    })
-}
-
-fn field_or(a: &Value, k: &str, default: bool) -> bool {
-    a.get(k).and_then(Value::as_bool).unwrap_or(default)
+fn course_id(course: &Value) -> Option<String> {
+    json::id_at(course, &["id", "course_id", "courseId"])
 }
 
 /// Already-submitted across the family's variant field names (real tenants differ; §8 needs-real-account).
 fn already_submitted(a: &Value) -> bool {
     ["has_submitted", "submitted", "is_submitted"]
         .iter()
-        .any(|k| field_or(a, k, false))
+        .any(|k| json::flag(a, k, false))
 }
 
 /// Exam answerable gate (v1): started, not closed, not explicitly not-in-progress, window not past, not
 /// already submitted, and attempts not exhausted.
 fn exam_answerable(a: &Value, now: i64) -> bool {
     // v1: absent is_started means NOT started → skip (don't default-open).
-    let started = field_or(a, "is_started", false);
-    let closed = field_or(a, "is_closed", false);
+    let started = json::flag(a, "is_started", false);
+    let closed = json::flag(a, "is_closed", false);
     let in_progress = a.get("is_in_progress").and_then(Value::as_bool) != Some(false);
     // An absent deadline preserves v1's open-ended semantics; a present but malformed deadline is
     // unsafe to interpret and therefore fails closed.
@@ -1081,7 +1047,11 @@ fn epoch_value(v: Option<&Value>) -> EndTime {
     }
     v.as_i64()
         .map(EndTime::Valid)
-        .or_else(|| v.as_str().and_then(iso8601_to_epoch).map(EndTime::Valid))
+        .or_else(|| {
+            v.as_str()
+                .and_then(crate::time::parse_iso8601)
+                .map(EndTime::Valid)
+        })
         .unwrap_or(EndTime::Invalid)
 }
 
@@ -1111,8 +1081,8 @@ fn homework_window_open(a: &Value, now: i64) -> bool {
 /// submitted, or a start/end window showing not-started/ended. Missing fields keep the open default
 /// (never guess a closed window from absent data).
 fn homework_answerable(a: &Value, now: i64) -> bool {
-    field_or(a, "is_started", true)
-        && !field_or(a, "is_closed", false)
+    json::flag(a, "is_started", true)
+        && !json::flag(a, "is_closed", false)
         && !already_submitted(a)
         && homework_window_open(a, now)
 }
@@ -1125,115 +1095,6 @@ fn end_epoch(a: &Value) -> Option<i64> {
         EndTime::Valid(epoch) => Some(epoch),
         EndTime::Absent | EndTime::Invalid => None,
     }
-}
-
-/// Parse `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM|±HHMM]` to a UTC epoch (civil-date math; no date crate
-/// across the 4 ABIs). A missing timezone is retained as UTC for compatibility with existing tenants.
-fn iso8601_to_epoch(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (date, rest) = s.split_once(['T', ' '])?;
-    if date.len() != 10
-        || date.as_bytes().get(4) != Some(&b'-')
-        || date.as_bytes().get(7) != Some(&b'-')
-    {
-        return None;
-    }
-    if !date
-        .as_bytes()
-        .iter()
-        .enumerate()
-        .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let y = date.get(0..4)?.parse::<i64>().ok()?;
-    let m = date.get(5..7)?.parse::<i64>().ok()?;
-    let day = date.get(8..10)?.parse::<i64>().ok()?;
-
-    // Split the time from an optional trailing Z / ±HH:MM offset.
-    let (time, off_secs) = if let Some(t) = rest.strip_suffix('Z') {
-        (t, 0)
-    } else if let Some(pos) = rest.rfind(['+', '-']) {
-        let (t, off) = rest.split_at(pos);
-        let sign = if off.starts_with('-') { -1 } else { 1 };
-        let offset = &off[1..];
-        let (oh, om) = if let Some((oh, om)) = offset.split_once(':') {
-            if oh.len() != 2 || om.len() != 2 {
-                return None;
-            }
-            (oh, om)
-        } else {
-            if offset.len() != 4 {
-                return None;
-            }
-            (offset.get(0..2)?, offset.get(2..4)?)
-        };
-        let oh = oh.parse::<i64>().ok()?;
-        let om = om.parse::<i64>().ok()?;
-        // ISO-8601's practical UTC-offset range is -14:00..+14:00; the boundary hour
-        // may not carry minutes (e.g. +14:01 is not a real civil offset).
-        if oh > 14 || om > 59 || (oh == 14 && om != 0) {
-            return None;
-        }
-        (t, sign * (oh * 3600 + om * 60))
-    } else {
-        (rest, 0)
-    };
-
-    let clock = match time.split_once('.') {
-        Some((clock, fraction))
-            if !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            clock
-        }
-        Some(_) => return None,
-        None => time,
-    };
-    let clock = clock.as_bytes();
-    if clock.len() != 8 || clock[2] != b':' || clock[5] != b':' {
-        return None;
-    }
-    if !clock
-        .iter()
-        .enumerate()
-        .all(|(index, byte)| index == 2 || index == 5 || byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let hh = std::str::from_utf8(&clock[0..2])
-        .ok()?
-        .parse::<i64>()
-        .ok()?;
-    let mm = std::str::from_utf8(&clock[3..5])
-        .ok()?
-        .parse::<i64>()
-        .ok()?;
-    let ss = std::str::from_utf8(&clock[6..8])
-        .ok()?
-        .parse::<i64>()
-        .ok()?;
-    if hh > 23 || mm > 59 || ss > 59 {
-        return None;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let days_in_month = match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
-    if day < 1 || day > days_in_month {
-        return None;
-    }
-    // days_from_civil (Howard Hinnant): days since 1970-01-01.
-    let yy = y - i64::from(m <= 2);
-    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
-    let yoe = yy - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hh * 3600 + mm * 60 + ss - off_secs)
 }
 
 /// vote: `interactions` → `type=="vote" && status=="start"`; then read the vote and skip if the caller
@@ -1253,7 +1114,7 @@ async fn detect_vote(
         {
             continue;
         }
-        let Some(aid) = id_of(&a) else { continue };
+        let Some(aid) = activity_id(&a) else { continue };
         if voted.contains(&aid) || seen.contains(&quiz_seen_key("vote", cid, &aid)) {
             continue;
         }
@@ -1304,12 +1165,14 @@ async fn detect_courseware(
         if m.get("type").and_then(Value::as_str) != Some("material") {
             continue;
         }
-        let Some(mat_id) = id_of(&m) else { continue };
+        let Some(mat_id) = activity_id(&m) else {
+            continue;
+        };
         for q in family_list(acc, &ep.courseware_quizzes(&mat_id), "quizzes").await {
-            if field_or(&q, "is_closed", false) || !field_or(&q, "is_started", true) {
+            if json::flag(&q, "is_closed", false) || !json::flag(&q, "is_started", true) {
                 continue;
             }
-            let Some(qid) = id_of(&q) else { continue };
+            let Some(qid) = activity_id(&q) else { continue };
             if seen.contains(&quiz_seen_key("courseware-quiz", cid, &qid)) {
                 continue;
             }
@@ -3892,43 +3755,17 @@ fn emit_rollcall_detected(cb: EventCb, rollcall_id: &str, base_url: &str, a: &Ac
     );
 }
 
-fn extract_rollcalls(v: &Value) -> Vec<Value> {
-    v.get("rollcalls")
-        .and_then(Value::as_array)
-        .or_else(|| v.as_array())
-        .cloned()
-        .unwrap_or_default()
-}
 fn rollcall_course_id(rollcall: &Value) -> Option<String> {
-    ["course_id", "courseId", "cid"]
-        .iter()
-        .find_map(|key| {
-            rollcall.get(*key).and_then(|value| {
-                value
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| value.as_i64().map(|number| number.to_string()))
-            })
-        })
-        .or_else(|| rollcall.get("course").and_then(course_id_of))
+    json::id_at(rollcall, &["course_id", "courseId", "cid"])
+        .or_else(|| rollcall.get("course").and_then(course_id))
 }
 
-fn rollcall_id(rc: &Value) -> Option<String> {
-    rc.get("rollcall_id")
-        .or_else(|| rc.get("id"))
-        .and_then(|x| {
-            x.as_str()
-                .map(str::to_string)
-                .or_else(|| x.as_i64().map(|n| n.to_string()))
-        })
+fn rollcall_id(rollcall: &Value) -> Option<String> {
+    json::id_at(rollcall, &["rollcall_id", "id"])
 }
 
-fn course_name(rc: &Value) -> String {
-    rc.get("course_name")
-        .or_else(|| rc.get("course"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string()
+fn course_name(rollcall: &Value) -> String {
+    json::text_at(rollcall, &["course_name", "course"]).to_string()
 }
 
 // ================= quiz (slice 3) =================
@@ -5047,7 +4884,7 @@ fn quiz_prepared_event(q: &QuizActivity) -> Value {
                                 .iter()
                                 .map(|option| {
                                     json!({
-                                        "id": id_of(option).unwrap_or_default(),
+                                        "id": crate::quiz::option_id(option),
                                         "text": option.get("content")
                                             .or_else(|| option.get("description"))
                                             .and_then(Value::as_str)
@@ -5059,11 +4896,11 @@ fn quiz_prepared_event(q: &QuizActivity) -> Value {
                         .unwrap_or_default();
                     json!({
                         "subject_id": sid,
-                        "parent_id": value_id(s.get("parent_id")),
+                        "parent_id": s.get("parent_id").and_then(json::id),
                         "type": s.get("type").and_then(Value::as_str).unwrap_or(""),
                         "answer_type": s.get("answer_type").and_then(Value::as_str)
                             .or_else(|| s.get("type").and_then(Value::as_str)).unwrap_or(""),
-                        "stem": subject_stem(s),
+                        "stem": crate::quiz::stem(s),
                         "options": options,
                         "answer": answer_wire,
                         "existing_answer": existing_wire,
@@ -5115,28 +4952,6 @@ fn quiz_prepared_event(q: &QuizActivity) -> Value {
             "course_id": q.course_id, "course": q.course },
         "course": q.course, "per_account": per_account, "expected_accounts": expected_accounts,
         "conflict_count": conflict_count })
-}
-
-fn subject_stem(subject: &Value) -> &str {
-    ["description", "content", "stem"]
-        .iter()
-        .find_map(|key| {
-            subject
-                .get(*key)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-        })
-        .unwrap_or("")
-}
-
-fn value_id(value: Option<&Value>) -> Option<String> {
-    value.and_then(|value| {
-        value
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| value.as_i64().map(|id| id.to_string()))
-            .or_else(|| value.as_u64().map(|id| id.to_string()))
-    })
 }
 
 fn find_quiz_key(
@@ -5214,22 +5029,10 @@ async fn submit_classroom(
     }
     Ok(completed)
 }
-fn extract_array(v: &Value, key: &str) -> Vec<Value> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .or_else(|| v.as_array())
-        .cloned()
-        .unwrap_or_default()
-}
-fn id_of(v: &Value) -> Option<String> {
-    v.get("id")
-        .or_else(|| v.get("activity_id"))
-        .or_else(|| v.get("course_id"))
-        .and_then(|x| {
-            x.as_str()
-                .map(str::to_string)
-                .or_else(|| x.as_i64().map(|n| n.to_string()))
-        })
+
+/// The id of a detected activity, whichever of the family's id fields carries it.
+fn activity_id(activity: &Value) -> Option<String> {
+    json::id_at(activity, &["id", "activity_id", "course_id"])
 }
 
 fn vote_letters(a: &Answer) -> Vec<String> {
@@ -5394,29 +5197,7 @@ mod tests {
     }
 
     #[test]
-    fn iso8601_epoch_parses_z_offset_and_int() {
-        // 2021-01-01T00:00:00Z = 1609459200.
-        assert_eq!(
-            iso8601_to_epoch("2021-01-01T00:00:00Z"),
-            Some(1_609_459_200)
-        );
-        // same instant expressed as +08:00 local (08:00 local == 00:00 UTC).
-        assert_eq!(
-            iso8601_to_epoch("2021-01-01T08:00:00+08:00"),
-            Some(1_609_459_200)
-        );
-        // The compact ISO-8601 offset form denotes the same instant.
-        assert_eq!(
-            iso8601_to_epoch("2021-01-01T08:00:00+0800"),
-            Some(1_609_459_200)
-        );
-        // fractional seconds + space separator tolerated.
-        assert_eq!(
-            iso8601_to_epoch("2021-01-01 00:00:00.500Z"),
-            Some(1_609_459_200)
-        );
-        assert_eq!(iso8601_to_epoch("not-a-date"), None);
-        // end_epoch also accepts a bare integer epoch.
+    fn end_time_reads_an_epoch_or_iso_text_and_separates_absent_from_invalid() {
         assert_eq!(
             end_epoch(&json!({"end_time": 1_609_459_200_i64})),
             Some(1_609_459_200)
@@ -5433,21 +5214,6 @@ mod tests {
             end_time(&json!({"end_time": "not-a-date"})),
             EndTime::Invalid
         );
-    }
-
-    #[test]
-    fn iso8601_rejects_impossible_dates_times_and_offsets() {
-        assert!(iso8601_to_epoch("2024-02-29T00:00:00Z").is_some());
-        assert_eq!(iso8601_to_epoch("2023-02-29T00:00:00Z"), None);
-        assert_eq!(iso8601_to_epoch("2024-04-31T00:00:00Z"), None);
-        assert_eq!(iso8601_to_epoch("2024-01-01T24:00:00Z"), None);
-        assert_eq!(iso8601_to_epoch("2024-01-01T23:60:00Z"), None);
-        assert_eq!(iso8601_to_epoch("2024-01-01T23:59:60Z"), None);
-        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+24:00"), None);
-        assert!(iso8601_to_epoch("2024-01-01T00:00:00+14:00").is_some());
-        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+14:01"), None);
-        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+2360"), None);
-        assert_eq!(iso8601_to_epoch("2024-01-01T00:00:00+08:60"), None);
     }
 
     #[test]

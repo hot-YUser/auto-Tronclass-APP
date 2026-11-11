@@ -5,9 +5,11 @@
 //! Submit values are VERBATIM (gotcha 1): blank/short answers keep whatever text/HTML they carry.
 
 use crate::http;
+use crate::json;
 use crate::llm::{self, LlmConfig};
 use crate::providers::Endpoints;
 use crate::quiz::{self, Answer, Decision};
+use crate::redaction::EventCb;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -55,18 +57,6 @@ pub struct Paper {
     pub subjects: Vec<Value>,
 }
 
-/// A JSON id as a string whether the server sent it as a number or a string (ids like
-/// `exam_paper_instance_id` come back as integers). Empty when absent.
-fn json_id_string(v: Option<&Value>) -> String {
-    v.and_then(|x| {
-        x.as_str()
-            .map(str::to_string)
-            .or_else(|| x.as_i64().map(|n| n.to_string()))
-            .or_else(|| x.as_u64().map(|n| n.to_string()))
-    })
-    .unwrap_or_default()
-}
-
 /// Fetch the paper for an activity, per the family's real contract (docs 31). exam/classroom/
 /// questionnaire use their own `distribute` segment; courseware its subjects endpoint — all four run
 /// `quiz::flatten_paper`. vote synthesizes subjects from `vote_option_items`; homework synthesizes one
@@ -98,7 +88,7 @@ pub async fn fetch_paper(
     Ok(Paper {
         // Real distribute returns this as an integer (e.g. 635061) — reading it as_str gave "" and the
         // submit then dropped the instance id. Accept int OR string (confirmed live 2026-07).
-        instance_id: json_id_string(v.get("exam_paper_instance_id")),
+        instance_id: json::id_at(&v, &["exam_paper_instance_id"]).unwrap_or_default(),
         subjects: quiz::flatten_paper(&raw),
     })
 }
@@ -177,7 +167,7 @@ pub async fn shared_answers(
     school: &Client,
     llm_client: &Client,
     cfg: &LlmConfig,
-    cb: llm::EventCb,
+    cb: EventCb,
     activity_token: &str,
     account_id: &str,
     course_id: &str,
@@ -268,26 +258,10 @@ pub fn missing_subjects(
         .collect()
 }
 
-/// The subject's question text — `description`, else `content`, else `stem` (v1 answer_flow.py:92).
-/// The real exam distribute puts the question in `description`; reading only `content` gave an EMPTY
-/// stem (the LLM saw options with no question and answered nothing) — confirmed live 2026-07.
-fn subject_stem(subject: &Value) -> &str {
-    // v1 `description or content or stem` — a null/empty field falls through (not "present but blank").
-    ["description", "content", "stem"]
-        .iter()
-        .find_map(|k| {
-            subject
-                .get(*k)
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or("")
-}
-
 /// User content (docs 31 R3b): stem + each option `<LETTER>. <content>` (letters, no ids); for
 /// fill/cloze a blank-count hint. short_answer = stem only. The SYSTEM_PROMPT does the rest.
 fn build_prompt(subject: &Value) -> String {
-    let mut p = quiz::clean_html(subject_stem(subject));
+    let mut p = quiz::clean_html(quiz::stem(subject));
     let qtype = subject.get("type").and_then(Value::as_str).unwrap_or("");
     if let Some(opts) = subject.get("options").and_then(Value::as_array) {
         p.push('\n');
@@ -320,7 +294,7 @@ async fn build_user_content(
     subject: &Value,
 ) -> Value {
     let text = build_prompt(subject);
-    let mut html = subject_stem(subject).to_string();
+    let mut html = quiz::stem(subject).to_string();
     if let Some(opts) = subject.get("options").and_then(Value::as_array) {
         for o in opts {
             html.push_str(o.get("content").and_then(Value::as_str).unwrap_or(""));
@@ -445,13 +419,7 @@ pub fn existing_answer(subject: &Value) -> Option<Answer> {
         .get("student_answer_option_ids")
         .and_then(Value::as_array)
     {
-        let ids: Vec<String> = ids
-            .iter()
-            .filter_map(|value| {
-                let id = json_id_string(Some(value));
-                (!id.is_empty()).then_some(id)
-            })
-            .collect();
+        let ids: Vec<String> = ids.iter().filter_map(json::id).collect();
         if !ids.is_empty() {
             return Some(Answer::Options(ids));
         }
@@ -485,8 +453,7 @@ pub fn exam_subject_entry(subject: &Value, answer: &Answer) -> Value {
 
 /// A subject's `parent_id` int-or-string; `None` when absent/null (a top-level subject).
 fn parent_id_str(subject: &Value) -> Option<String> {
-    let s = json_id_string(subject.get("parent_id"));
-    (!s.is_empty()).then_some(s)
+    json::id_at(subject, &["parent_id"])
 }
 
 /// `[{sort:i, content}]` — 0-based per-blank (first pass; the resubmit overlay preserves the review's raw sort).
@@ -567,7 +534,7 @@ pub async fn submit_exam(
     .await?;
     // submission_id comes back as an INTEGER (e.g. 681504) — reading it as_str gave "" and disabled the
     // resubmit-for-correct pass; accept int OR string, with the v1 `id` fallback (confirmed live 2026-07).
-    let sid = json_id_string(v.get("submission_id").or_else(|| v.get("id")));
+    let sid = json::id_at(&v, &["submission_id", "id"]).unwrap_or_default();
     if sid.is_empty() {
         return Err("submit exam: response missing submission_id".to_string());
     }
@@ -620,7 +587,7 @@ pub async fn resubmit_correct(
         "resubmit corrected exam",
     )
     .await?;
-    let sid = json_id_string(response.get("submission_id").or_else(|| response.get("id")));
+    let sid = json::id_at(&response, &["submission_id", "id"]).unwrap_or_default();
     if sid.is_empty() {
         return Err("resubmit corrected exam: response missing submission_id".to_string());
     }
@@ -658,7 +625,7 @@ fn overlay_entry(subject: &Value, review: &Value) -> Option<Value> {
                     .map(str::to_string)
                     .or_else(|| x.as_i64().map(|n| n.to_string()))
             })
-            .filter(|id| subject_has_option(subject, id)) // cross-block ids dropped
+            .filter(|id| quiz::subject_has_option(subject, id)) // cross-block ids dropped
             .collect();
         if !valid.is_empty() {
             e["answer_option_ids"] = json!(quiz::id_values(&valid));
@@ -702,24 +669,6 @@ fn overlay_entry(subject: &Value, review: &Value) -> Option<Value> {
         e["parent_id"] = quiz::id_value(&pid);
     }
     Some(e)
-}
-
-fn subject_has_option(subject: &Value, id: &str) -> bool {
-    subject
-        .get("options")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter().any(|o| {
-                let oid = o.get("id");
-                oid.and_then(Value::as_str) == Some(id)
-                    || oid
-                        .and_then(Value::as_i64)
-                        .map(|n| n.to_string())
-                        .as_deref()
-                        == Some(id)
-            })
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

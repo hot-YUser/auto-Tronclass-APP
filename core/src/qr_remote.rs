@@ -51,28 +51,18 @@ pub fn is_valid_token(data: &str) -> bool {
 static QR_CLIENT: OnceLock<Client> = OnceLock::new();
 
 pub fn qr_client() -> &'static Client {
-    QR_CLIENT.get_or_init(|| {
-        crate::http::client_builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .cookie_store(false)
-            .timeout(REQUEST_TIMEOUT)
-            .connection_verbose(false)
-            .build()
-            .expect("qr remote client")
-    })
+    QR_CLIENT.get_or_init(|| client_builder().build().expect("qr remote client"))
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
-pub fn build_client() -> Result<Client, String> {
+/// Never follows redirects, never uses a proxy, never keeps cookies: the token request carries a
+/// bearer key that must reach exactly the configured host.
+fn client_builder() -> reqwest::ClientBuilder {
     crate::http::client_builder()
         .redirect(Policy::none())
         .no_proxy()
         .cookie_store(false)
         .timeout(REQUEST_TIMEOUT)
         .connection_verbose(false)
-        .build()
-        .map_err(|e| format!("qr remote client: {e}"))
 }
 
 pub fn token_url(normalized_base: &str) -> String {
@@ -263,7 +253,7 @@ mod tests {
                     .unwrap();
             }
         });
-        let client = build_client().unwrap();
+        let client = client_builder().build().unwrap();
         let base = format!("http://{addr}");
         let got = fetch_token(&client, &base, "test-key").await.unwrap();
         assert_eq!(got, token);
@@ -303,7 +293,7 @@ mod tests {
                     .await
                     .unwrap();
             });
-            let client = build_client().unwrap();
+            let client = client_builder().build().unwrap();
             assert!(
                 matches!(
                     fetch_token(&client, &format!("http://{a1}"), "k")
@@ -325,7 +315,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let client = build_client().unwrap();
+        let client = client_builder().build().unwrap();
         assert!(matches!(
             fetch_token(&client, &format!("http://{a2}"), "k")
                 .await
@@ -336,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_429_503_exact_with_cap_and_malformed_oversize() {
-        let client = build_client().unwrap();
+        let client = client_builder().build().unwrap();
         let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a1 = l1.local_addr().unwrap();
         tokio::spawn(async move {

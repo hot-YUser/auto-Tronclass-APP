@@ -667,9 +667,7 @@ async fn radar_solve_and_sign(
         ));
     }
     // (3) coarse global solve.
-    let est = radar::solve_global_radar(&obs, None)
-        .ok_or("radar: solver failed")?
-        .point;
+    let est = radar::solve_global_radar(&obs, None).ok_or("radar: solver failed")?;
     // (4) standard sampling rings around the estimate.
     for point in radar::standard_sample_points(est) {
         match radar_probe(client, ep, id, point, device_id, beacon).await {
@@ -680,9 +678,7 @@ async fn radar_solve_and_sign(
         }
     }
     // (5) refine with the fuller observation set and submit the estimate itself.
-    let est2 = radar::solve_global_radar(&obs, Some(est))
-        .ok_or("radar: refine failed")?
-        .point;
+    let est2 = radar::solve_global_radar(&obs, Some(est)).ok_or("radar: refine failed")?;
     match radar_probe(client, ep, id, est2, device_id, beacon).await {
         ProbeOutcome::AuthLost => Err(format!("radar probe: {SESSION_INVALID}")),
         ProbeOutcome::InRange => radar_confirm(client, ep, id, user_no).await,
@@ -747,7 +743,8 @@ async fn radar_probe(
         "accuracy": 60, "speed": null, "heading": null, "altitude": 0, "altitudeAccuracy": null
     });
     if let Some((nonce, uid)) = beacon {
-        body["radarSignal"] = Value::String(radar_signature(nonce, device_id, uid, now_unix()));
+        body["radarSignal"] =
+            Value::String(radar_signature(nonce, device_id, uid, crate::time::now()));
     }
     let resp = match client
         .put(ep.answer_radar_coord(id))
@@ -840,19 +837,12 @@ fn extract_distance(v: &Value) -> Option<f64> {
 }
 
 /// beacon signature (radar.rs §1): `md5(nonce+deviceId+userId+ts) + "," + ts`. ts = unix seconds.
-fn radar_signature(nonce: &str, device_id: &str, user_no: &str, ts: u64) -> String {
+fn radar_signature(nonce: &str, device_id: &str, user_no: &str, ts: i64) -> String {
     use md5::{Digest, Md5};
     let mut h = Md5::new();
     h.update(format!("{nonce}{device_id}{user_no}{ts}"));
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     format!("{hex},{ts}")
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// self_registration: empty body, the simplest type.

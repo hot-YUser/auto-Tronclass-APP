@@ -141,10 +141,6 @@ fn seam_login_flow_end_to_end() {
 
     // Skeleton risks still hold.
     assert!(
-        wait_for(|v| v["event"] == "Tick", 3).is_some(),
-        "heartbeat ticks"
-    );
-    assert!(
         snapshot()
             .iter()
             .any(|v| v["event"] == "MonitoringSnapshot"),

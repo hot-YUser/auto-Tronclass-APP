@@ -11,9 +11,10 @@
 //!      and per-phase: TRON_EXAM_ID, TRON_ROLLCALL_ID, TRON_NUMBER_CODE.
 
 use crate::answer::{self, Source};
-use crate::llm::{self, EventCb, LlmConfig};
+use crate::llm::{self, LlmConfig};
 use crate::login::{self, LoginOutcome};
 use crate::providers::Endpoints;
+use crate::redaction::EventCb;
 use crate::rollcall::{self, NumberCfg};
 use reqwest::Client;
 use std::collections::HashMap;

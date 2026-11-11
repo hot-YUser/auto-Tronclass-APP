@@ -4,11 +4,10 @@
 //! `reasoning_content` field, and only the **clean final answer** is returned. The API key comes
 //! from the vault and never enters a log.
 
+use crate::redaction::{emit, EventCb};
 use reqwest::{Client, Response};
 use serde_json::{json, Value};
 use std::time::Duration;
-
-pub type EventCb = extern "C" fn(*const u8, usize);
 
 /// Per-chunk read-idle timeout for LLM responses: a slow-but-chunked reasoning stream must never be
 /// cut by a total deadline, but a server that stops sending bytes must not hold the answer flow
@@ -71,11 +70,6 @@ pub fn build_client() -> Result<Client, String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("llm client: {error}"))
-}
-
-/// All events cross the seam through the single audited redaction pass (docs 90 §4).
-fn emit(cb: EventCb, v: &Value) {
-    crate::redaction::emit(cb, v);
 }
 
 /// The answerer contract system prompt (docs 31). Verbatim — includes the `search_course_materials`

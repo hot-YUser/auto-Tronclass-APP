@@ -1,4 +1,4 @@
-use crate::supervisor::{format_rfc3339_utc, now_epoch_seconds};
+use crate::time;
 use serde_json::{json, Value};
 use std::ffi::c_void;
 
@@ -62,7 +62,7 @@ pub fn apply_clock_command(id: u64, snapshot: &Value) -> String {
         "clock_revision": clock_revision,
         "config_revision": snapshot["config_revision"],
         "schedule_revision": snapshot["schedule_revision"],
-        "evaluated_at_utc": format_rfc3339_utc(now_epoch_seconds()),
+        "evaluated_at_utc": time::format_rfc3339_utc(time::now()),
         "targets": targets,
     })
     .to_string()

@@ -5,6 +5,7 @@
 //! and `monitor::sign_qr_student`). Contract ported from the proven Python v1 teacher flow
 //! (`build_teacher_rollcall_payload(kind="qr")`); still needs a real teacher tenant to fully verify.
 
+use crate::json;
 use crate::providers::Endpoints;
 use crate::rollcall;
 use reqwest::{Client, Response};
@@ -67,18 +68,10 @@ pub fn build_create_payload(title: &str) -> Value {
     })
 }
 
-fn scalar_id(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
 pub fn extract_teacher_rollcall_id(payload: &Value) -> Option<String> {
     let obj = payload.as_object()?;
     for key in ["id", "rollcall_id", "rollcallId"] {
-        if let Some(id) = obj.get(key).and_then(scalar_id) {
+        if let Some(id) = obj.get(key).and_then(json::id) {
             return Some(id);
         }
     }
@@ -116,7 +109,7 @@ pub fn extract_course_id(item: &Value) -> Option<String> {
     let obj = item.as_object()?;
     ["id", "course_id", "courseId"]
         .iter()
-        .find_map(|key| obj.get(*key).and_then(scalar_id))
+        .find_map(|key| obj.get(*key).and_then(json::id))
 }
 
 pub fn extract_teacher_qr_data(payload: &Value) -> Option<String> {

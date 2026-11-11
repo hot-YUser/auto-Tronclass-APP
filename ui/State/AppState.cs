@@ -120,7 +120,6 @@ public sealed class AppState : ObservableObject
     public event Action<QuizVm>? HeroQuiz;
     public event Action<string, ImageSource>? CaptchaRequested; // (account_id, 圖)
     public event Action<string, string>? Toast;                 // (severity, message)
-    public event Action? Ticked;
 
     /// <summary>頁面層的即時提示(儲存成功之類)也走同一條 Toast 通道。</summary>
     public void Notify(string severity, string message) => Toast?.Invoke(severity, message);
@@ -144,7 +143,6 @@ public sealed class AppState : ObservableObject
         if (!e.TryGetProperty("event", out var evEl)) return;
         switch (evEl.GetString())
         {
-            case "Tick": Ticked?.Invoke(); break;
             case "MonitoringSnapshot":
                 ApplyMonitoringSnapshot(MonitoringSnapshotContract.Parse(
                     WireShape.Required(e, "snapshot")));

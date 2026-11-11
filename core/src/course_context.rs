@@ -4,6 +4,7 @@
 //! account's authed client; every failure degrades to a string / `None` — an error never enters the answer
 //! flow (the model must still get its best shot).
 
+use crate::json;
 use crate::providers::Endpoints;
 use crate::quiz::clean_html;
 use reqwest::{Client, Response};
@@ -95,7 +96,7 @@ pub async fn search_course_materials(
 
     let mut out = String::new();
     for a in picked.into_iter().take(3) {
-        let Some(aid) = a.get("id").and_then(id_str) else {
+        let Some(aid) = a.get("id").and_then(json::id) else {
             continue;
         };
         let chunk = read_material(client, &ep, &aid).await;
@@ -167,9 +168,9 @@ async fn read_reference(client: &Client, ep: &Endpoints, rf: &Value) -> String {
         .to_string();
     let upload_id = rf
         .get("upload_id")
-        .and_then(id_str)
-        .or_else(|| rf.pointer("/upload/id").and_then(id_str))
-        .or_else(|| rf.get("id").and_then(id_str))
+        .and_then(json::id)
+        .or_else(|| rf.pointer("/upload/id").and_then(json::id))
+        .or_else(|| rf.get("id").and_then(json::id))
         .unwrap_or_default();
 
     // Server-provided direct attachment URLs are untrusted. Resolve relative values against the
@@ -294,12 +295,6 @@ fn is_image_name(lower: &str) -> bool {
     [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]
         .iter()
         .any(|e| lower.ends_with(e))
-}
-
-fn id_str(x: &Value) -> Option<String> {
-    x.as_str()
-        .map(str::to_string)
-        .or_else(|| x.as_i64().map(|n| n.to_string()))
 }
 
 /// Truncate `s` to at most `max` BYTES, backing off to the nearest char boundary (never mid-codepoint).

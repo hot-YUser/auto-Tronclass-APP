@@ -18,6 +18,7 @@ use crate::protocol::{
     Command, CourseSnapshot, GroupInput, LoginState, Notice, WakeMode, WireError,
 };
 use crate::providers::{Endpoints, Registry};
+use crate::redaction::{emit, EventCb};
 use crate::secrets::{AccountSecret, VaultFile};
 use crate::supervisor::{EffectivePlan, TargetSupervisor};
 use cookie_store::CookieStore;
@@ -32,8 +33,6 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
-
-pub type EventCb = extern "C" fn(*const u8, usize);
 
 fn platform_wake_mode(reason: &str) -> Option<WakeMode> {
     match reason {
@@ -208,11 +207,6 @@ pub struct Core {
     captcha_answer_timeout: Duration,
 }
 
-/// All events cross the seam through the single audited redaction pass (docs 90 §4).
-fn emit(cb: EventCb, v: &Value) {
-    crate::redaction::emit(cb, v);
-}
-
 /// Reply to a correlated command. `error` is None on success.
 fn reply(cb: EventCb, id: u64, ok: bool, error: Option<String>) {
     emit(
@@ -245,17 +239,6 @@ impl Core {
             .enable_all()
             .build()
             .map_err(|error| format!("build tokio runtime: {error}"))?;
-
-        // Heartbeat: unsolicited reverse-channel + process-alive proof (unchanged from slice 0).
-        rt.spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            let mut n: u64 = 0;
-            loop {
-                ticker.tick().await;
-                n += 1;
-                emit(cb, &json!({ "id": null, "event": "Tick", "n": n }));
-            }
-        });
 
         Ok(Box::new(Core {
             rt,
@@ -581,16 +564,14 @@ fn arm_clock_stale_timer(core: &Core) {
     let runtime = core.rt.handle().clone();
     let wake_runtime = runtime.clone();
     runtime.spawn(async move {
-        let seconds = (deadline - crate::supervisor::now_epoch_seconds()).max(0) as u64;
+        let seconds = (deadline - crate::time::now()).max(0) as u64;
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         let changed = {
             let mut guard = lock_state(&state);
             let Some(st) = guard.as_mut() else {
                 return;
             };
-            if st.supervisor.clock_revision() != Some(revision)
-                || crate::supervisor::now_epoch_seconds() < deadline
-            {
+            if st.supervisor.clock_revision() != Some(revision) || crate::time::now() < deadline {
                 return;
             }
             let before = st.supervisor.plan().revision;

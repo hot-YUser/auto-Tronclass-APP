@@ -1,41 +1,21 @@
-//! Radar-rollcall global position solver — a faithful 1:1 port of the owner-authored, server-verified
-//! numerical algorithm (this file IS the executable realization; no external spec doc is maintained).
-//! anchor coordinates → collect each "distance to target" → **3D linear closed-form initial estimate**
-//! (global, no tangent plane) → **geodesic pattern search** → **LM local refine** → uncertainty.
-//! Pure, zero external math deps (docs 90 §8). The old ENU tangent-plane solver was wrong at earth
-//! scale (§0) — this replaces it.
+//! Radar-rollcall position solver. The server reports only the distance from each coordinate we
+//! submit to the classroom, so the target is found by multilateration on the sphere:
+//! closed-form initial estimate → geodesic pattern search → Levenberg–Marquardt refine.
+//! Pure functions, no external math dependencies.
 
 use std::f64::consts::PI;
 
-// ===== §2 constants (verbatim) =====
-/// Mean Earth radius — the sphere radius the solver + `haversine` use.
+/// Mean Earth radius: the sphere every distance here is measured on.
 pub const MEAN_EARTH_RADIUS_M: f64 = 6371008.8;
-// ponytail: WGS84 ellipsoid — only used by true Vincenty inverse/direct, the faithfulness upgrade
-// (§3 sanctions spherical-first this round; diff <1 m absorbed by the LM refine). R2.5.
-#[allow(dead_code)]
-const WGS84_A: f64 = 6378137.0;
-#[allow(dead_code)]
-const WGS84_F: f64 = 1.0 / 298.257223563;
-#[allow(dead_code)]
-const WGS84_B: f64 = WGS84_A * (1.0 - WGS84_F);
-const SQRT_CHI2_2D_95: f64 = 2.4477; // sqrt(5.991), 2-DoF 95% chi-square
 
 const ANCHOR_COUNT: usize = 12;
-const BEARING_COUNT: usize = 12; // points per standard sampling ring (pattern search uses 16, §7)
+const BEARING_COUNT: usize = 12;
 const STANDARD_RADII: [f64; 5] = [10000.0, 3000.0, 1000.0, 300.0, 100.0];
-// ponytail: supplement ring (§11 step 6) — deferred to R2.5.
-#[allow(dead_code)]
-const SUPPLEMENT_RADII: [f64; 3] = [300.0, 100.0, 30.0];
-const ROBUST_F_SCALE: f64 = 50.0; // soft-L1 scale
-const MEASUREMENT_SIGMA: f64 = 0.289;
-// ponytail: the u95 threshold that decides whether to run the supplement ring — R2.5.
-#[allow(dead_code)]
-const TARGET_UNCERTAINTY_95: f64 = 35.0;
+const ROBUST_F_SCALE: f64 = 50.0; // soft-L1 scale, metres
 const MAX_PATTERN_ITERATIONS: u32 = 220;
 const MAX_LM_ITERATIONS: u32 = 60;
 
-// ===== types =====
-/// A geographic point in degrees (§3). Longitude normalized to (-180, 180].
+/// A geographic point in degrees. Longitude is normalized to (-180, 180].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeoPoint {
     pub lat: f64,
@@ -49,18 +29,7 @@ pub struct Observation {
     pub distance: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GlobalRadarEstimate {
-    pub point: GeoPoint,
-    // ponytail: rmse + u95 drive the §11 step-6 supplement-ring decision (deferred to R2.5); computed
-    // now (part of the complete §10 unit) but not yet consumed by the steps 1-5 driver.
-    #[allow(dead_code)]
-    pub residual_rmse: f64,
-    #[allow(dead_code)]
-    pub uncertainty_95_meters: f64,
-}
-
-// ===== §3 geometry primitives =====
+// ---- geometry primitives ----
 
 fn normalize_lon(lon: f64) -> f64 {
     let l = (lon + 180.0).rem_euclid(360.0) - 180.0;
@@ -94,15 +63,6 @@ fn spherical_direct(origin: GeoPoint, bearing_deg: f64, dist: f64) -> GeoPoint {
         lat: lat2.to_degrees(),
         lon: normalize_lon(lon2.to_degrees()),
     }
-}
-
-// ponytail: spherical stand-in for WGS84 — §3 explicitly sanctions spherical-first (diff <1 m,
-// absorbed by the LM refine); true Vincenty inverse/direct is the faithfulness upgrade (R2.5).
-fn wgs84_distance_meters(a: GeoPoint, b: GeoPoint) -> f64 {
-    haversine(a, b)
-}
-fn wgs84_direct_point(origin: GeoPoint, bearing_deg: f64, dist: f64) -> GeoPoint {
-    spherical_direct(origin, bearing_deg, dist)
 }
 
 fn unit_from_geo(p: GeoPoint) -> [f64; 3] {
@@ -151,7 +111,7 @@ impl LocalFrame {
     }
 }
 
-// ===== §4 robust cost (soft-L1) =====
+// ---- robust cost (soft-L1) ----
 fn soft_l1_cost(r: f64) -> f64 {
     let f = ROBUST_F_SCALE;
     f * f * ((1.0 + (r / f).powi(2)).sqrt() - 1.0)
@@ -161,23 +121,16 @@ fn robust_weight(r: f64) -> f64 {
     1.0 / (1.0 + (r / f).powi(2)).sqrt()
 }
 fn residual_i(point: GeoPoint, obs: &Observation) -> f64 {
-    wgs84_distance_meters(point, obs.point) - obs.distance
+    haversine(point, obs.point) - obs.distance
 }
 fn robust_cost(obs: &[Observation], point: GeoPoint) -> f64 {
     obs.iter().map(|o| soft_l1_cost(residual_i(point, o))).sum()
-}
-fn rmse(obs: &[Observation], point: GeoPoint) -> f64 {
-    if obs.is_empty() {
-        return f64::INFINITY;
-    }
-    let s: f64 = obs.iter().map(|o| residual_i(point, o).powi(2)).sum();
-    (s / obs.len() as f64).sqrt()
 }
 fn residuals(obs: &[Observation], geo: GeoPoint) -> Vec<f64> {
     obs.iter().map(|o| residual_i(geo, o)).collect()
 }
 
-// ===== §5 3D linear closed-form initial estimate (global — the true "global refine") =====
+// ---- 3D linear closed-form initial estimate (global — the true "global refine") ----
 fn spherical_initial_estimate(obs: &[Observation]) -> Option<GeoPoint> {
     if obs.len() < 3 {
         return None;
@@ -237,7 +190,7 @@ fn solve_2x2(a11: f64, a12: f64, a22: f64, b1: f64, b2: f64) -> Option<(f64, f64
     Some(((b1 * a22 - a12 * b2) / det, (a11 * b2 - b1 * a12) / det))
 }
 
-// ===== §6 best_seed fallback + anchor / fibonacci points =====
+// ---- best_seed fallback + anchor / fibonacci points ----
 fn best_seed(obs: &[Observation]) -> Option<GeoPoint> {
     let mut candidates = global_anchor_points(ANCHOR_COUNT);
     candidates.extend(fibonacci_points(36));
@@ -295,7 +248,7 @@ fn fibonacci_points(n: usize) -> Vec<GeoPoint> {
         .collect()
 }
 
-// ===== §7 pattern search (geodesic coordinate descent, global, derivative-free) =====
+// ---- pattern search (geodesic coordinate descent, global, derivative-free) ----
 fn pattern_search(start: GeoPoint, obs: &[Observation], has_initial: bool) -> GeoPoint {
     let mut current = start;
     let mut current_cost = robust_cost(obs, current);
@@ -311,7 +264,7 @@ fn pattern_search(start: GeoPoint, obs: &[Observation], has_initial: bool) -> Ge
             let mut best = current;
             let mut best_cost = current_cost;
             for &brg in &bearings {
-                let cand = wgs84_direct_point(current, brg, radius);
+                let cand = spherical_direct(current, brg, radius);
                 let c = robust_cost(obs, cand);
                 if c + 1e-9 < best_cost {
                     best = cand;
@@ -342,7 +295,7 @@ fn pattern_radii(has_initial: bool) -> &'static [f64] {
     }
 }
 
-// ===== §8 LM local refine (ENU tangent frame — valid once near the target) =====
+// ---- LM local refine (ENU tangent frame — valid once near the target) ----
 fn least_squares_refine(start: GeoPoint, obs: &[Observation]) -> GeoPoint {
     let frame = LocalFrame::new(start);
     let (mut cx, mut cy) = (0.0f64, 0.0f64);
@@ -395,62 +348,29 @@ fn least_squares_refine(start: GeoPoint, obs: &[Observation]) -> GeoPoint {
     frame.to_geo(cx, cy)
 }
 
-// ===== §9 uncertainty_95 =====
-fn uncertainty_95(obs: &[Observation], point: GeoPoint, residual_rmse: f64) -> f64 {
-    let frame = LocalFrame::new(point);
-    let r = residuals(obs, frame.to_geo(0.0, 0.0));
-    let r_e = residuals(obs, frame.to_geo(1.0, 0.0));
-    let r_n = residuals(obs, frame.to_geo(0.0, 1.0));
-    let (mut h11, mut h12, mut h22) = (0.0, 0.0, 0.0);
-    for i in 0..r.len() {
-        let w = robust_weight(r[i]);
-        let j1 = r_e[i] - r[i];
-        let j2 = r_n[i] - r[i];
-        h11 += w * j1 * j1;
-        h12 += w * j1 * j2;
-        h22 += w * j2 * j2;
-    }
-    let det = h11 * h22 - h12 * h12;
-    if det <= 1e-18 {
-        return f64::INFINITY;
-    }
-    let (inv11, inv12, inv22) = (h22 / det, -h12 / det, h11 / det);
-    let trace = inv11 + inv22;
-    let spread = ((inv11 - inv22).powi(2) + 4.0 * inv12 * inv12).sqrt();
-    let max_var = (trace + spread) / 2.0;
-    let sigma = MEASUREMENT_SIGMA.max(residual_rmse);
-    max_var.sqrt() * sigma * SQRT_CHI2_2D_95
-}
-
-// ===== §10 solve_global_radar (assemble 5 → 7 → 8 → 9) =====
-pub fn solve_global_radar(
-    obs: &[Observation],
-    initial: Option<GeoPoint>,
-) -> Option<GlobalRadarEstimate> {
+/// Locate the target from at least three distance observations. `initial` is a previous estimate
+/// to refine; without one the search starts from the closed-form solution, or the best global seed
+/// when the observations are degenerate.
+pub fn solve_global_radar(obs: &[Observation], initial: Option<GeoPoint>) -> Option<GeoPoint> {
     if obs.len() < 3 || obs.iter().any(|o| o.distance < 0.0) {
         return None;
     }
     let spherical = spherical_initial_estimate(obs);
     let has_initial = initial.is_some() || spherical.is_some();
     let seed = initial.or(spherical).or_else(|| best_seed(obs))?;
-    let p1 = pattern_search(seed, obs, has_initial);
-    let p2 = least_squares_refine(p1, obs);
-    let e = rmse(obs, p2);
-    let u95 = uncertainty_95(obs, p2, e);
-    Some(GlobalRadarEstimate {
-        point: p2,
-        residual_rmse: e,
-        uncertainty_95_meters: u95,
-    })
+    Some(least_squares_refine(
+        pattern_search(seed, obs, has_initial),
+        obs,
+    ))
 }
 
-// ===== §11 driver helper: the standard sampling rings around an estimate =====
+/// The sampling rings around an estimate: twelve bearings on each of five shrinking radii.
 pub fn standard_sample_points(center: GeoPoint) -> Vec<GeoPoint> {
     let mut pts = Vec::with_capacity(STANDARD_RADII.len() * BEARING_COUNT);
     for &radius in &STANDARD_RADII {
         for k in 0..BEARING_COUNT {
             let brg = 360.0 * k as f64 / BEARING_COUNT as f64;
-            pts.push(wgs84_direct_point(center, brg, radius));
+            pts.push(spherical_direct(center, brg, radius));
         }
     }
     pts
@@ -503,7 +423,7 @@ mod tests {
                 distance: haversine(a, target),
             })
             .collect();
-        let est = solve_global_radar(&obs, None).expect("solved").point;
+        let est = solve_global_radar(&obs, None).expect("solved");
         assert!(
             haversine(est, target) < 10.0,
             "global reverse <10 m, got {:.2}",
@@ -521,7 +441,7 @@ mod tests {
                 });
             }
         }
-        let est2 = solve_global_radar(&obs2, Some(est)).expect("refined").point;
+        let est2 = solve_global_radar(&obs2, Some(est)).expect("refined");
         assert!(
             haversine(est2, target) < 1.0,
             "LM refine <1 m, got {:.3}",

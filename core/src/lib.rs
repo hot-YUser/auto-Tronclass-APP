@@ -11,6 +11,7 @@ mod course_context;
 mod courses;
 mod engine;
 mod http;
+mod json;
 mod llm;
 mod login;
 mod monitor;
@@ -25,6 +26,7 @@ mod rollcall;
 mod secrets;
 mod supervisor;
 mod teacher_qr;
+mod time;
 
 #[cfg(any(test, feature = "fakeserver"))]
 pub mod fake;
