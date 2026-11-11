@@ -885,9 +885,14 @@ mod tests {
         // ONE response only: an empty review must abort before ANY fresh distribute (which would mint
         // a retake instance) — so the whole exchange is exactly one review GET.
         let (base, lines_rx) = scripted_server(vec![(200, r#"{}"#)]).await;
-        let err = resubmit_correct(&Client::new(), &Endpoints::derive(&base), "exam-1", "sub-1")
-            .await
-            .expect_err("an empty review must fail the correction pass");
+        let err = resubmit_correct(
+            &crate::http::client(),
+            &Endpoints::derive(&base),
+            "exam-1",
+            "sub-1",
+        )
+        .await
+        .expect_err("an empty review must fail the correction pass");
         assert!(
             err.contains("no correct answers"),
             "unexpected error: {err}"
@@ -924,9 +929,14 @@ mod tests {
             (200, r#"{"submission_id":999}"#),
         ])
         .await;
-        resubmit_correct(&Client::new(), &Endpoints::derive(&base), "exam-1", "sub-1")
-            .await
-            .expect("review with correct answers must resubmit");
+        resubmit_correct(
+            &crate::http::client(),
+            &Endpoints::derive(&base),
+            "exam-1",
+            "sub-1",
+        )
+        .await
+        .expect("review with correct answers must resubmit");
         let lines = lines_rx.await.unwrap();
         assert_eq!(lines.len(), 4);
         assert!(
@@ -968,7 +978,7 @@ mod tests {
 
         let base = one_shot_response(500, r#"{"error":"server failed"}"#).await;
         let result = submit_exam(
-            &Client::new(),
+            &crate::http::client(),
             &Endpoints::derive(&base),
             "exam-1",
             "instance-1",
@@ -983,7 +993,7 @@ mod tests {
 
         let base = one_shot_response(200, r#"{"allow_retake_exam":false}"#).await;
         let result = submit_exam(
-            &Client::new(),
+            &crate::http::client(),
             &Endpoints::derive(&base),
             "exam-1",
             "instance-1",
@@ -1029,7 +1039,7 @@ mod tests {
         let base = redirect_then_server("/login", r#"{"submission_id":1}"#).await;
         let answers = std::collections::HashMap::new();
         let err = submit_exam(
-            &Client::new(),
+            &crate::http::client(),
             &Endpoints::derive(&base),
             "exam-1",
             "instance-1",
@@ -1060,7 +1070,7 @@ mod tests {
         });
         let answers = std::collections::HashMap::new();
         let err = submit_exam(
-            &Client::new(),
+            &crate::http::client(),
             &Endpoints::derive(&format!("http://{address}")),
             "exam-1",
             "instance-1",
@@ -1123,8 +1133,8 @@ mod tests {
     async fn cross_origin_plaintext_image_is_dropped_not_sent_to_the_model() {
         // Cross-origin images are HTTPS-only: an `http://` CDN/other-host src must be dropped —
         // and the DROPPED image must not appear as its raw URL anywhere in the user content.
-        let school = Client::new();
-        let external = Client::new();
+        let school = crate::http::client();
+        let external = crate::http::client();
         let subject = json!({
             "id": "s-img",
             "type": "single_selection",
@@ -1168,8 +1178,8 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
             stream.write_all(&body).await.unwrap();
         });
-        let school = Client::new();
-        let external = Client::new();
+        let school = crate::http::client();
+        let external = crate::http::client();
         let base = format!("http://{address}/api");
         let subject = json!({
             "id": "s-img",
@@ -1205,8 +1215,8 @@ mod tests {
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let school = Client::new();
-        let external = Client::new();
+        let school = crate::http::client();
+        let external = crate::http::client();
         let base = format!("http://{address}/api");
         let subject = json!({
             "id": "s-img",

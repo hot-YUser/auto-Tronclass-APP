@@ -3184,7 +3184,7 @@ pub(crate) fn build_client(cookies_json: &str) -> Result<(Client, Arc<CookieStor
             .unwrap_or_default()
     };
     let jar = Arc::new(CookieStoreMutex::new(store));
-    let client = Client::builder()
+    let client = crate::http::client_builder()
         .cookie_provider(jar.clone())
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(45))

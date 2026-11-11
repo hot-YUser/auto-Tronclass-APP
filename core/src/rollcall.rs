@@ -1193,7 +1193,7 @@ mod tests {
             tokio::spawn(serve(listener, c2, true));
             let base = format!("http://{addr}");
             let ep = Endpoints::derive(&base);
-            let client = reqwest::Client::new();
+            let client = crate::http::client();
             let cfg = NumberCfg {
                 concurrency: 1,
                 min_concurrency: 1,
@@ -1220,7 +1220,7 @@ mod tests {
             tokio::spawn(serve(listener, c2, false));
             let base = format!("http://{addr}");
             let ep = Endpoints::derive(&base);
-            let client = reqwest::Client::new();
+            let client = crate::http::client();
             let cfg = NumberCfg {
                 concurrency: 1,
                 min_concurrency: 1,
@@ -1292,7 +1292,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            attendance_rate(&Client::new(), &Endpoints::derive(&base), "1").await,
+            attendance_rate(&crate::http::client(), &Endpoints::derive(&base), "1").await,
             None
         );
         let base = roster_server(
@@ -1301,7 +1301,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            read_number_code(&Client::new(), &Endpoints::derive(&base), "1").await,
+            read_number_code(&crate::http::client(), &Endpoints::derive(&base), "1").await,
             None
         );
     }
@@ -1314,12 +1314,12 @@ mod tests {
         let body = "{\"student_rollcalls\":[{\"user_no\":\"a\",\"rollcall_status\":\"on_call_fine\"},{\"user_no\":\"b\",\"rollcall_status\":\"absent\"}],\"number_code\":\"4321\"}";
         let base = roster_server("", body).await;
         assert_eq!(
-            attendance_rate(&Client::new(), &Endpoints::derive(&base), "1").await,
+            attendance_rate(&crate::http::client(), &Endpoints::derive(&base), "1").await,
             Some(50.0)
         );
         let base = roster_server("", body).await;
         assert_eq!(
-            read_number_code(&Client::new(), &Endpoints::derive(&base), "1")
+            read_number_code(&crate::http::client(), &Endpoints::derive(&base), "1")
                 .await
                 .as_deref(),
             Some("4321")
@@ -1447,7 +1447,7 @@ mod tests {
             })
             .await;
             let ep = Endpoints::derive(&base);
-            let client = Client::new();
+            let client = crate::http::client();
             let cfg = NumberCfg {
                 concurrency: 100,
                 min_concurrency: 5,
@@ -1493,7 +1493,7 @@ mod tests {
             })
             .await;
             let ep = Endpoints::derive(&base);
-            let client = Client::new();
+            let client = crate::http::client();
             let cfg = NumberCfg {
                 concurrency: 64,
                 min_concurrency: 4,
@@ -1554,7 +1554,7 @@ mod tests {
             let base = format!("http://{addr}");
             let ep = Endpoints::derive(&base);
             let url = ep.answer_number("RC1");
-            let client = reqwest::Client::builder()
+            let client = crate::http::client_builder()
                 .timeout(std::time::Duration::from_millis(200))
                 .build()
                 .unwrap();
@@ -1593,7 +1593,7 @@ mod tests {
                 })
                 .await;
                 let ep = Endpoints::derive(&base);
-                let client = Client::new();
+                let client = crate::http::client();
                 let cfg = NumberCfg {
                     concurrency: 32,
                     min_concurrency: 2,
@@ -1774,7 +1774,7 @@ mod tests {
         tokio::spawn(fake::serve(listener));
         let base = format!("http://127.0.0.1:{port}");
         let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .cookie_provider(jar)
             .build()
             .unwrap();
@@ -1941,7 +1941,7 @@ mod tests {
         let roster = r#"{"status":"in_progress","rollcallStatus":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"},{"user_no":"c0","rollcall_status":"absent"}]}"#;
         let (base, gets, puts) = qr_preflight_harness(roster, None, false, None).await;
         let ep = Endpoints::derive(&base);
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let out = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
             .await
             .expect("already present must succeed");
@@ -1969,7 +1969,7 @@ mod tests {
             let _ = variant;
             let (base2, _g2, puts2) = qr_preflight_harness(fully_present, None, false, None).await;
             let ep2 = Endpoints::derive(&base2);
-            let client2 = reqwest::Client::new();
+            let client2 = crate::http::client();
             let out2 = sign_qr_with_teacher_data(&client2, &ep2, "RC-QR2", "dev-1", "tok", "u1")
                 .await
                 .expect("whole-class present must be already-present");
@@ -1981,7 +1981,7 @@ mod tests {
         let top_only = r#"{"status":"on_call_fine","student_rollcalls":[]}"#;
         let (base3, _g3, puts3) = qr_preflight_harness(top_only, None, false, None).await;
         let ep3 = Endpoints::derive(&base3);
-        let client3 = reqwest::Client::new();
+        let client3 = crate::http::client();
         let out3 = sign_qr_with_teacher_data(&client3, &ep3, "RC-QR3", "dev-1", "tok", "u1")
             .await
             .expect("top_fine must be already-present");
@@ -2053,7 +2053,7 @@ mod tests {
         });
         let base = format!("http://{addr}");
         let ep = Endpoints::derive(&base);
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let out = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
             .await
             .expect("absent→1 PUT must succeed once roster flips");
@@ -2080,7 +2080,7 @@ mod tests {
         let (base, _gets, puts) =
             qr_preflight_harness(roster, None, false, Some("preflight")).await;
         let ep = Endpoints::derive(&base);
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let err = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
             .await
             .unwrap_err();
@@ -2099,7 +2099,7 @@ mod tests {
         let roster2 = r#"{"status":"on_call_fine","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"}]}"#;
         let (base2, _g2, puts2) = qr_preflight_harness(roster2, None, false, None).await;
         let ep2 = Endpoints::derive(&base2);
-        let client2 = reqwest::Client::new();
+        let client2 = crate::http::client();
         let first_is_auth_lost = is_auth_lost(&err);
         assert!(
             first_is_auth_lost,
@@ -2124,7 +2124,7 @@ mod tests {
             format!("http://{a}")
         };
         let ep_closed = Endpoints::derive(&closed_base);
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(std::time::Duration::from_millis(250))
             .build()
             .unwrap();
@@ -2144,7 +2144,7 @@ mod tests {
         let (base, _gets, puts) =
             qr_preflight_harness(r#"not-json-irrelevant"#, None, true, None).await;
         let ep = Endpoints::derive(&base);
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let err2 = sign_qr_with_teacher_data(&client, &ep, "RC-QR", "dev-1", "tok", "u1")
             .await
             .unwrap_err();
@@ -2166,7 +2166,7 @@ mod tests {
         let roster_ok = r#"{"status":"in_progress","student_rollcalls":[]}"#;
         let (base3, _g3, puts3) = qr_preflight_harness(roster_ok, Some(500), false, None).await;
         let ep3 = Endpoints::derive(&base3);
-        let client3 = reqwest::Client::new();
+        let client3 = crate::http::client();
         let err3 = sign_qr_with_teacher_data(&client3, &ep3, "RC-QR", "dev-1", "tok", "u1")
             .await
             .unwrap_err();
@@ -2181,7 +2181,7 @@ mod tests {
         let bad_payload = r#"{"success":false,"student_rollcalls":[]}"#;
         let (base4, _g4, puts4) = qr_preflight_harness(bad_payload, Some(200), false, None).await;
         let ep4 = Endpoints::derive(&base4);
-        let client4 = reqwest::Client::new();
+        let client4 = crate::http::client();
         let err4 = sign_qr_with_teacher_data(&client4, &ep4, "RC-QR", "dev-1", "tok", "u1")
             .await
             .unwrap_err();

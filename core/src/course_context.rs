@@ -346,7 +346,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let url = format!("http://{address}/img.png");
         assert!(
             fetch_image(&client, &url).await.is_none(),
@@ -368,7 +368,7 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
             stream.write_all(&body).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let url = format!("http://{address}/img");
         let (bytes, mime) = fetch_image(&client, &url)
             .await
@@ -386,7 +386,7 @@ mod tests {
             let response = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 104857600\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let url = format!("http://{address}/big.png");
         assert!(
             fetch_image(&client, &url).await.is_none(),

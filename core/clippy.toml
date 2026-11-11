@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use crate::http::client_builder()" },
+    { path = "reqwest::Client::builder", reason = "use crate::http::client_builder()" },
+    { path = "reqwest::ClientBuilder::new", reason = "use crate::http::client_builder()" },
+]

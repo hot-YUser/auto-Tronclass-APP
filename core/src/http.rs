@@ -10,6 +10,33 @@
 
 use reqwest::{RequestBuilder, Response};
 use serde_json::Value;
+use std::sync::{Arc, OnceLock};
+
+/// Where every client starts: rustls on the ring provider, trusting the bundled Mozilla roots,
+/// HTTP/1.1. reqwest is built without a crypto provider, so its own `Client::new()` /
+/// `Client::builder()` would panic or reach for the OS verifier; `clippy.toml` disallows them.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    static TLS: OnceLock<rustls::ClientConfig> = OnceLock::new();
+    let tls = TLS.get_or_init(|| {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default TLS versions")
+            .with_root_certificates(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tls
+    });
+    reqwest::Client::builder().tls_backend_preconfigured(tls.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn client() -> reqwest::Client {
+    client_builder().build().expect("client")
+}
 
 /// Hard cap for general school-API JSON bodies (rollcall/quiz/radar payloads are KBs; a misbehaving
 /// tenant must not be able to make the app buffer an unbounded response).
@@ -389,7 +416,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let result = super::mutation_checked(
             client
                 .post(format!("http://{address}/submit"))
@@ -417,7 +444,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let result = super::mutation_checked(
             client
                 .post(format!("http://{address}/submit"))
@@ -443,7 +470,7 @@ mod tests {
             let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 104857600\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let response = client
             .get(format!("http://{address}/"))
             .send()
@@ -473,7 +500,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let response = client
             .get(format!("http://{address}/"))
             .send()
@@ -499,7 +526,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let response = client
             .get(format!("http://{address}/"))
             .send()

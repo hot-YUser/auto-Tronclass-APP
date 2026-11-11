@@ -294,7 +294,7 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
         });
         let ep = Endpoints::derive(&format!("http://{address}"));
-        let err = resolve_course_id(&Client::new(), &ep, None)
+        let err = resolve_course_id(&crate::http::client(), &ep, None)
             .await
             .expect_err("an oversized body must not be buffered");
         assert_eq!(err.kind, FailureKind::Transient);

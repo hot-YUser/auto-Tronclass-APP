@@ -765,7 +765,7 @@ mod tests {
         )
         .await;
         assert!(
-            verify_session(&Client::new(), &Endpoints::derive(&base)).await,
+            verify_session(&crate::http::client(), &Endpoints::derive(&base)).await,
             "a path containing 'login' as a substring is a valid API path, not a login redirect"
         );
     }
@@ -775,7 +775,7 @@ mod tests {
         // A genuine redirect to the login page stays a dead session through the shared classifier.
         let base = two_hop_server((302, "/login", ""), (200, "", "{\"id\":1}")).await;
         assert!(
-            !verify_session(&Client::new(), &Endpoints::derive(&base)).await,
+            !verify_session(&crate::http::client(), &Endpoints::derive(&base)).await,
             "redirecting to /login must fail the session check even with a 200 JSON follow-up"
         );
     }

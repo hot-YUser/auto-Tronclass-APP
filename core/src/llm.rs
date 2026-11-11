@@ -66,7 +66,7 @@ pub fn resolve_max_tokens(configured: u32) -> u32 {
 /// tenant-supplied cross-origin image URL from redirecting the shared fetch client into a literal
 /// private address. Model providers should expose their final API endpoint directly.
 pub fn build_client() -> Result<Client, String> {
-    Client::builder()
+    crate::http::client_builder()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -666,7 +666,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             answer_question(
                 &llm_client,
-                &reqwest::Client::new(),
+                &crate::http::client(),
                 &cfg,
                 &[json!({"role": "user", "content": "q"})],
                 noop_cb,
@@ -760,7 +760,7 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let school = reqwest::Client::builder()
+        let school = crate::http::client_builder()
             .cookie_provider(std::sync::Arc::new(
                 reqwest_cookie_store::CookieStoreMutex::new(cookie_store::CookieStore::default()),
             ))

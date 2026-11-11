@@ -118,7 +118,7 @@ async fn live_llm() {
 async fn live_school_probe() {
     use crate::login::{detect_login_kind, LoginKind};
     let reg = crate::providers::Registry::factory();
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()
         .unwrap();

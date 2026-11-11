@@ -5817,7 +5817,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: "http://127.0.0.1:1".to_string(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         };
@@ -5916,7 +5916,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: "http://127.0.0.1:1".to_string(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -6522,7 +6522,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: base_url.clone(),
-            client: reqwest::Client::new(),
+            client: crate::http::client(),
             username: "user".to_string(),
             password: crate::secrets::Secret::default(),
         });
@@ -6801,7 +6801,7 @@ mod tests {
             is_teacher,
             course_id: None,
             base_url: "http://127.0.0.1:1".to_string(), // port 1: connection refused → fails fast
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         })
@@ -7567,7 +7567,7 @@ mod tests {
             is_teacher: true,
             course_id: Some("C1".to_string()),
             base_url: teacher_base,
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -7578,7 +7578,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -7759,7 +7759,7 @@ mod tests {
             is_teacher: true,
             course_id: Some("C1".to_string()),
             base_url: teacher_base,
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -7770,7 +7770,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -7943,7 +7943,7 @@ mod tests {
             is_teacher: true,
             course_id: Some("C1".to_string()),
             base_url: teacher_base,
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -7954,7 +7954,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8034,7 +8034,7 @@ mod tests {
             is_teacher: true,
             course_id: Some("C1".to_string()),
             base_url: teacher_base,
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8045,7 +8045,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8189,7 +8189,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8350,7 +8350,7 @@ mod tests {
                 is_teacher: false,
                 course_id: None,
                 base_url: student_base.clone(),
-                client: Client::new(),
+                client: crate::http::client(),
                 username: String::new(),
                 password: crate::secrets::Secret::default(),
             })
@@ -8509,7 +8509,7 @@ mod tests {
             is_teacher: true,
             course_id: Some("C1".to_string()),
             base_url: teacher_base,
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8520,7 +8520,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8660,7 +8660,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -8990,7 +8990,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -9100,7 +9100,7 @@ mod tests {
                 is_teacher: false,
                 course_id: None,
                 base_url: student_base.clone(),
-                client: Client::new(),
+                client: crate::http::client(),
                 username: String::new(),
                 password: crate::secrets::Secret::default(),
             })
@@ -9371,7 +9371,7 @@ mod tests {
                     is_teacher: false,
                     course_id: None,
                     base_url: "http://x".to_string(),
-                    client: Client::new(),
+                    client: crate::http::client(),
                     username: String::new(),
                     password: Secret::default(),
                 }),
@@ -9385,7 +9385,7 @@ mod tests {
                     is_teacher: false,
                     course_id: None,
                     base_url: "http://x".to_string(),
-                    client: Client::new(),
+                    client: crate::http::client(),
                     username: String::new(),
                     password: Secret::default(),
                 }),
@@ -9399,7 +9399,7 @@ mod tests {
                     is_teacher: false,
                     course_id: None,
                     base_url: "http://x".to_string(),
-                    client: Client::new(),
+                    client: crate::http::client(),
                     username: String::new(),
                     password: Secret::default(),
                 }),
@@ -9593,7 +9593,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -9745,7 +9745,7 @@ mod tests {
             is_teacher: true,
             course_id: None,
             base_url: teacher_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });
@@ -9756,7 +9756,7 @@ mod tests {
             is_teacher: false,
             course_id: None,
             base_url: student_base.clone(),
-            client: Client::new(),
+            client: crate::http::client(),
             username: String::new(),
             password: crate::secrets::Secret::default(),
         });

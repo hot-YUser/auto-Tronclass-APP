@@ -52,7 +52,7 @@ static QR_CLIENT: OnceLock<Client> = OnceLock::new();
 
 pub fn qr_client() -> &'static Client {
     QR_CLIENT.get_or_init(|| {
-        Client::builder()
+        crate::http::client_builder()
             .redirect(Policy::none())
             .no_proxy()
             .cookie_store(false)
@@ -65,7 +65,7 @@ pub fn qr_client() -> &'static Client {
 
 #[cfg_attr(not(test), expect(dead_code))]
 pub fn build_client() -> Result<Client, String> {
-    Client::builder()
+    crate::http::client_builder()
         .redirect(Policy::none())
         .no_proxy()
         .cookie_store(false)
