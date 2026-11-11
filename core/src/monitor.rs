@@ -8436,6 +8436,8 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let _ = stream.read(&mut buf).await;
+                    // The teacher source fails only after consuming 11s of the 12s window.
+                    tokio::time::sleep(Duration::from_millis(11000)).await;
                     let resp =
                         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(resp.as_bytes()).await;
@@ -8528,8 +8530,9 @@ mod tests {
             "RC-FALLBACK-REMAINING".to_string(),
         );
         let secret = Arc::new(Secret::new("k-qr-test".to_string()));
-        // Advance time so prepare_teacher_source still fails fast, then fallback must run with remaining budget only.
-        // Use a short manual deadline by sleeping before assist consumes the window.
+        // Paused time auto-advances: the teacher fails at ~11s, so the fallback starts with ~1s left
+        // and its 5s token fetch must be cut off by the original deadline.
+        let assist_started = Instant::now();
         spawn_qr_teacher_assist(
             teacher,
             vec![student],
@@ -8540,11 +8543,6 @@ mod tests {
             &group,
             Some((remote_base, secret, leaked_qr_rev_rx(), 0)),
         );
-        // Consume ~11s of the 12s teacher window before fallback would start.
-        tokio::time::advance(Duration::from_millis(11000)).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(3000)).await;
-        tokio::task::yield_now().await;
         let mut msg = rx
             .recv()
             .await
@@ -8564,16 +8562,22 @@ mod tests {
         }
         match msg {
             MonitorMsg::QrSignResult { result, .. } => {
-                let err = result.expect_err("must be deadline or teacher error, not success");
-                assert!(
-                    err.to_ascii_lowercase().contains("deadline") || err.contains("qr: teacher"),
-                    "got: {err}"
-                );
+                let err = result.expect_err("must be a deadline error, not success");
+                assert!(err.to_ascii_lowercase().contains("deadline"), "got: {err}");
             }
             _ => panic!("expected QrSignResult"),
         }
-        // Total elapsed from task start bounded (~12s): fallback must NOT have granted a fresh 12s.
-        // Paused time is ~14s advanced; without bounding fallback would take ~23s.
+        assert!(
+            remote_fetch_started.load(Ordering::SeqCst) > 0,
+            "fallback must have started inside the teacher window"
+        );
+        // Total elapsed from task start is one window: a fresh 12s for the fallback would let the
+        // 5s token fetch finish at ~16s instead.
+        let elapsed = assist_started.elapsed();
+        assert!(
+            elapsed <= teacher_qr::CONFIRM_WINDOW + Duration::from_millis(50),
+            "elapsed: {elapsed:?}"
+        );
         group.cancel();
         tokio::time::resume();
     }

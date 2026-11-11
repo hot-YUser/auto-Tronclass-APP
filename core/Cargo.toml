@@ -12,9 +12,7 @@ name = "tronclass_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# 1.53.3 起修正 paused time 遇 I/O 喚醒的自動快轉（tokio#8595），monitor 的 QR fallback 測試依賴舊行為；
-# 解除此 pin 前需先調整該測試。
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
 reqwest_cookie_store = "0.8"      # serializable cookie jar → cache/restore a session
 cookie_store = "0.21"             # (used directly for save/load of the session)
