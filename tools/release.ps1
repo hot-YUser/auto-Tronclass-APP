@@ -527,8 +527,6 @@ foreach ($check in $csharpChecks) {
         throw "缺少 $($check.Name) 可執行檢查：$($check.Path)"
     }
     Step "$($check.Name) 可執行檢查"
-    # Checks declare RollForward Major via tools/checks/Directory.Build.props so both CI and
-    # release share the same project-declared runtime policy (no env duplication).
     Invoke-Native -FilePath $dotnet -Arguments @("run", "--project", $check.Path, "-c", "Release") -FailureMessage "$($check.Name) 可執行檢查失敗"
 }
 

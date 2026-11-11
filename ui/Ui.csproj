@@ -3,7 +3,7 @@
 	<PropertyGroup>
 		<!-- Skeleton heads only: Windows (dev desktop) + Android (foreground-service keepalive).
 		     iOS/MacCatalyst need a Mac build host and are deferred; Linux/WASM (Avalonia) is slice N. -->
-		<!-- .NET 11 preview's android workload compiles against API 37 only; the android-37 platform
+		<!-- .NET 11's android workload compiles against API 37 only; the android-37 platform
 		     is fetched via `dotnet build -t:InstallAndroidDependencies` (not in the default SDK channel). -->
 		<TargetFrameworks>net11.0-android</TargetFrameworks>
 		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net11.0-windows10.0.19041.0</TargetFrameworks>
@@ -93,7 +93,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
-		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.0" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="11.0.0" />
 	</ItemGroup>
 
 	<!-- Native core, built by tools/build-core.ps1 into the sibling core/ crate's output.
