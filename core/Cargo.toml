@@ -19,9 +19,9 @@ cookie_store = "0.21"             # (used directly for save/load of the session)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Vault: at-rest encryption of stored secrets, auto-unlocked with a per-device key (no password).
-chacha20poly1305 = "0.10"          # XChaCha20-Poly1305 AEAD
+chacha20poly1305 = "0.11"          # XChaCha20-Poly1305 AEAD
 zeroize = "1"                      # wipe the device key on lock
-getrandom = "0.2"                  # OS CSPRNG for the device key + per-write nonce
+getrandom = "0.4"                  # OS CSPRNG for the device key + per-write nonce
 # Login form parsing (protocol boundary — carry hidden CSRF inputs verbatim).
 # tl: one small pure-Rust HTML parser; lenient on malformed pages. (Not scraper — that pulls
 # html5ever/selectors/cssparser and is heavier to compile across four ABIs, with no benefit here.)

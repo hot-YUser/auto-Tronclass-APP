@@ -673,7 +673,7 @@ pub fn canonical_tenant(registry: &Registry, school_ref: &str) -> Result<String,
 
 pub fn new_id() -> String {
     let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         return fallback_id();
     }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()

@@ -106,7 +106,7 @@ impl VaultFile {
     /// so the on-disk layout (salt||nonce||ct) is identical to a password vault.
     pub fn create_with_key(path: &Path, mut key: [u8; 32]) -> Result<VaultFile, String> {
         let mut salt = [0u8; SALT_LEN];
-        if let Err(error) = getrandom::getrandom(&mut salt) {
+        if let Err(error) = getrandom::fill(&mut salt) {
             key.zeroize();
             return Err(error.to_string());
         }
@@ -159,8 +159,12 @@ impl VaultFile {
         ciphertext: &[u8],
         err: &str,
     ) -> Result<VaultFile, String> {
+        let Ok(nonce) = <&XNonce>::try_from(nonce) else {
+            key.zeroize();
+            return Err("vault file corrupt".into());
+        };
         let cipher = XChaCha20Poly1305::new((&key).into());
-        let mut plaintext = match cipher.decrypt(XNonce::from_slice(nonce), ciphertext) {
+        let mut plaintext = match cipher.decrypt(nonce, ciphertext) {
             Ok(plaintext) => plaintext,
             Err(_) => {
                 key.zeroize();
@@ -190,11 +194,11 @@ impl VaultFile {
         let key = self.key.as_ref().ok_or("vault is locked")?;
 
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?; // fresh, every write
+        getrandom::fill(&mut nonce).map_err(|e| e.to_string())?; // fresh, every write
 
         let mut plaintext = serde_json::to_vec(&self.data).map_err(|e| e.to_string())?;
         let cipher = XChaCha20Poly1305::new(key.into());
-        let ciphertext_result = cipher.encrypt(XNonce::from_slice(&nonce), plaintext.as_ref());
+        let ciphertext_result = cipher.encrypt((&nonce).into(), plaintext.as_ref());
         plaintext.zeroize();
         let ciphertext = ciphertext_result.map_err(|e| e.to_string())?;
 
@@ -359,7 +363,7 @@ pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
         Err(error) => return Err(format!("read device key: {error}")),
     }
     let mut key = [0u8; 32];
-    getrandom::getrandom(&mut key).map_err(|e| e.to_string())?;
+    getrandom::fill(&mut key).map_err(|e| e.to_string())?;
     match crate::atomic_file::create_new(key_path, &key) {
         Ok(()) => Ok(key),
         // Another initializer won the race. Its complete key is authoritative; never replace it.
@@ -531,7 +535,7 @@ mod tests {
         let mut payload = b"\"VAULT-SECRET-ECHO\"".to_vec();
         let ciphertext = cipher
             .encrypt(
-                XNonce::from_slice(&raw[SALT_LEN..SALT_LEN + NONCE_LEN]),
+                <&XNonce>::try_from(&raw[SALT_LEN..SALT_LEN + NONCE_LEN]).unwrap(),
                 payload.as_ref(),
             )
             .unwrap();
