@@ -231,26 +231,12 @@ pub async fn recheck_on_call_fine(
     my_present(&v, user_no) || (total > 0 && present == total) || top_fine(&v)
 }
 
-/// Brute-force tuning (rollcall.rs). Kept for backward compatibility — the
-/// runtime clamps effective concurrency to 1 per rollcall/profile (unknown-safe
-/// sequential; see `brute_force_number`).
+/// Brute-force pacing. Codes are tried one at a time: an ambiguous response may already be a
+/// success, so a second request must never be in flight alongside it.
 #[derive(Clone, Copy)]
 pub struct NumberCfg {
-    pub concurrency: u32,
-    pub min_concurrency: u32,
     pub cooldown_ms: u64,
     pub max_cooldowns: u32,
-}
-
-impl NumberCfg {
-    /// Retained knobs are clamped to sequential: at most one unresolved number
-    /// mutation per rollcall/profile (ambiguous responses may be successes).
-    pub fn effective_concurrency(self) -> u32 {
-        1
-    }
-    pub fn was_clamped(self) -> bool {
-        self.concurrency.clamp(1, 256) != 1 || self.min_concurrency.clamp(1, 256) != 1
-    }
 }
 
 /// Classification of a single number-answer response — the real server distinguishes these and the
@@ -1185,8 +1171,6 @@ mod tests {
             let ep = Endpoints::derive(&base);
             let client = crate::http::client();
             let cfg = NumberCfg {
-                concurrency: 1,
-                min_concurrency: 1,
                 cooldown_ms: 1,
                 max_cooldowns: 0,
             };
@@ -1212,8 +1196,6 @@ mod tests {
             let ep = Endpoints::derive(&base);
             let client = crate::http::client();
             let cfg = NumberCfg {
-                concurrency: 1,
-                min_concurrency: 1,
                 cooldown_ms: 1,
                 max_cooldowns: 0,
             };
@@ -1337,26 +1319,6 @@ mod tests {
         assert!(!response_auth_lost(400, &api, r#"{"error":"wrong"}"#));
     }
 
-    #[test]
-    fn number_cfg_clamps_effective_concurrency_to_one() {
-        let cfg = NumberCfg {
-            concurrency: 100,
-            min_concurrency: 5,
-            cooldown_ms: 5000,
-            max_cooldowns: 3,
-        };
-        assert!(cfg.was_clamped());
-        assert_eq!(cfg.effective_concurrency(), 1);
-        let unitary = NumberCfg {
-            concurrency: 1,
-            min_concurrency: 1,
-            cooldown_ms: 1,
-            max_cooldowns: 0,
-        };
-        assert!(!unitary.was_clamped());
-        assert_eq!(unitary.effective_concurrency(), 1);
-    }
-
     #[tokio::test]
     async fn brute_force_number_is_sequential_with_barrier_proof() {
         use crate::providers::Endpoints;
@@ -1439,8 +1401,6 @@ mod tests {
             let ep = Endpoints::derive(&base);
             let client = crate::http::client();
             let cfg = NumberCfg {
-                concurrency: 100,
-                min_concurrency: 5,
                 cooldown_ms: 1,
                 max_cooldowns: 0,
             };
@@ -1485,8 +1445,6 @@ mod tests {
             let ep = Endpoints::derive(&base);
             let client = crate::http::client();
             let cfg = NumberCfg {
-                concurrency: 64,
-                min_concurrency: 4,
                 cooldown_ms: 1,
                 max_cooldowns: 0,
             };
@@ -1549,8 +1507,6 @@ mod tests {
                 .build()
                 .unwrap();
             let cfg = NumberCfg {
-                concurrency: 50,
-                min_concurrency: 5,
                 cooldown_ms: 50,
                 max_cooldowns: 0,
             };
@@ -1585,8 +1541,6 @@ mod tests {
                 let ep = Endpoints::derive(&base);
                 let client = crate::http::client();
                 let cfg = NumberCfg {
-                    concurrency: 32,
-                    min_concurrency: 2,
                     cooldown_ms: 1,
                     max_cooldowns: 0,
                 };

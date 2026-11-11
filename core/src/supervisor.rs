@@ -2,13 +2,13 @@ use crate::config::{
     AccountGroup, Config, DetectorSelection, ManualOverride, PlatformBlock, ScheduleBinding,
     TargetId,
 };
-use crate::protocol::{
+use crate::time;
+use crate::wire::{
     AccountResult, AccountResultPhase, AccountRole, AccountSnapshot, CourseSnapshot,
     DetectorSnapshot, GroupDefinitionSnapshot, LoginState, ManualOverrideSnapshot, MergeCoverage,
     MergePrompt, MonitoringSnapshot, Notice, ScheduleClockEntry, SessionState, TargetRef,
     TargetRuntimeState, TargetSnapshot, WakeMode, WireError,
 };
-use crate::time;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 

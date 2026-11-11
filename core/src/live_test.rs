@@ -14,8 +14,8 @@ use crate::answer::{self, Source};
 use crate::llm::{self, LlmConfig};
 use crate::login::{self, LoginOutcome};
 use crate::providers::Endpoints;
-use crate::redaction::EventCb;
 use crate::rollcall::{self, NumberCfg};
+use crate::wire::EventCb;
 use reqwest::Client;
 use std::collections::HashMap;
 
@@ -387,8 +387,6 @@ async fn live_number_rollcall() {
 
     // Sign with the known code (avoid brute-forcing the real server). cfg is unused on this path.
     let cfg = NumberCfg {
-        concurrency: 8,
-        min_concurrency: 2,
         cooldown_ms: 200,
         max_cooldowns: 2,
     };

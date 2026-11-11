@@ -4,7 +4,7 @@
 //! `reasoning_content` field, and only the **clean final answer** is returned. The API key comes
 //! from the vault and never enters a log.
 
-use crate::redaction::{emit, EventCb};
+use crate::wire::{emit, Event, EventCb};
 use reqwest::{Client, Response};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -260,9 +260,12 @@ fn flush_reasoning(
     }
     emit(
         cb,
-        &json!({ "id": null, "event": "ReasoningChunk",
-                      "activity_token": activity_token, "account_id": account_id,
-                      "subject_id": subject_id, "text": pending.as_str() }),
+        Event::ReasoningChunk {
+            activity_token,
+            account_id,
+            subject_id,
+            text: pending.as_str(),
+        },
     );
     pending.clear();
 }
@@ -426,9 +429,12 @@ async fn tool_loop(
         if let Some(r) = reasoning_content(msg) {
             emit(
                 cb,
-                &json!({ "id": null, "event": "ReasoningChunk",
-                              "activity_token": activity_token, "account_id": account_id,
-                              "subject_id": subject_id, "text": r }),
+                Event::ReasoningChunk {
+                    activity_token,
+                    account_id,
+                    subject_id,
+                    text: r,
+                },
             );
         }
         let content = strip_think(msg.get("content").and_then(Value::as_str).unwrap_or(""))

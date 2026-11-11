@@ -16,16 +16,18 @@ use crate::config::TargetId;
 use crate::json;
 use crate::llm::LlmConfig;
 use crate::login;
-use crate::protocol::AccountResultPhase;
-use crate::protocol::AnswerWire;
 use crate::providers::Endpoints;
 use crate::quiz::Answer;
-use crate::redaction::{emit, EventCb};
 use crate::rollcall::{self, RollcallKind, SignOutcome};
 use crate::secrets::Secret;
 use crate::teacher_qr::{self, FailureKind};
+use crate::wire::{
+    emit, respond, AccountResultPhase, AnswerWire, AttemptState, CountdownScope, Event, EventCb,
+    ExpectedAccount, LogLevel, PreparedAccount, PreparedQuestion, Problem, QuestionOption,
+    QuizActivityRef, QuizPrepared,
+};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap as Map;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,16 +39,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 fn command_reply(cb: EventCb, command_id: u64, result: Result<(), String>) {
-    match result {
-        Ok(()) => emit(
-            cb,
-            &json!({ "id": command_id, "event": "Reply", "ok": true, "error": null }),
-        ),
-        Err(error) => emit(
-            cb,
-            &json!({ "id": command_id, "event": "Reply", "ok": false, "error": error }),
-        ),
-    }
+    respond(cb, command_id, Event::reply(result));
 }
 
 /// Per-account runtime context (session already authenticated by the engine). Carries the credentials
@@ -166,9 +159,7 @@ impl TaskGroup {
                     let _ = error;
                     emit(
                         cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                                      "code": "core_panicked",
-                                      "message": "monitor task failed internally" }),
+                        Problem::error("core_panicked", "monitor task failed internally"),
                     );
                     let _ = panic_tx.send(());
                 }
@@ -522,8 +513,6 @@ pub struct MonitorConfig {
     pub max_tool_iterations: u32,
     pub resubmit_for_correct: bool,
     pub radar_strategy: Vec<String>,
-    pub number_concurrency: u32,
-    pub number_min_concurrency: u32,
     pub number_cooldown_ms: u64,
     pub number_max_cooldowns: u32,
     pub poll_idle_secs: u64,
@@ -1396,12 +1385,7 @@ async fn actor(init: ActorInit) {
                                     a.qr_source_failed_reason = Some(reason.clone());
                                     // Preserve sanitized user diagnostics.
                                     let _ = account_ids;
-                                    emit(
-                                        cb,
-                                        &json!({ "id": null, "event": "Error", "severity": "warn",
-                                                  "code": "qr_source_failed", "activity_token": a.activity_token.clone(),
-                                                  "message": reason }),
-                                    );
+                                    emit(cb, Problem::warning("qr_source_failed", reason).activity(&a.activity_token));
                                 }
                             }
                         }
@@ -1607,13 +1591,7 @@ async fn actor(init: ActorInit) {
                             let attempts =
                                 relogin_failed(&mut relogin_backoff, &account_id, Instant::now());
                             if attempts == RELOGIN_MAX_ATTEMPTS {
-                                emit(cb, &json!({
-                                    "id": null, "event": "Error", "severity": "error",
-                                    "code": "relogin_failed", "account_id": account_id,
-                                    "message": format!(
-                                        "account {account_id}: re-login failed {attempts} times; automatic retries stopped"
-                                    )
-                                }));
+                                emit(cb, Problem::error("relogin_failed", format!( "account {account_id}: re-login failed {attempts} times; automatic retries stopped" )).account(&account_id));
                                 let _ = runtime_tx.send(RuntimeEvent::AccountLogin {
                                     account_id: account_id.clone(),
                                     online: false,
@@ -1866,9 +1844,13 @@ fn on_gate(
     let holding = rate + f64::EPSILON < cfg.gate_percent;
     emit(
         cb,
-        &json!({ "id": null, "event": "RollcallGate", "rollcall_id": key.2,
-                      "activity_token": a.activity_token,
-                      "rate": a.attendance_rate, "gate_percent": cfg.gate_percent, "holding": holding }),
+        Event::RollcallGate {
+            rollcall_id: &key.2,
+            activity_token: &a.activity_token,
+            rate: a.attendance_rate,
+            gate_percent: cfg.gate_percent,
+            holding,
+        },
     );
     if holding {
         // Below the anti-fake-rollcall gate → hold and re-check only on the bounded cadence.
@@ -1876,8 +1858,13 @@ fn on_gate(
         a.gate_next_check = Some(Instant::now() + GATE_RECHECK_INTERVAL);
         emit(
             cb,
-            &json!({ "id": null, "event": "LogLine", "level": "info",
-                          "text": format!("rollcall {} below {:.0}% gate ({:.1}%), holding", key.2, cfg.gate_percent, rate) }),
+            Event::log(
+                LogLevel::Info,
+                format!(
+                    "rollcall {} below {:.0}% gate ({:.1}%), holding",
+                    key.2, cfg.gate_percent, rate
+                ),
+            ),
         );
         return;
     }
@@ -1918,9 +1905,12 @@ fn on_tick(
             let remaining = deadline.saturating_duration_since(now).as_secs();
             emit(
                 cb,
-                &json!({ "id": null, "event": "Countdown", "scope": "rollcall",
-                              "activity_token": a.activity_token, "external_id": key.2,
-                              "remaining_secs": remaining }),
+                Event::Countdown {
+                    scope: CountdownScope::Rollcall,
+                    activity_token: &a.activity_token,
+                    external_id: &key.2,
+                    remaining_secs: remaining,
+                },
             );
             if now >= deadline {
                 dispatch_signs(
@@ -2740,32 +2730,9 @@ fn dispatch_signs_for(
     let activity_token = a.activity_token.clone();
     let radar_strategy = cfg.radar_strategy.clone();
     let ncfg = rollcall::NumberCfg {
-        concurrency: cfg.number_concurrency,
-        min_concurrency: cfg.number_min_concurrency,
         cooldown_ms: cfg.number_cooldown_ms,
         max_cooldowns: cfg.number_max_cooldowns,
     };
-    if ncfg.was_clamped() {
-        emit(
-            cb,
-            &json!({ "id": null, "event": "NumberConcurrencyClamped",
-                "activity_token": activity_token.clone(),
-                "rollcall_id": key.2.clone(),
-                "configured_concurrency": ncfg.concurrency,
-                "configured_min_concurrency": ncfg.min_concurrency,
-                "effective_concurrency": ncfg.effective_concurrency(),
-                "reason": "unknown-safe single-flight: at most one unresolved Number mutation per rollcall/profile" }),
-        );
-    }
-    emit(
-        cb,
-        &json!({ "id": null, "event": "NumberConcurrencyStatus",
-            "activity_token": activity_token.clone(),
-            "rollcall_id": key.2.clone(),
-            "effective_concurrency": ncfg.effective_concurrency(),
-            "configured_concurrency": ncfg.concurrency }),
-    );
-
     if kind == RollcallKind::Qr {
         let teacher = accounts
             .values()
@@ -2864,20 +2831,14 @@ fn dispatch_signs_for(
                 // Best-effort emit now; actor duplicate emit is deduplicated by mutation guard.
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "warn", "code": "qr_source_failed", "activity_token": a.activity_token.clone(), "message": sanitized }),
+                    Problem::warning("qr_source_failed", sanitized).activity(&a.activity_token),
                 );
                 let _ = (gen, k, ids, tx);
             }
         }
         if teacher.is_none() {
             a.acted = false;
-            emit(
-                cb,
-                &json!({ "id": null, "event": "Error", "severity": "warn",
-                                     "code": "qr_needs_teacher",
-                                     "activity_token": activity_token,
-                                     "message": "偵測到 QR 點名，但目前沒有教師帳號可輔助。請先停止監控，到「帳號」新增教師帳號，再重新開始監控。" }),
-            );
+            emit(cb, Problem::warning("qr_needs_teacher", "偵測到 QR 點名，但目前沒有教師帳號可輔助。請先停止監控，到「帳號」新增教師帳號，再重新開始監控。").activity(&activity_token));
         } else if account_ids.is_empty() {
             // teacher existed but no students to sign — nothing to do
             a.acted = false;
@@ -2959,9 +2920,13 @@ fn on_sign_result(
             }
             emit(
                 cb,
-                &json!({ "id": null, "event": "SignedIn", "rollcall_id": key.2,
-                              "activity_token": a.activity_token,
-                              "account_id": account_id, "course": a.course, "method": outcome.method }),
+                Event::SignedIn {
+                    rollcall_id: &key.2,
+                    activity_token: &a.activity_token,
+                    account_id: &account_id,
+                    course: &a.course,
+                    method: &outcome.method,
+                },
             );
         }
         // Session died mid-sign (R4.1 #2): DON'T give up on the first hit — mark for re-sign, ask the
@@ -2976,17 +2941,24 @@ fn on_sign_result(
                 a.sign_failed.remove(&account_id);
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "error",
-                                  "code": "sign_failed", "activity_token": a.activity_token,
-                                  "message": format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} re-logins)") }),
+                    Problem::error(
+                        "sign_failed",
+                        format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} re-logins)"),
+                    )
+                    .activity(&a.activity_token),
                 );
             } else {
                 a.needs_resign.insert(account_id.clone());
                 a.sign_failed.remove(&account_id); // the resign path owns this account now
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "LogLine", "level": "warn",
-                                  "text": format!("rollcall {}: {account_id} session lost mid-sign, re-logging in", key.2) }),
+                    Event::log(
+                        LogLevel::Warn,
+                        format!(
+                            "rollcall {}: {account_id} session lost mid-sign, re-logging in",
+                            key.2
+                        ),
+                    ),
                 );
                 tx.send(MonitorMsg::AuthLost { account_id }).ok();
             }
@@ -3000,17 +2972,18 @@ fn on_sign_result(
                 a.sign_failed.remove(&account_id);
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "error",
-                                  "code": "sign_failed", "activity_token": a.activity_token,
-                                  "message": format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} attempts)") }),
+                    Problem::error(
+                        "sign_failed",
+                        format!("{account_id}: {e} (unrecoverable after {MAX_RESIGN} attempts)"),
+                    )
+                    .activity(&a.activity_token),
                 );
             } else {
                 a.sign_failed.insert(account_id.clone());
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "error",
-                                  "code": "sign_failed", "activity_token": a.activity_token,
-                                  "message": format!("{account_id}: {e}") }),
+                    Problem::error("sign_failed", format!("{account_id}: {e}"))
+                        .activity(&a.activity_token),
                 );
             }
         }
@@ -3040,19 +3013,9 @@ fn redispatch_signs(
         return;
     };
     let ncfg = rollcall::NumberCfg {
-        concurrency: cfg.number_concurrency,
-        min_concurrency: cfg.number_min_concurrency,
         cooldown_ms: cfg.number_cooldown_ms,
         max_cooldowns: cfg.number_max_cooldowns,
     };
-    if ncfg.was_clamped() {
-        emit(
-            cb,
-            &json!({ "id": null, "event": "NumberConcurrencyClamped",
-                "effective_concurrency": ncfg.effective_concurrency(),
-                "configured_concurrency": ncfg.concurrency }),
-        );
-    }
     let has_qr_source = qr_source_available(cfg, accounts);
     let mut qr_keys: Vec<ActivityKey> = Vec::new();
     for (key, a) in activities.iter_mut() {
@@ -3108,8 +3071,10 @@ fn on_defer(activities: &mut HashMap<ActivityKey, Activity>, cb: EventCb, key: &
         a.gate_next_check = None;
         emit(
             cb,
-            &json!({ "id": null, "event": "PendingSignIn", "rollcall_id": key.2,
-            "activity_token": a.activity_token }),
+            Event::PendingSignIn {
+                rollcall_id: &key.2,
+                activity_token: &a.activity_token,
+            },
         );
     }
 }
@@ -3745,13 +3710,17 @@ fn find_activity_key(
 }
 
 fn emit_rollcall_detected(cb: EventCb, rollcall_id: &str, base_url: &str, a: &Activity) {
-    let accounts: Vec<&String> = a.participants.iter().collect();
     emit(
         cb,
-        &json!({ "id": null, "event": "RollcallDetected", "rollcall_id": rollcall_id,
-                      "activity_token": a.activity_token,
-                      "base_url": base_url, "kind": a.kind.as_str(), "course": a.course,
-                      "attendance_rate": a.attendance_rate, "accounts": accounts }),
+        Event::RollcallDetected {
+            rollcall_id,
+            activity_token: &a.activity_token,
+            base_url,
+            kind: a.kind.as_str(),
+            course: &a.course,
+            attendance_rate: a.attendance_rate,
+            accounts: a.participants.iter().map(String::as_str).collect(),
+        },
     );
 }
 
@@ -3784,17 +3753,6 @@ struct QuizActivity {
     sources: HashSet<TargetId>,
     plan_generation: u64,
     mutation_blocked: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttemptState {
-    Waiting,
-    Preparing,
-    Ready,
-    Submitting,
-    Submitted,
-    Gone,
-    Failed,
 }
 
 struct PerAccountAttempt {
@@ -4019,10 +3977,9 @@ fn on_quiz_prepare_retry(
         };
         emit(
             cb,
-            &json!({ "id": null, "event": "Error", "severity": "error",
-                          "code": "quiz_unanswerable", "activity_token": q.activity_token,
-                          "account_id": account_id,
-                          "message": format!("{}: {detail}", q.activity_id) }),
+            Problem::error("quiz_unanswerable", format!("{}: {detail}", q.activity_id))
+                .activity(&q.activity_token)
+                .account(&account_id),
         );
         rearm_quiz_countdown(q, cfg);
         emit_quiz_prepared(cb, q); // publish the terminal account state to the UI completion gate
@@ -4083,8 +4040,9 @@ fn on_quiz_prepare_failed(
     attempt.state = AttemptState::Failed;
     emit(
         cb,
-        &json!({ "id": null, "event": "Error", "severity": "error", "code": code,
-        "activity_token": q.activity_token, "account_id": account_id, "message": message }),
+        Problem::error(&code, message)
+            .activity(&q.activity_token)
+            .account(&account_id),
     );
     rearm_quiz_countdown(q, cfg);
     emit_quiz_prepared(cb, q); // no later Ready event may exist
@@ -4118,9 +4076,11 @@ fn on_quiz_discard(q: &mut QuizActivity, cb: EventCb) -> Result<(), String> {
     q.discarded = true;
     emit(
         cb,
-        &json!({"id":null,"event":"LogLine","level":"info",
-        "text":format!("quiz {} discarded", q.activity_id),
-        "activity_token": q.activity_token}),
+        Event::LogLine {
+            level: LogLevel::Info,
+            text: format!("quiz {} discarded", q.activity_id),
+            activity_token: Some(&q.activity_token),
+        },
     );
     Ok(())
 }
@@ -4176,15 +4136,19 @@ fn on_quiz_set_answer(
         .overrides
         .insert(subject_id.to_string(), answer.clone());
     attempt.conflicts.remove(subject_id);
-    let answer_wire = AnswerWire::from_answer(&answer);
-    let display_answer = answer_wire.display();
+    let answer = AnswerWire::from_answer(&answer);
     emit(
         cb,
-        &json!({ "id": null, "event": "AnswerUpdated", "quiz_id": q.activity_id,
-                      "activity_token": q.activity_token, "account_id": account_id,
-                      "subject_id": subject_id, "answer": answer_wire,
-                      "display_answer": display_answer,
-                      "source": "user", "conflict": false }),
+        Event::AnswerUpdated {
+            quiz_id: &q.activity_id,
+            activity_token: &q.activity_token,
+            account_id,
+            subject_id,
+            display_answer: answer.display(),
+            answer,
+            source: "user",
+            conflict: false,
+        },
     );
     rearm_quiz_countdown(q, cfg);
     Ok(())
@@ -4226,9 +4190,9 @@ fn on_quiz_tick(
                 }
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "error",
-                    "code": "quiz_account_unavailable", "activity_token": q.activity_token,
-                    "account_id": account_id, "message": "測驗帳號已不在監控工作階段中" }),
+                    Problem::error("quiz_account_unavailable", "測驗帳號已不在監控工作階段中")
+                        .activity(&q.activity_token)
+                        .account(account_id),
                 );
             }
             due_ids.retain(|account_id| accounts.contains_key(account_id));
@@ -4247,9 +4211,9 @@ fn on_quiz_tick(
                     }
                     emit(
                         cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                        "code": "quiz_account_unavailable", "activity_token": q.activity_token,
-                        "account_id": account_id, "message": "測驗帳號已不在監控工作階段中" }),
+                        Problem::error("quiz_account_unavailable", "測驗帳號已不在監控工作階段中")
+                            .activity(&q.activity_token)
+                            .account(account_id),
                     );
                     continue;
                 };
@@ -4323,9 +4287,12 @@ fn on_quiz_tick(
         let remaining = deadline.saturating_duration_since(now).as_secs();
         emit(
             cb,
-            &json!({ "id": null, "event": "Countdown", "scope": "quiz",
-                          "activity_token": q.activity_token, "external_id": q.activity_id,
-                          "remaining_secs": remaining }),
+            Event::Countdown {
+                scope: CountdownScope::Quiz,
+                activity_token: &q.activity_token,
+                external_id: &q.activity_id,
+                remaining_secs: remaining,
+            },
         );
         if now >= deadline {
             let _ = dispatch_quiz_submits(quizzes, accounts, tx, group, cfg, &key);
@@ -4442,15 +4409,19 @@ fn on_quiz_submit_result(
             attempt.state = AttemptState::Submitted;
             emit(
                 cb,
-                &json!({ "id": null, "event": "QuizSubmitted", "quiz_id": q.activity_id,
-                "activity_token": q.activity_token, "account_id": account_id, "result": report.detail }),
+                Event::QuizSubmitted {
+                    quiz_id: &q.activity_id,
+                    activity_token: &q.activity_token,
+                    account_id: &account_id,
+                    result: &report.detail,
+                },
             );
             if let Some(warning) = report.warning {
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "warn",
-                    "code": "quiz_correction_failed", "activity_token": q.activity_token,
-                    "account_id": account_id, "message": warning }),
+                    Problem::warning("quiz_correction_failed", warning)
+                        .activity(&q.activity_token)
+                        .account(&account_id),
                 );
             }
         }
@@ -4463,10 +4434,15 @@ fn on_quiz_submit_result(
             attempt.state = AttemptState::Ready;
             emit(
                 cb,
-                &json!({ "id": null, "event": "Error", "severity": "error",
-                "code": "quiz_submit_failed", "activity_token": q.activity_token,
-                "account_id": account_id, "message": format!(
-                    "{}: {}（可手動重試：於測驗頁按「立即送出」再次提交）", account_id, failure.error) }),
+                Problem::error(
+                    "quiz_submit_failed",
+                    format!(
+                        "{}: {}（可手動重試：於測驗頁按「立即送出」再次提交）",
+                        account_id, failure.error
+                    ),
+                )
+                .activity(&q.activity_token)
+                .account(&account_id),
             );
         }
     }
@@ -4848,11 +4824,11 @@ fn submit_failure(error: impl Into<String>) -> QuizSubmitFailure {
 }
 
 fn emit_quiz_prepared(cb: EventCb, q: &QuizActivity) {
-    emit(cb, &quiz_prepared_event(q));
+    emit(cb, quiz_prepared(q));
 }
 
-fn quiz_prepared_event(q: &QuizActivity) -> Value {
-    let per_account: Vec<Value> = q
+fn quiz_prepared(q: &QuizActivity) -> QuizPrepared<'_> {
+    let per_account = q
         .attempts
         .iter()
         .filter(|(_, attempt)| {
@@ -4861,97 +4837,76 @@ fn quiz_prepared_event(q: &QuizActivity) -> Value {
                 AttemptState::Ready | AttemptState::Submitting | AttemptState::Submitted
             )
         })
-        .map(|(account_id, attempt)| {
-            let questions: Vec<Value> = attempt
+        .map(|(account_id, attempt)| PreparedAccount {
+            account_id,
+            instance_id: &attempt.instance_id,
+            state: attempt.state,
+            questions: attempt
                 .subjects
                 .iter()
-                .map(|s| {
-                    let sid = crate::quiz::subject_id(s);
-                    let conflict = attempt.conflicts.contains(&sid);
-                    let existing_answer = attempt.existing_answers.get(&sid);
-                    let answer = attempt.generated_answers.get(&sid);
-                    let answer_wire = answer.map(AnswerWire::from_answer);
-                    let existing_wire = existing_answer.map(AnswerWire::from_answer);
-                    let display_answer = answer_wire
-                        .as_ref()
-                        .map(AnswerWire::display)
-                        .unwrap_or_default();
-                    let options: Vec<Value> = s
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .map(|options| {
-                            options
-                                .iter()
-                                .map(|option| {
-                                    json!({
-                                        "id": crate::quiz::option_id(option),
-                                        "text": option.get("content")
-                                            .or_else(|| option.get("description"))
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    json!({
-                        "subject_id": sid,
-                        "parent_id": s.get("parent_id").and_then(json::id),
-                        "type": s.get("type").and_then(Value::as_str).unwrap_or(""),
-                        "answer_type": s.get("answer_type").and_then(Value::as_str)
-                            .or_else(|| s.get("type").and_then(Value::as_str)).unwrap_or(""),
-                        "stem": crate::quiz::stem(s),
-                        "options": options,
-                        "answer": answer_wire,
-                        "existing_answer": existing_wire,
-                        "display_answer": display_answer,
-                        "source": "llm",
-                        "conflict": conflict
-                    })
-                })
-                .collect();
-            json!({ "account_id": account_id, "instance_id": attempt.instance_id,
-                "state": match attempt.state {
-                    AttemptState::Ready => "ready",
-                    AttemptState::Submitting => "submitting",
-                    AttemptState::Submitted => "submitted",
-                    AttemptState::Failed => "failed",
-                    AttemptState::Gone => "gone",
-                    AttemptState::Waiting => "waiting",
-                    AttemptState::Preparing => "preparing",
-                },
-                "questions": questions })
+                .map(|subject| prepared_question(attempt, subject))
+                .collect(),
         })
         .collect();
-    let expected_accounts: Vec<Value> = q
-        .attempts
-        .iter()
-        .map(|(account_id, attempt)| {
-            json!({
-                "account_id": account_id,
-                "state": match attempt.state {
-                    AttemptState::Ready => "ready",
-                    AttemptState::Submitting => "submitting",
-                    AttemptState::Submitted => "submitted",
-                    AttemptState::Failed => "failed",
-                    AttemptState::Gone => "gone",
-                    AttemptState::Waiting => "waiting",
-                    AttemptState::Preparing => "preparing",
-                }
+    QuizPrepared {
+        schema_version: 1,
+        activity_token: &q.activity_token,
+        quiz_id: &q.activity_id,
+        activity: QuizActivityRef {
+            external_id: &q.activity_id,
+            source: q.source.as_str(),
+            course_id: &q.course_id,
+            course: &q.course,
+        },
+        course: &q.course,
+        per_account,
+        expected_accounts: q
+            .attempts
+            .iter()
+            .map(|(account_id, attempt)| ExpectedAccount {
+                account_id,
+                state: attempt.state,
             })
-        })
-        .collect();
-    let conflict_count: usize = q
-        .attempts
-        .values()
-        .map(|attempt| attempt.conflicts.len())
-        .sum();
-    json!({ "id": null, "event": "QuizPrepared", "schema_version": 1,
-        "activity_token": q.activity_token, "quiz_id": q.activity_id,
-        "activity": { "external_id": q.activity_id, "source": q.source.as_str(),
-            "course_id": q.course_id, "course": q.course },
-        "course": q.course, "per_account": per_account, "expected_accounts": expected_accounts,
-        "conflict_count": conflict_count })
+            .collect(),
+        conflict_count: q
+            .attempts
+            .values()
+            .map(|attempt| attempt.conflicts.len())
+            .sum(),
+    }
+}
+
+fn prepared_question<'a>(
+    attempt: &'a PerAccountAttempt,
+    subject: &'a Value,
+) -> PreparedQuestion<'a> {
+    let subject_id = crate::quiz::subject_id(subject);
+    let answer = attempt
+        .generated_answers
+        .get(&subject_id)
+        .map(AnswerWire::from_answer);
+    PreparedQuestion {
+        parent_id: subject.get("parent_id").and_then(json::id),
+        kind: json::text_at(subject, &["type"]),
+        answer_type: json::text_at(subject, &["answer_type", "type"]),
+        stem: crate::quiz::stem(subject),
+        options: json::array_at(subject, &["options"])
+            .iter()
+            .map(|option| QuestionOption {
+                id: crate::quiz::option_id(option),
+                text: json::text_at(option, &["content", "description"]),
+            })
+            .collect(),
+        display_answer: answer.as_ref().map(AnswerWire::display).unwrap_or_default(),
+        answer,
+        existing_answer: attempt
+            .existing_answers
+            .get(&subject_id)
+            .map(AnswerWire::from_answer),
+        source: "llm",
+        conflict: attempt.conflicts.contains(&subject_id),
+        subject_id,
+    }
 }
 
 fn find_quiz_key(
@@ -5092,6 +5047,7 @@ mod tests {
         leaked_qr_rev_tx().subscribe()
     }
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn production_quiz_prepared_emitter_matches_v1_contract() {
@@ -5170,7 +5126,7 @@ mod tests {
             plan_generation: 0,
             mutation_blocked: false,
         };
-        let emitted = quiz_prepared_event(&activity);
+        let emitted = serde_json::to_value(Event::from(quiz_prepared(&activity))).unwrap();
         for field in [
             "event",
             "schema_version",
@@ -5279,8 +5235,6 @@ mod tests {
             max_tool_iterations: 0,
             resubmit_for_correct: false,
             radar_strategy: vec![],
-            number_concurrency: 1,
-            number_min_concurrency: 1,
             number_cooldown_ms: 0,
             number_max_cooldowns: 0,
             poll_idle_secs: 5,
@@ -6782,8 +6736,6 @@ mod tests {
             max_tool_iterations: 0,
             resubmit_for_correct: false,
             radar_strategy: vec![],
-            number_concurrency: 1,
-            number_min_concurrency: 1,
             number_cooldown_ms: 0,
             number_max_cooldowns: 0,
             poll_idle_secs: 5,

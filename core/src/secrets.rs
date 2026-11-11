@@ -24,7 +24,7 @@ const QR_REMOTE_KEY_ID: &str = "__qr_remote__";
 
 /// A string secret whose `Debug`/`Display` are masked, so a stray `{:?}`/log of a struct holding it
 /// (e.g. the monitor's `Account`, which carries a password for session re-login) never leaks it. The
-/// real value is reachable only via `expose()`. `redaction::emit` covers the event seam; this covers
+/// real value is reachable only via `expose()`. `wire::emit` covers the event seam; this covers
 /// accidental debug logging that the seam can't see.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secret(String);
@@ -608,15 +608,6 @@ mod tests {
                 .map(|secret| secret.expose()),
             Some("qr-secret-value")
         );
-        // Redaction must hide the raw key
-        let mut value = serde_json::json!({"qr_remote_key": "qr-secret-value", "other": "ok"});
-        crate::redaction::redact(&mut value);
-        assert_eq!(value["qr_remote_key"], "[redacted]");
-        assert_eq!(value["other"], "ok");
-        // Also case-insensitive
-        let mut value2 = serde_json::json!({"QR_REMOTE_KEY": "secret"});
-        crate::redaction::redact(&mut value2);
-        assert_eq!(value2["QR_REMOTE_KEY"], "[redacted]");
         // Empty clears
         vault.set_qr_remote_key(String::new()).unwrap();
         assert!(!vault.has_qr_remote_key());

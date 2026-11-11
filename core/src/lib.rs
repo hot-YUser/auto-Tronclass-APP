@@ -16,17 +16,16 @@ mod llm;
 mod login;
 mod monitor;
 mod persistence;
-mod protocol;
 mod providers;
 mod qr_remote;
 mod quiz;
 mod radar;
-mod redaction;
 mod rollcall;
 mod secrets;
 mod supervisor;
 mod teacher_qr;
 mod time;
+mod wire;
 
 #[cfg(any(test, feature = "fakeserver"))]
 pub mod fake;

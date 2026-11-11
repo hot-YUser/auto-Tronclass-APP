@@ -14,13 +14,13 @@ use crate::login;
 use crate::login::LoginOutcome;
 use crate::monitor::{self, MonitorConfig};
 use crate::persistence::{AccountJournal, AccountMutation};
-use crate::protocol::{
-    Command, CourseSnapshot, GroupInput, LoginState, Notice, WakeMode, WireError,
-};
 use crate::providers::{Endpoints, Registry};
-use crate::redaction::{emit, EventCb};
 use crate::secrets::{AccountSecret, VaultFile};
 use crate::supervisor::{EffectivePlan, TargetSupervisor};
+use crate::wire::{
+    emit, respond, Caps, Command, CourseSnapshot, Event, EventCb, GroupInput, LogLevel, LoginState,
+    Notice, Problem, SettingsView, WakeMode, WireError,
+};
 use cookie_store::CookieStore;
 use reqwest::Client;
 use reqwest_cookie_store::CookieStoreMutex;
@@ -185,10 +185,7 @@ fn recover_account_transaction(
 fn recover_stale_journal(st: &mut CoreState, cb: EventCb) -> Result<(), String> {
     match recover_account_transaction(&st.data_dir, &st.config, st.vault.as_mut().unwrap()) {
         Ok(Some(message)) => {
-            emit(
-                cb,
-                &json!({ "id": null, "event": "LogLine", "level": "warn", "text": message }),
-            );
+            emit(cb, Event::log(LogLevel::Warn, message));
             Ok(())
         }
         Ok(None) => Ok(()),
@@ -209,16 +206,26 @@ pub struct Core {
 
 /// Reply to a correlated command. `error` is None on success.
 fn reply(cb: EventCb, id: u64, ok: bool, error: Option<String>) {
-    emit(
+    respond(
         cb,
-        &json!({ "id": id, "event": "Reply", "ok": ok, "error": error }),
+        id,
+        Event::Reply {
+            ok,
+            error,
+            data: None,
+        },
     );
 }
 
 fn reply_data(cb: EventCb, id: u64, ok: bool, error: Option<String>, data: Value) {
-    emit(
+    respond(
         cb,
-        &json!({ "id": id, "event": "Reply", "ok": ok, "error": error, "data": data }),
+        id,
+        Event::Reply {
+            ok,
+            error,
+            data: Some(data),
+        },
     );
 }
 
@@ -274,11 +281,7 @@ pub fn panic_reply(core: &Core, json_bytes: &[u8]) {
         .and_then(|v| v.get("id").and_then(Value::as_u64))
     {
         Some(id) => reply(cb, id, false, Some(INTERNAL_ERROR.to_string())),
-        None => emit(
-            cb,
-            &json!({ "id": null, "event": "Error", "severity": "error",
-                                 "code": "core_panicked", "message": INTERNAL_ERROR }),
-        ),
+        None => emit(cb, Problem::error("core_panicked", INTERNAL_ERROR)),
     }
 }
 
@@ -292,11 +295,7 @@ pub fn send(core: &Core, json_bytes: &[u8]) {
                 .and_then(|value| value.get("id").and_then(Value::as_u64))
             {
                 Some(id) => reply(cb, id, false, Some(MALFORMED_COMMAND.to_string())),
-                None => emit(
-                    cb,
-                    &json!({ "id": null, "event": "Error", "severity": "error",
-                    "code": "bad_command", "message": MALFORMED_COMMAND }),
-                ),
+                None => emit(cb, Problem::error("bad_command", MALFORMED_COMMAND)),
             }
             return;
         }
@@ -425,10 +424,7 @@ fn recover_login_panic(
         }),
         true,
     );
-    emit(
-        cb,
-        &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": INTERNAL_ERROR }),
-    );
+    respond(cb, id, Event::login_failed(INTERNAL_ERROR));
 }
 
 /// Watch the monitor's panic channel. The monitor's TaskGroup pings it (`Some(())`) when one of its
@@ -462,11 +458,7 @@ fn spawn_monitor_watchdog(
             };
             drop(guard);
             handle.stop();
-            emit(
-                cb,
-                &json!({ "id": null, "event": "Error", "severity": "error",
-                "code": "monitor_panicked", "message": INTERNAL_ERROR }),
-            );
+            emit(cb, Problem::error("monitor_panicked", INTERNAL_ERROR));
             reconcile_monitor_with(restart_runtime.clone(), state.clone(), cb, false);
         }
     });
@@ -608,14 +600,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
                 Ok(loaded) => {
                     // 播種沒能保存:App 照常啟動(內容全部來自內建種子),只是把話講清楚。
                     if let Some(warning) = loaded.persist_warning {
-                        emit(
-                            cb,
-                            &json!({ "id": null, "event": "Error", "severity": "warn",
-                            "code": "providers_not_persisted",
-                            "message": format!(
-                                "學校清單未能保存（{warning}）；本次使用內建清單，之後新增的學校不會被保存"
-                            ) }),
-                        );
+                        emit(cb, Problem::warning("providers_not_persisted", format!( "學校清單未能保存（{warning}）；本次使用內建清單，之後新增的學校不會被保存" )));
                     }
                     loaded.registry
                 }
@@ -627,11 +612,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
                     if let Some(dir_error) = &dir_error {
                         message.push_str(&format!("；資料目錄建立失敗（{:?}）", dir_error.kind()));
                     }
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                        "code": "providers_unavailable", "message": message }),
-                    );
+                    emit(cb, Problem::error("providers_unavailable", &message));
                     return reply(cb, id, false, Some(message));
                 }
             };
@@ -640,11 +621,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
                 Ok(initialized) => initialized,
                 Err(error) => {
                     let message = format!("設定檔無法載入：{error}");
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                        "code": "config_unavailable", "message": message }),
-                    );
+                    emit(cb, Problem::error("config_unavailable", &message));
                     return reply(cb, id, false, Some(message));
                 }
             };
@@ -654,7 +631,6 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
                 backup_path: Some(notice.backup_path.to_string_lossy().into_owned()),
             });
             let config = initialized.config;
-            crate::redaction::set_level(&config.settings.log_level);
             // GUI hosts recover the vault key through their OS keystore and pass it only in memory.
             // Headless tests may omit it and retain the legacy keyfile path.
             let vault_result = (|| {
@@ -671,28 +647,21 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             let (mut vault, vault_error) = match vault_result {
                 Ok(v) => (Some(v), None),
                 Err(e) => {
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                                      "code": "vault_open_failed", "message": e }),
-                    );
+                    emit(cb, Problem::error("vault_open_failed", &e));
                     (None, Some(e))
                 }
             };
             if let Some(vault) = vault.as_mut() {
                 match recover_account_transaction(&dir, &config, vault) {
-                    Ok(Some(message)) => emit(
-                        cb,
-                        &json!({ "id": null, "event": "LogLine",
-                        "level": "warn", "text": message }),
-                    ),
+                    Ok(Some(message)) => emit(cb, Event::log(LogLevel::Warn, message)),
                     Ok(None) => {}
                     // Fixed message — the journal loader's error bundles a serde literal.
                     Err(_) => emit(
                         cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                        "code": "account_transaction_recovery_failed",
-                        "message": "account transaction journal unreadable; recovery skipped" }),
+                        Problem::error(
+                            "account_transaction_recovery_failed",
+                            "account transaction journal unreadable; recovery skipped",
+                        ),
                     ),
                 }
             }
@@ -717,7 +686,10 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             emit_monitoring_snapshot(cb, &state);
             emit(
                 cb,
-                &json!({ "id": null, "event": "VaultState", "exists": unlocked, "unlocked": unlocked }),
+                Event::VaultState {
+                    exists: unlocked,
+                    unlocked,
+                },
             );
             emit_caps(cb);
 
@@ -800,8 +772,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             if let Err(error) = AccountJournal::complete(&st.data_dir) {
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "warn",
-                    "code": "account_transaction_cleanup_failed", "message": error }),
+                    Problem::warning("account_transaction_cleanup_failed", error),
                 );
             }
             st.supervisor.invalidate_clock();
@@ -915,8 +886,7 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
             if let Err(error) = AccountJournal::complete(&st.data_dir) {
                 emit(
                     cb,
-                    &json!({ "id": null, "event": "Error", "severity": "warn",
-                    "code": "account_transaction_cleanup_failed", "message": error }),
+                    Problem::warning("account_transaction_cleanup_failed", error),
                 );
             }
             st.supervisor.invalidate_clock();
@@ -1558,7 +1528,6 @@ fn handle_sync_state(state: &Arc<Mutex<Option<CoreState>>>, cb: EventCb, cmd: Co
                 return reply(cb, id, false, Some(error));
             }
             st.config = next;
-            crate::redaction::set_level(&st.config.settings.log_level);
             push_config(st); // a running monitor adopts the change live (no stop/start)
             emit_settings(cb, st); // echo the applied settings so the UI reflects the saved values
             reply(cb, id, true, None);
@@ -1850,8 +1819,7 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
         publish_login_state(&state, cb, &account_id, LoginState::LoggingIn, None, false);
         emit(
             cb,
-            &json!({ "id": null, "event": "LogLine", "level": "info",
-                          "text": format!("login → {base_url}") }),
+            Event::log(LogLevel::Info, format!("login → {base_url}")),
         ); // base_url only, never creds
 
         let endpoints = Endpoints::derive(&base_url);
@@ -1869,65 +1837,63 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                     }),
                     true,
                 );
-                emit(
-                    cb,
-                    &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": error }),
-                );
+                respond(cb, id, Event::login_failed(error));
                 return;
             }
         };
 
         // Restore path: a cached session that still verifies skips the password login entirely.
-        let result: Result<bool, String> = if !cached_cookies.is_empty()
-            && login::verify_session(&client, &endpoints).await
-        {
-            Ok(true)
-        } else {
-            match login::login(&client, &endpoints, &username, &password).await {
-                LoginOutcome::Ok => Ok(false),
-                LoginOutcome::Failed(e) => Err(e),
-                LoginOutcome::NeedCaptcha {
-                    image_bytes,
-                    pending,
-                } => {
-                    // Register a one-shot for the answer, show the challenge (image is not a secret),
-                    // and await a SubmitCaptcha command. Credentials stay inside `pending`, never emitted.
-                    let (txc, rxc) = oneshot::channel::<String>();
-                    {
-                        let mut guard = lock_state(&state);
-                        if let Some(st) = guard.as_mut() {
-                            st.pending_captcha.insert(account_id.clone(), txc);
-                        }
-                    }
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "CaptchaChallenge",
-                                      "account_id": account_id, "image_b64": login::encode_base64(&image_bytes) }),
-                    );
-                    match tokio::time::timeout(captcha_answer_timeout, rxc).await {
-                        Ok(Ok(text)) => {
-                            login::complete_captcha(&client, &endpoints, pending, &text)
-                                .await
-                                .map(|_| false)
-                        }
-                        // DeleteAccount dropped the pending sender: the challenge is withdrawn.
-                        Ok(Err(_)) => {
-                            Err("login cancelled because the account was deleted".to_string())
-                        }
-                        _ => {
-                            // timeout → drop the stale pending entry
-                            {
-                                let mut guard = lock_state(&state);
-                                if let Some(st) = guard.as_mut() {
-                                    st.pending_captcha.remove(&account_id);
-                                }
+        let result: Result<bool, String> =
+            if !cached_cookies.is_empty() && login::verify_session(&client, &endpoints).await {
+                Ok(true)
+            } else {
+                match login::login(&client, &endpoints, &username, &password).await {
+                    LoginOutcome::Ok => Ok(false),
+                    LoginOutcome::Failed(e) => Err(e),
+                    LoginOutcome::NeedCaptcha {
+                        image_bytes,
+                        pending,
+                    } => {
+                        // Register a one-shot for the answer, show the challenge (image is not a secret),
+                        // and await a SubmitCaptcha command. Credentials stay inside `pending`, never emitted.
+                        let (txc, rxc) = oneshot::channel::<String>();
+                        {
+                            let mut guard = lock_state(&state);
+                            if let Some(st) = guard.as_mut() {
+                                st.pending_captcha.insert(account_id.clone(), txc);
                             }
-                            Err("captcha timed out".to_string())
+                        }
+                        emit(
+                            cb,
+                            Event::CaptchaChallenge {
+                                account_id: &account_id,
+                                image_b64: login::encode_base64(&image_bytes),
+                            },
+                        );
+                        match tokio::time::timeout(captcha_answer_timeout, rxc).await {
+                            Ok(Ok(text)) => {
+                                login::complete_captcha(&client, &endpoints, pending, &text)
+                                    .await
+                                    .map(|_| false)
+                            }
+                            // DeleteAccount dropped the pending sender: the challenge is withdrawn.
+                            Ok(Err(_)) => {
+                                Err("login cancelled because the account was deleted".to_string())
+                            }
+                            _ => {
+                                // timeout → drop the stale pending entry
+                                {
+                                    let mut guard = lock_state(&state);
+                                    if let Some(st) = guard.as_mut() {
+                                        st.pending_captcha.remove(&account_id);
+                                    }
+                                }
+                                Err("captcha timed out".to_string())
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
 
         match result {
             Ok(from_cache) => {
@@ -1947,10 +1913,14 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                             None,
                             true,
                         );
-                        emit(
+                        respond(
                             cb,
-                            &json!({ "id": id, "event": "LoginResult", "ok": true,
-                            "detail": if from_cache { "session restored from cache" } else { "logged in" } }),
+                            id,
+                            Event::logged_in(if from_cache {
+                                "session restored from cache"
+                            } else {
+                                "logged in"
+                            }),
                         );
                     }
                     Ok(PersistOutcome::AccountGone) => {
@@ -1965,10 +1935,12 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                             }),
                             true,
                         );
-                        emit(
+                        respond(
                             cb,
-                            &json!({ "id": id, "event": "LoginResult", "ok": false,
-                            "reason": "login succeeded but the account was deleted during login" }),
+                            id,
+                            Event::login_failed(
+                                "login succeeded but the account was deleted during login",
+                            ),
                         );
                     }
                     Err(error) => {
@@ -1983,10 +1955,12 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                             }),
                             true,
                         );
-                        emit(
+                        respond(
                             cb,
-                            &json!({ "id": id, "event": "LoginResult", "ok": false,
-                            "reason": format!("login succeeded but session persistence failed: {error}") }),
+                            id,
+                            Event::login_failed(format!(
+                                "login succeeded but session persistence failed: {error}"
+                            )),
                         );
                     }
                 }
@@ -2005,10 +1979,7 @@ fn spawn_login(core: &Core, id: u64, account_id: String) {
                     }),
                     true,
                 );
-                emit(
-                    cb,
-                    &json!({ "id": id, "event": "LoginResult", "ok": false, "reason": e }),
-                );
+                respond(cb, id, Event::login_failed(e));
             }
         }
     });
@@ -2055,8 +2026,6 @@ fn monitor_config(st: &CoreState) -> MonitorConfig {
         max_tool_iterations: s.max_tool_iterations,
         resubmit_for_correct: s.resubmit_for_correct,
         radar_strategy: s.radar_strategy.clone(),
-        number_concurrency: s.number_concurrency,
-        number_min_concurrency: s.number_min_concurrency,
         number_cooldown_ms: s.number_cooldown_ms,
         number_max_cooldowns: s.number_max_cooldowns,
         poll_idle_secs: s.poll_idle_secs,
@@ -2177,11 +2146,7 @@ fn reconcile_monitor_with(
         let runtime_changed = st.supervisor.reconcile(&mut st.config);
         if runtime_changed {
             if let Err(error) = st.config.save(&st.config_path()) {
-                emit(
-                    cb,
-                    &json!({ "id": null, "event": "Error", "severity": "error",
-                    "code": "runtime_persistence_failed", "message": error }),
-                );
+                emit(cb, Problem::error("runtime_persistence_failed", error));
                 return;
             }
         }
@@ -2376,11 +2341,7 @@ fn spawn_monitor_auth(
             }
             if st.supervisor.reconcile(&mut st.config) {
                 if let Err(error) = st.config.save(&st.config_path()) {
-                    emit(
-                        cb,
-                        &json!({ "id": null, "event": "Error", "severity": "error",
-                        "code": "runtime_persistence_failed", "message": error }),
-                    );
+                    emit(cb, Problem::error("runtime_persistence_failed", error));
                 }
             }
             let desired = monitor_plan(st.supervisor.plan());
@@ -2925,9 +2886,10 @@ fn spawn_import_cookies(core: &Core, id: u64, account_id: String, cookies_json: 
 fn emit_providers(cb: EventCb, st: &CoreState) {
     emit(
         cb,
-        &json!({ "id": null, "event": "Providers",
-                      "default_key": st.registry.default_key,
-                      "schools": st.registry.schools }),
+        Event::Providers {
+            default_key: st.registry.default_key.as_deref(),
+            schools: &st.registry.schools,
+        },
     );
 }
 
@@ -2935,28 +2897,25 @@ fn emit_monitoring_snapshot(cb: EventCb, st: &CoreState) {
     let snapshot = st.supervisor.snapshot(&st.config, &st.login_in_flight);
     emit(
         cb,
-        &json!({ "id": null, "event": "MonitoringSnapshot", "snapshot": snapshot }),
+        Event::MonitoringSnapshot {
+            snapshot: &snapshot,
+        },
     );
 }
 
 fn emit_caps(cb: EventCb) {
-    emit(cb, &caps_payload());
+    emit(cb, Event::Caps { caps: CAPS });
 }
 
-fn caps_payload() -> Value {
-    // Captcha is human-in-loop (no OCR), so `ocr_captcha` stays false. QR teacher-assist IS implemented
-    // (monitor::spawn_qr_teacher_assist) — the build supports it; it just needs a teacher account added.
-    json!({ "id": null, "event": "Caps", "caps": {
-        // Background monitoring is only meaningful where the OS can keep the app alive while the
-        // UI is not foregrounded (Android). The Windows/Mac desktop build has no background host,
-        // so the capability is not advertised there — the UI must not offer a toggle it can't honor.
-        "background_monitoring": cfg!(target_os = "android"),
-        // No updater exists in this repository; never advertise a capability the product cannot run.
-        "self_update": false,
-        "qr_teacher_assist": true,
-        "ocr_captcha": false
-    }})
-}
+const CAPS: Caps = Caps {
+    // Only Android can keep the app alive while its UI is not in the foreground.
+    background_monitoring: cfg!(target_os = "android"),
+    // This repository ships no updater.
+    self_update: false,
+    qr_teacher_assist: true,
+    // Captchas are answered by the user.
+    ocr_captcha: false,
+};
 
 /// Apply a settings patch to `settings` (a caller-owned clone). Strict per-field typing: a
 /// wrong-typed value or an unknown key is an error, never a silent ignore; `operating` parses
@@ -3123,8 +3082,7 @@ fn warn_insecure_http(cb: EventCb, base_url: &str) {
     if base_url.starts_with("http://") {
         emit(
             cb,
-            &json!({ "id": null, "event": "LogLine", "level": "warn",
-                          "text": "學校網址使用未加密 HTTP，建議改用 HTTPS" }),
+            Event::log(LogLevel::Warn, "學校網址使用未加密 HTTP，建議改用 HTTPS"),
         );
     }
 }
@@ -3135,19 +3093,21 @@ fn emit_settings(cb: EventCb, st: &CoreState) {
     let has_qr_remote_key = st.vault.as_ref().is_some_and(|v| v.has_qr_remote_key());
     emit(
         cb,
-        &json!({ "id": null, "event": "Settings", "settings": {
-            "countdown_secs": s.countdown_secs,
-            "attendance_gate_percent": s.attendance_gate_percent,
-            "llm_endpoint": s.llm_endpoint,
-            "llm_model": s.llm_model,
-            "llm_max_tokens": s.llm_max_tokens,
-            "resubmit_for_correct": s.resubmit_for_correct,
-            "enable_llm_tools": s.enable_llm_tools,
-            "has_llm_key": has_llm_key,
-            "has_qr_remote_key": has_qr_remote_key,
-            "qr_remote_enabled": s.qr_remote_enabled,
-            "qr_remote_base_url": s.qr_remote_base_url,
-        }}),
+        Event::Settings {
+            settings: SettingsView {
+                countdown_secs: s.countdown_secs,
+                attendance_gate_percent: s.attendance_gate_percent,
+                llm_endpoint: &s.llm_endpoint,
+                llm_model: &s.llm_model,
+                llm_max_tokens: s.llm_max_tokens,
+                resubmit_for_correct: s.resubmit_for_correct,
+                enable_llm_tools: s.enable_llm_tools,
+                has_llm_key,
+                has_qr_remote_key,
+                qr_remote_enabled: s.qr_remote_enabled,
+                qr_remote_base_url: &s.qr_remote_base_url,
+            },
+        },
     );
 }
 
@@ -3225,17 +3185,6 @@ mod tests {
             Err("monitor is already starting")
         );
         assert!(lifecycle.is_starting(1));
-    }
-
-    #[test]
-    fn caps_never_advertise_an_unimplemented_self_updater() {
-        let caps = caps_payload();
-        assert_eq!(caps["caps"]["self_update"], false);
-        assert_eq!(
-            caps["caps"]["background_monitoring"],
-            cfg!(target_os = "android"),
-            "background monitoring is only advertised where the OS keeps the app alive in background"
-        );
     }
 
     #[tokio::test]
@@ -5132,17 +5081,6 @@ mod tests {
             s.get("qr_remote_key").is_none() && s.get("qr_secret").is_none(),
             "Settings must not have raw key field"
         );
-        // Direct redaction path also covers qr_remote_key.
-        let mut v =
-            serde_json::json!({"qr_remote_key": raw_key, "nested": {"qr_remote_key": raw_key}});
-        crate::redaction::redact(&mut v);
-        let serialized = v.to_string();
-        assert!(
-            !serialized.contains(raw_key),
-            "redact must not leak raw key"
-        );
-        assert_eq!(v["qr_remote_key"], "[redacted]");
-        assert_eq!(v["nested"]["qr_remote_key"], "[redacted]");
         // Clear emits a Settings with has_qr_remote_key=false, still without raw.
         events()
             .lock()

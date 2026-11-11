@@ -1,5 +1,5 @@
-use crate::protocol::CourseSnapshot;
 use crate::providers::Endpoints;
+use crate::wire::CourseSnapshot;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;

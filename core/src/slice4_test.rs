@@ -3,7 +3,7 @@
 
 use crate::config::{new_id, Settings};
 use crate::fake;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -32,74 +32,6 @@ fn radar_default_chain_is_empty_then_wgs84() {
         Settings::default().radar_strategy,
         vec!["empty_answer".to_string(), "global_wgs84".to_string()]
     );
-}
-
-#[test]
-fn redaction_hides_secrets_everywhere() {
-    // Secrets under sensitive keys — nested in objects and arrays — must all become [redacted].
-    let mut v = json!({
-        "event": "LoginResult",
-        "password": "hunter2",
-        "cookies": "session=abc",
-        "nested": { "api_key": "sk-abc123", "note": "ok" },
-        "list": [ { "master_password": "root-pw" }, { "authorization": "Bearer xyz" } ],
-        "account_id": "keep-me"
-    });
-    crate::redaction::redact(&mut v);
-    let s = v.to_string();
-
-    for secret in [
-        "hunter2",
-        "session=abc",
-        "sk-abc123",
-        "root-pw",
-        "Bearer xyz",
-    ] {
-        assert!(
-            !s.contains(secret),
-            "secret {secret} leaked through redaction: {s}"
-        );
-    }
-    assert!(s.contains("[redacted]"), "redaction marker present");
-    assert_eq!(v["account_id"], "keep-me", "non-secret ids are preserved");
-    assert_eq!(v["nested"]["note"], "ok", "non-secret siblings preserved");
-}
-
-// A dedicated sink for the leveled-logging test (log_line needs a C callback).
-static RBUF: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-fn rbuf() -> &'static Mutex<Vec<String>> {
-    RBUF.get_or_init(|| Mutex::new(Vec::new()))
-}
-extern "C" fn rcollect(ptr: *const u8, len: usize) {
-    let b = unsafe { std::slice::from_raw_parts(ptr, len) };
-    rbuf()
-        .lock()
-        .unwrap()
-        .push(String::from_utf8_lossy(b).into_owned());
-}
-
-#[test]
-fn leveled_logging_drops_debug_at_normal() {
-    let _g = SEQ.lock().unwrap(); // serialize: LOG_LEVEL is a process global
-    rbuf().lock().unwrap().clear();
-
-    crate::redaction::set_level("normal");
-    crate::redaction::log_line(rcollect, "debug", "should be dropped");
-    crate::redaction::log_line(rcollect, "info", "always shown");
-    assert_eq!(
-        rbuf().lock().unwrap().len(),
-        1,
-        "debug dropped at normal, info kept"
-    );
-
-    crate::redaction::set_level("debug");
-    crate::redaction::log_line(rcollect, "debug", "now shown");
-    assert_eq!(
-        rbuf().lock().unwrap().len(),
-        2,
-        "debug emitted at debug level"
-    );
-    crate::redaction::set_level("normal"); // restore
 }
 
 // ===================== e2e over the FFI (serialized via SEQ) =====================
@@ -247,7 +179,6 @@ fn settings_persist_over_the_seam() {
     assert_eq!(s.quiz_detect_secs, 30);
     assert_eq!(s.log_level, "debug");
     assert_eq!(s.max_answer_reask, 7);
-    crate::redaction::set_level("normal"); // Init/UpdateConfig flipped the global level
 }
 
 #[test]

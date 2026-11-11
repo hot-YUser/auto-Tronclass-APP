@@ -9,7 +9,7 @@ use crate::json;
 use crate::llm::{self, LlmConfig};
 use crate::providers::Endpoints;
 use crate::quiz::{self, Answer, Decision};
-use crate::redaction::EventCb;
+use crate::wire::EventCb;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
