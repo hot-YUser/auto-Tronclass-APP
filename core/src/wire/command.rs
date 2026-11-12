@@ -3,6 +3,7 @@
 
 use crate::config::{DetectorSelection, ScheduleBinding, TargetId, TimeZoneSpec, WeeklySchedule};
 use crate::quiz::Answer;
+use crate::secrets::Secret;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +96,7 @@ pub enum Command {
         id: u64,
         data_dir: String,
         #[serde(default)]
-        device_key_b64: Option<String>,
+        device_key_b64: Option<Secret>,
     },
     CreateVault {
         id: u64,
@@ -108,7 +109,7 @@ pub enum Command {
         label: String,
         school: String,
         username: String,
-        password: String,
+        password: Secret,
         #[serde(default)]
         is_teacher: bool,
         #[serde(default)]
@@ -239,11 +240,11 @@ pub enum Command {
     },
     SetLlmKey {
         id: u64,
-        key: String,
+        key: Secret,
     },
     SetQrRemoteKey {
         id: u64,
-        key: String,
+        key: Secret,
     },
     UpdateConfig {
         id: u64,
@@ -345,7 +346,7 @@ mod tests {
             Command::Init {
                 device_key_b64: Some(key),
                 ..
-            } if key.ends_with('=')
+            } if key.expose().ends_with('=')
         ));
     }
 

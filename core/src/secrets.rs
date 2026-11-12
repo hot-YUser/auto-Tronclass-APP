@@ -26,7 +26,8 @@ const QR_REMOTE_KEY_ID: &str = "__qr_remote__";
 /// (e.g. the monitor's `Account`, which carries a password for session re-login) never leaks it. The
 /// real value is reachable only via `expose()`. `wire::emit` covers the event seam; this covers
 /// accidental debug logging that the seam can't see.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
 pub struct Secret(String);
 
 impl Secret {
