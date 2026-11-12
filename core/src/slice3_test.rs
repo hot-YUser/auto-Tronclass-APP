@@ -2,8 +2,8 @@
 //! conflict → SetAnswer → countdown → auto-submit, over the FFI. Also proves LLM runs **once** per
 //! activity (shared) even with two accounts, and that a blank/failed LLM subject is never submitted.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

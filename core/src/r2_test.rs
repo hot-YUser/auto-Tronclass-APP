@@ -3,8 +3,8 @@
 //! beacon rollcall's coordinate answers carry a radarSignal. Serialized via `SEQ`. The solver
 //! convergence + the independent known-value haversine assertions live in `radar.rs`'s own tests.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

@@ -1,9 +1,11 @@
 //! UI → core commands. This is a trust boundary: parsing is strict, and a malformed command
 //! becomes an error reply, never a panic.
 
-use crate::config::{DetectorSelection, ScheduleBinding, TargetId, TimeZoneSpec, WeeklySchedule};
-use crate::quiz::Answer;
-use crate::secrets::Secret;
+use crate::store::config::{
+    DetectorSelection, ScheduleBinding, TargetId, TimeZoneSpec, WeeklySchedule,
+};
+use crate::store::secrets::Secret;
+use crate::tronclass::quiz::Answer;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

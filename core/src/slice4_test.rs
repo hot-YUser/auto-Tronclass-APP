@@ -1,8 +1,8 @@
 //! Slice-4 tests (headless). Pure gates plus e2e over the FFI: settings persistence, captcha
 //! login, SSO→cookie fallback routing, and platform-key unlock.
 
-use crate::config::{new_id, Settings};
 use crate::fake;
+use crate::store::config::{new_id, Settings};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -168,7 +168,7 @@ fn settings_persist_over_the_seam() {
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
 
     // Read the persisted config.json back and confirm every knob round-tripped.
-    let cfg = crate::config::Config::load(&PathBuf::from(&dir).join("config.json")).unwrap();
+    let cfg = crate::store::config::Config::load(&PathBuf::from(&dir).join("config.json")).unwrap();
     let s = &cfg.settings;
     assert_eq!(s.llm_max_tokens, 32000);
     assert_eq!(s.number_cooldown_ms, 500);
@@ -223,7 +223,7 @@ fn captcha_login_challenge_and_submit() {
         10,
     )
     .expect("CaptchaChallenge");
-    let expected_b64 = crate::login::encode_base64(fake::CAPTCHA_IMAGE.as_bytes());
+    let expected_b64 = crate::tronclass::login::encode_base64(fake::CAPTCHA_IMAGE.as_bytes());
     assert_eq!(
         challenge["image_b64"].as_str().unwrap(),
         expected_b64,

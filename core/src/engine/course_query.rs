@@ -4,7 +4,7 @@ use super::monitoring::{emit_monitoring_snapshot, MonitorLoginInput};
 use super::session::authed_client;
 use super::state::CoreState;
 use super::{lock_state, reply_data, Core, INTERNAL_ERROR};
-use crate::config::canonical_tenant;
+use crate::store::config::canonical_tenant;
 use crate::wire::{CourseSnapshot, EventCb, LoginState, WireError};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -147,9 +147,11 @@ pub(super) async fn query_common_courses(
             )
             .await
             {
-                Ok((client, refreshed_cookies)) => crate::courses::list(&client, &input.base_url)
-                    .await
-                    .map(|courses| (refreshed_cookies, courses)),
+                Ok((client, refreshed_cookies)) => {
+                    crate::tronclass::courses::list(&client, &input.base_url)
+                        .await
+                        .map(|courses| (refreshed_cookies, courses))
+                }
                 Err(error) => Err(error),
             };
             (input.meta.id, result)

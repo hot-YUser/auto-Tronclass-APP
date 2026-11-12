@@ -5,8 +5,8 @@
 //!   - a false-positive guard: bad creds land the fake's 200-with-login-page, and the content-based
 //!     `verify_session` rejects it → `LoginResult{ok:false}` (never a silent/false success).
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

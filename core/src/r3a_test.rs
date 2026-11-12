@@ -2,8 +2,8 @@
 //! per-type body-shape assertions. The e2e (red gate) proves the wire shapes end-to-end; the pure
 //! `answer.rs`/`quiz.rs` unit tests assert every builder field-by-field. Serialized via `SEQ`.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

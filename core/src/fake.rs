@@ -957,9 +957,9 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
         if let (Some(lat), Some(lon), Some((tlat, tlng))) =
             (v["latitude"].as_f64(), v["longitude"].as_f64(), r.location)
         {
-            let dist = crate::radar::haversine(
-                crate::radar::GeoPoint { lat, lon },
-                crate::radar::GeoPoint {
+            let dist = crate::tronclass::radar::haversine(
+                crate::tronclass::radar::GeoPoint { lat, lon },
+                crate::tronclass::radar::GeoPoint {
                     lat: tlat,
                     lon: tlng,
                 },

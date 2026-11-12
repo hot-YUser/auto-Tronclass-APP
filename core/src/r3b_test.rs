@@ -2,8 +2,8 @@
 //! re-ask, strip_think) + the two R3a acceptance bugs (numeric matching sort; single-vote). Pure
 //! parsing units live in quiz.rs/llm.rs; the e2e here drive the request/parse end-to-end over the FFI.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

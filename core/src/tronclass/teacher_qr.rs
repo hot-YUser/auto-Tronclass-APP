@@ -6,8 +6,8 @@
 //! (`build_teacher_rollcall_payload(kind="qr")`); still needs a real teacher tenant to fully verify.
 
 use crate::json;
-use crate::providers::Endpoints;
-use crate::rollcall;
+use crate::tronclass::rollcall;
+use crate::tronclass::Endpoints;
 use reqwest::{Client, Response};
 use serde_json::{json, Value};
 

@@ -5,12 +5,12 @@ use super::actor::Env;
 use super::{
     Account, ActivityKey, MonitorConfig, MonitorMsg, MonitorPlan, QuizDetected, RuntimeEvent,
 };
-use crate::answer::{self, Source};
-use crate::config::TargetId;
 use crate::json;
 use crate::llm::LlmConfig;
-use crate::providers::Endpoints;
-use crate::quiz::Answer;
+use crate::store::config::TargetId;
+use crate::tronclass::answer::{self, Source};
+use crate::tronclass::quiz::Answer;
+use crate::tronclass::Endpoints;
 use crate::wire::{
     emit, AccountResultPhase, AnswerWire, AttemptState, CountdownScope, Event, EventCb,
     ExpectedAccount, LogLevel, PreparedAccount, PreparedQuestion, Problem, QuestionOption,
@@ -145,7 +145,7 @@ pub(super) fn on_detected(
     let key = ActivityKey::quiz(&detected.base_url, detected.source, &detected.activity_id);
     let generation = detected.generation;
     let quiz = quizzes.entry(key).or_insert_with(|| QuizActivity {
-        activity_token: crate::config::new_id(),
+        activity_token: crate::store::config::new_id(),
         source: detected.source,
         course: detected.course,
         course_id: detected.course_id,
@@ -408,10 +408,10 @@ pub(super) fn set_answer(
     let subject = attempt
         .subjects
         .iter()
-        .find(|subject| crate::quiz::subject_id(subject) == subject_id)
+        .find(|subject| crate::tronclass::quiz::subject_id(subject) == subject_id)
         .ok_or_else(|| "unknown subject for this quiz".to_string())?;
     let answer = answer.into_answer()?;
-    crate::quiz::validate_answer(subject, &answer, q.source == Source::Vote)?;
+    crate::tronclass::quiz::validate_answer(subject, &answer, q.source == Source::Vote)?;
     attempt
         .overrides
         .insert(subject_id.to_string(), answer.clone());
@@ -919,7 +919,7 @@ pub(super) fn spawn_prepare(env: &Env, job: PrepareJob) {
                 .iter()
                 .filter_map(|subject| {
                     answer::existing_answer(subject)
-                        .map(|value| (crate::quiz::subject_id(subject), value))
+                        .map(|value| (crate::tronclass::quiz::subject_id(subject), value))
                 })
                 .collect();
             prepared.push(PreparedAttempt {
@@ -1051,7 +1051,7 @@ pub(super) fn spawn_submit(env: &Env, key: &ActivityKey, job: SubmitJob) {
                     .iter()
                     .filter_map(|s| {
                         answers
-                            .get(&crate::quiz::subject_id(s))
+                            .get(&crate::tronclass::quiz::subject_id(s))
                             .map(|a| answer::exam_subject_entry(s, a))
                     })
                     .collect();
@@ -1196,7 +1196,7 @@ pub(super) fn prepared_question<'a>(
     attempt: &'a PerAccountAttempt,
     subject: &'a Value,
 ) -> PreparedQuestion<'a> {
-    let subject_id = crate::quiz::subject_id(subject);
+    let subject_id = crate::tronclass::quiz::subject_id(subject);
     let answer = attempt
         .generated_answers
         .get(&subject_id)
@@ -1205,11 +1205,11 @@ pub(super) fn prepared_question<'a>(
         parent_id: subject.get("parent_id").and_then(json::id),
         kind: json::text_at(subject, &["type"]),
         answer_type: json::text_at(subject, &["answer_type", "type"]),
-        stem: crate::quiz::stem(subject),
+        stem: crate::tronclass::quiz::stem(subject),
         options: json::array_at(subject, &["options"])
             .iter()
             .map(|option| QuestionOption {
-                id: crate::quiz::option_id(option),
+                id: crate::tronclass::quiz::option_id(option),
                 text: json::text_at(option, &["content", "description"]),
             })
             .collect(),
@@ -1267,7 +1267,7 @@ pub(super) async fn submit_classroom(
     let mut completed = Vec::new();
     let mut answered = 0_usize;
     for subject in subjects {
-        let subject_id = crate::quiz::subject_id(subject);
+        let subject_id = crate::tronclass::quiz::subject_id(subject);
         let Some(answer) = answers.get(&subject_id) else {
             continue;
         };
@@ -1326,7 +1326,7 @@ pub(super) fn source_items(
     subjects
         .iter()
         .filter_map(|s| {
-            let sid = crate::quiz::subject_id(s);
+            let sid = crate::tronclass::quiz::subject_id(s);
             let atype = s
                 .get("answer_type")
                 .and_then(Value::as_str)

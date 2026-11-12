@@ -5,7 +5,7 @@ use super::definitions::{change_runtime, check_revision, redefine, routed_source
 use super::monitoring::{emit_monitoring_snapshot, reconcile_monitor_with};
 use super::state::CoreState;
 use super::{lock_state, Core};
-use crate::config::{ScheduleBinding, TargetId, TimeZoneSpec, WeeklySchedule};
+use crate::store::config::{ScheduleBinding, TargetId, TimeZoneSpec, WeeklySchedule};
 use crate::wire::{EventCb, ScheduleClockEntry, WakeMode};
 use std::collections::HashSet;
 use std::time::Duration;

@@ -1,0 +1,181 @@
+//! Every URL the core requests from a school, derived from the school's base URL.
+
+/// A school's endpoints. Schools differ only in their base URL.
+pub struct Endpoints {
+    base: String,
+}
+
+impl Endpoints {
+    pub fn derive(base_url: &str) -> Endpoints {
+        Endpoints {
+            base: base_url.trim_end_matches('/').to_string(),
+        }
+    }
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+    pub fn login_page(&self) -> String {
+        format!("{}/login", self.base)
+    }
+    pub fn current_semester(&self) -> String {
+        format!("{}/api/current-semester-info", self.base)
+    }
+    pub fn rollcalls(&self) -> String {
+        format!("{}/api/radar/rollcalls?api_version=1.1.0", self.base)
+    }
+
+    // --- Quiz detection: per-account × per-course fan-out (docs 31; NOT a global list) ---
+    // v1 does NOT multi-page; page_size=50 covers a semester's courses.
+    pub fn my_courses(&self) -> String {
+        format!("{}/api/my-courses?page=1&page_size=50", self.base)
+    }
+    /// courseware: generic activities list, filtered to `type=="material"`, then the quizzes chain.
+    pub fn course_activities(&self, cid: &str) -> String {
+        format!(
+            "{}/api/courses/{cid}/activities?page=1&page_size=200",
+            self.base
+        )
+    }
+    /// exam family list (real endpoint; `exams` key). v1 sends `conditions=` + page params.
+    pub fn course_exam_list(&self, cid: &str) -> String {
+        format!(
+            "{}/api/courses/{cid}/exam-list?conditions=&page=1&page_size=50",
+            self.base
+        )
+    }
+    pub fn course_questionnaire_list(&self, cid: &str) -> String {
+        format!("{}/api/courses/{cid}/questionnaire-list", self.base)
+    }
+    pub fn course_homework(&self, cid: &str) -> String {
+        format!("{}/api/courses/{cid}/homework-activities", self.base)
+    }
+    pub fn course_interactions(&self, cid: &str) -> String {
+        format!("{}/api/courses/{cid}/interactions", self.base)
+    }
+    pub fn course_classroom_list(&self, cid: &str) -> String {
+        format!("{}/api/courses/{cid}/classroom-list", self.base)
+    }
+    /// courseware: per-material quiz list, then the quiz's my-submission (skip when already answered).
+    pub fn courseware_quizzes(&self, activity_id: &str) -> String {
+        format!(
+            "{}/api/courseware-quiz/activity/{activity_id}/quizzes",
+            self.base
+        )
+    }
+    pub fn courseware_my_submission(&self, quiz_id: &str) -> String {
+        format!(
+            "{}/api/courseware-quiz/quiz/{quiz_id}/my-submission",
+            self.base
+        )
+    }
+
+    // --- exam (docs 31) ---
+    pub fn exam_qualification(&self, id: &str) -> String {
+        format!("{}/api/exam/{id}/check-exam-qualification", self.base)
+    }
+    pub fn exam_distribute(&self, id: &str) -> String {
+        format!("{}/api/exams/{id}/distribute", self.base)
+    }
+    /// distribute for questionnaire / classroom (same shape as exam, different segment; docs 31).
+    pub fn questionnaire_distribute(&self, id: &str) -> String {
+        format!("{}/api/questionnaire/{id}/distribute", self.base)
+    }
+    pub fn classroom_distribute(&self, id: &str) -> String {
+        format!("{}/api/classroom/{id}/distribute", self.base)
+    }
+    /// vote: read `interaction.data.vote_option_items` (letter→text); activity detail: homework stem.
+    pub fn votes_read(&self, id: &str) -> String {
+        format!("{}/api/votes/{id}", self.base)
+    }
+    pub fn activity_detail(&self, id: &str) -> String {
+        format!("{}/api/activities/{id}", self.base)
+    }
+    /// R5 course-material tool: a material's file attachments, and a preview URL for an upload id.
+    pub fn upload_references(&self, activity_id: &str) -> String {
+        format!(
+            "{}/api/activities/{activity_id}/upload_references",
+            self.base
+        )
+    }
+    pub fn upload_document_url(&self, upload_id: &str) -> String {
+        format!(
+            "{}/api/uploads/document/{upload_id}/url?preview=true",
+            self.base
+        )
+    }
+    pub fn exam_submissions(&self, eid: &str) -> String {
+        format!("{}/api/exams/{eid}/submissions", self.base)
+    }
+    pub fn exam_submission_review(&self, eid: &str, sid: &str) -> String {
+        format!("{}/api/exams/{eid}/submissions/{sid}", self.base)
+    }
+
+    // --- vote / courseware-quiz / classroom-exam / homework / questionnaire ---
+    pub fn vote_cast(&self, id: &str) -> String {
+        format!("{}/api/votes/{id}/vote", self.base)
+    }
+    pub fn courseware_subjects(&self, id: &str) -> String {
+        format!("{}/api/courseware-quiz/quiz/{id}/subjects", self.base)
+    }
+    pub fn courseware_submissions(&self, id: &str) -> String {
+        format!("{}/api/courseware-quiz/quiz/{id}/submissions", self.base)
+    }
+    pub fn classroom_submit(&self, activity_id: &str, subject_id: &str) -> String {
+        format!(
+            "{}/api/classroom/{activity_id}/submit/{subject_id}",
+            self.base
+        )
+    }
+    pub fn homework_submissions(&self, activity_id: &str) -> String {
+        format!(
+            "{}/api/course/activities/{activity_id}/submissions",
+            self.base
+        )
+    }
+    pub fn questionnaire_submissions(&self, activity_id: &str) -> String {
+        format!("{}/api/questionnaire/{activity_id}/submissions", self.base)
+    }
+
+    // --- Student answer endpoints (one per rollcall type) ---
+    pub fn answer_number(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/answer_number_rollcall", self.base)
+    }
+    pub fn answer_radar(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/answer", self.base)
+    }
+    /// Radar coordinate answer (radar.rs §1) — carries `?api_version=1.76`; the empty `{}` path does not.
+    pub fn answer_radar_coord(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/answer?api_version=1.76", self.base)
+    }
+    pub fn answer_self_registration(&self, id: &str) -> String {
+        format!(
+            "{}/api/rollcall/{id}/answer_self_registration_rollcall",
+            self.base
+        )
+    }
+    pub fn answer_qr(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/answer_qr_rollcall", self.base)
+    }
+
+    // --- Reads: roster/code/on_call_fine, attendance summary, radar-lite ---
+    pub fn student_rollcalls(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/student_rollcalls", self.base)
+    }
+    pub fn lite(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/lite", self.base)
+    }
+
+    // --- Teacher endpoints (QR teacher-assist; student accounts get 403) ---
+    pub fn teacher_create_rollcall(&self, course_id: &str) -> String {
+        format!("{}/api/course/{course_id}/rollcall", self.base)
+    }
+    pub fn teacher_start_rollcall(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/start-rollcall", self.base)
+    }
+    pub fn teacher_qr_code(&self, course_id: &str, id: &str) -> String {
+        format!("{}/api/course/{course_id}/rollcall/{id}/qr_code", self.base)
+    }
+    pub fn teacher_stop_qr(&self, id: &str) -> String {
+        format!("{}/api/rollcall/{id}/stop_qr_rollcall", self.base)
+    }
+}

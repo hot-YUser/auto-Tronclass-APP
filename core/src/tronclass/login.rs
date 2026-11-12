@@ -3,7 +3,7 @@
 //! image for the user to type (no OCR — docs 30); SSO / email-SPA pages defer to the browser-cookie
 //! fallback (`ImportCookies`). `detect_login_kind` is pure and unit-tested.
 
-use crate::providers::Endpoints;
+use crate::tronclass::Endpoints;
 use reqwest::Client;
 
 /// Bounded response bodies for login-page reads: a themed login HTML page can carry heavy JS/CSS

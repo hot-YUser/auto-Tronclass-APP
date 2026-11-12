@@ -3,7 +3,7 @@
 //! and gone before `emit` returns.
 
 use super::{AnswerWire, MonitoringSnapshot};
-use crate::providers::School;
+use crate::store::providers::School;
 use serde::Serialize;
 use serde_json::Value;
 

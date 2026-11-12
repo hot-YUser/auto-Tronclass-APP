@@ -5,8 +5,8 @@
 //! flow (the model must still get its best shot).
 
 use crate::json;
-use crate::providers::Endpoints;
-use crate::quiz::clean_html;
+use crate::tronclass::quiz::clean_html;
+use crate::tronclass::Endpoints;
 use reqwest::{Client, Response};
 use serde_json::{json, Value};
 

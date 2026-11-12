@@ -4,10 +4,10 @@
 use super::actor::Env;
 use super::qr;
 use super::{Account, ActivityKey, Detected, MonitorMsg, RuntimeEvent};
-use crate::config::{normalize_qr_remote_base_url, TargetId};
-use crate::providers::Endpoints;
-use crate::rollcall::{self, RollcallKind, SignOutcome};
-use crate::secrets::Secret;
+use crate::store::config::{normalize_qr_remote_base_url, TargetId};
+use crate::store::secrets::Secret;
+use crate::tronclass::rollcall::{self, RollcallKind, SignOutcome};
+use crate::tronclass::Endpoints;
 use crate::wire::{emit, AccountResultPhase, CountdownScope, Event, EventCb, LogLevel, Problem};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -70,7 +70,7 @@ pub(super) enum QrSource {
 impl Activity {
     pub(super) fn new(kind: RollcallKind, course: String, plan_generation: u64) -> Self {
         Self {
-            activity_token: crate::config::new_id(),
+            activity_token: crate::store::config::new_id(),
             kind,
             course,
             participants: HashSet::new(),

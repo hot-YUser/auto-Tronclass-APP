@@ -2,8 +2,8 @@
 //! (login-gated `<img>` base64-inlined into the request). Drives everything over the FFI against the
 //! real-contract fake. Serialized via `SEQ`.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

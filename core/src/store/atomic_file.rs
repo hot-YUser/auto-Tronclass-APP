@@ -187,7 +187,10 @@ mod tests {
     use super::*;
 
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("tron-atomic-{name}-{}", crate::config::new_id()))
+        std::env::temp_dir().join(format!(
+            "tron-atomic-{name}-{}",
+            crate::store::config::new_id()
+        ))
     }
 
     #[test]

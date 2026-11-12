@@ -1,6 +1,6 @@
 //! Versioned persisted definitions and runtime state. Secrets never enter this file.
 
-use crate::providers::Registry;
+use crate::store::providers::Registry;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -472,7 +472,7 @@ impl Config {
                 let backup_path = path.with_file_name(format!(
                     "{file_name}.pre-v{CONFIG_SCHEMA_VERSION}-{unix_seconds}.bak"
                 ));
-                crate::atomic_file::create_new(&backup_path, &bytes)
+                crate::store::atomic_file::create_new(&backup_path, &bytes)
                     .map_err(|error| ConfigLoadError::Backup(error.to_string()))?;
                 fresh(Some(ConfigResetNotice { backup_path }))
             }
@@ -492,7 +492,8 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<(), String> {
         self.validate_static()?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
-        crate::atomic_file::replace(path, &bytes).map_err(|error| format!("write config: {error}"))
+        crate::store::atomic_file::replace(path, &bytes)
+            .map_err(|error| format!("write config: {error}"))
     }
 
     pub fn account(&self, id: &str) -> Option<&AccountMeta> {
@@ -1051,7 +1052,7 @@ mod tests {
     fn canonical_tenant_normalizes_alias_default_port_and_base_path() {
         let registry = Registry {
             default_key: Some("school".into()),
-            schools: vec![crate::providers::School {
+            schools: vec![crate::store::providers::School {
                 key: "school".into(),
                 label: "School".into(),
                 base_url: "https://EXAMPLE.edu:443/root/".into(),

@@ -215,12 +215,14 @@ impl VaultFile {
     /// partially truncated file.
     fn persist(&self) -> Result<(), String> {
         let out = self.sealed_bytes()?;
-        crate::atomic_file::replace(&self.path, &out).map_err(|e| format!("write vault: {e}"))
+        crate::store::atomic_file::replace(&self.path, &out)
+            .map_err(|e| format!("write vault: {e}"))
     }
 
     fn persist_new(&self) -> Result<(), String> {
         let out = self.sealed_bytes()?;
-        crate::atomic_file::create_new(&self.path, &out).map_err(|e| format!("create vault: {e}"))
+        crate::store::atomic_file::create_new(&self.path, &out)
+            .map_err(|e| format!("create vault: {e}"))
     }
 
     pub fn get(&self, account_id: &str) -> Option<AccountSecret> {
@@ -365,7 +367,7 @@ pub fn load_or_create_device_key(key_path: &Path) -> Result<[u8; 32], String> {
     }
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).map_err(|e| e.to_string())?;
-    match crate::atomic_file::create_new(key_path, &key) {
+    match crate::store::atomic_file::create_new(key_path, &key) {
         Ok(()) => Ok(key),
         // Another initializer won the race. Its complete key is authoritative; never replace it.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -469,7 +471,10 @@ mod tests {
 
     #[test]
     fn locked_vault_reads_are_unavailable_and_plaintext_cleared() {
-        let dir = std::env::temp_dir().join(format!("tron-vault-lock-{}", crate::config::new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tron-vault-lock-{}",
+            crate::store::config::new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let key = [9u8; 32];
         let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
@@ -523,7 +528,10 @@ mod tests {
 
     #[test]
     fn corrupt_vault_plaintext_error_never_echoes_decrypted_content() {
-        let dir = std::env::temp_dir().join(format!("tron-vault-echo-{}", crate::config::new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tron-vault-echo-{}",
+            crate::store::config::new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let key = [0x5au8; 32];
         let path = dir.join("vault.bin");
@@ -558,8 +566,10 @@ mod tests {
 
     #[test]
     fn has_llm_key_reports_presence_without_cloning_and_follows_lock() {
-        let dir =
-            std::env::temp_dir().join(format!("tron-vault-has-key-{}", crate::config::new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tron-vault-has-key-{}",
+            crate::store::config::new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let key = [3u8; 32];
         let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
@@ -595,7 +605,8 @@ mod tests {
 
     #[test]
     fn vault_qr_remote_key_set_get_clear_and_redaction() {
-        let dir = std::env::temp_dir().join(format!("tron-vault-qr-{}", crate::config::new_id()));
+        let dir =
+            std::env::temp_dir().join(format!("tron-vault-qr-{}", crate::store::config::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let key = [7u8; 32];
         let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
@@ -625,7 +636,7 @@ mod tests {
     fn qr_remote_key_validation_vault_unchanged_clear_and_secret() {
         let dir = std::env::temp_dir().join(format!(
             "tron-vault-qr-validate-{}",
-            crate::config::new_id()
+            crate::store::config::new_id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let key = [7u8; 32];

@@ -3,8 +3,8 @@
 use super::commands::{Handled, Reply};
 use super::monitoring::push_config;
 use super::state::CoreState;
-use crate::config::Settings;
-use crate::secrets::Secret;
+use crate::store::config::Settings;
+use crate::store::secrets::Secret;
 use crate::wire::{emit, Caps, Event, EventCb, SettingsView};
 use serde_json::Value;
 
@@ -125,7 +125,7 @@ pub(super) fn apply_config_patch(settings: &mut Settings, patch: &Value) -> Resu
                     settings.qr_remote_base_url = String::new();
                 } else {
                     settings.qr_remote_base_url =
-                        crate::config::normalize_qr_remote_base_url(&raw)?;
+                        crate::store::config::normalize_qr_remote_base_url(&raw)?;
                 }
             }
 

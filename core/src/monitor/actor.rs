@@ -8,7 +8,7 @@ use super::rollcall::{self, Activity};
 use super::{
     Account, ActivityKey, MonitorConfig, MonitorMsg, MonitorPlan, RuntimeEvent, TaskGroup,
 };
-use crate::config::TargetId;
+use crate::store::config::TargetId;
 use crate::wire::{emit, respond, Event, EventCb, Problem};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

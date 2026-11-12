@@ -2,11 +2,11 @@
 
 use super::poller::course_id;
 use super::{Account, MonitorMsg, QuizDetected};
-use crate::answer::Source;
 use crate::http;
 use crate::json;
-use crate::providers::Endpoints;
 use crate::time;
+use crate::tronclass::answer::Source;
+use crate::tronclass::Endpoints;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;

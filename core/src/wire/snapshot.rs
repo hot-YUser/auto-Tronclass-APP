@@ -1,7 +1,7 @@
 //! The monitoring snapshot: the complete, authoritative state the UI renders. The core re-emits it
 //! whole after every change, so the UI never has to reconcile deltas.
 
-use crate::config::{
+use crate::store::config::{
     DetectorSelection, PlatformBlock, ScheduleBinding, TargetId, TimeZoneSpec, WeeklySchedule,
 };
 use serde::{Deserialize, Serialize};

@@ -6,7 +6,7 @@
 use super::commands::Failure;
 use super::monitoring::{emit_monitoring_snapshot, monitor_plan};
 use super::state::{CoreState, MonitorLifecycle};
-use crate::config::{Config, TargetId};
+use crate::store::config::{Config, TargetId};
 use crate::supervisor::TargetSupervisor;
 use crate::wire::EventCb;
 use serde_json::json;

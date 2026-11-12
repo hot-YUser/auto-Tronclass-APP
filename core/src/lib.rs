@@ -4,27 +4,16 @@
 
 use std::ffi::c_void;
 
-mod answer;
-mod atomic_file;
-mod config;
-mod course_context;
-mod courses;
 mod engine;
 mod http;
 mod json;
 mod llm;
-mod login;
 mod monitor;
-mod persistence;
-mod providers;
 mod qr_remote;
-mod quiz;
-mod radar;
-mod rollcall;
-mod secrets;
+mod store;
 mod supervisor;
-mod teacher_qr;
 mod time;
+mod tronclass;
 mod wire;
 
 #[cfg(any(test, feature = "fakeserver"))]

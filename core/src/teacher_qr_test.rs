@@ -5,8 +5,8 @@
 //!   * a session lost mid-flight is recovered once on BOTH sides (teacher source + student sign);
 //!   * an HTTP-OK submission still requires roster confirmation before `SignedIn`.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

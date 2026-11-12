@@ -3,11 +3,11 @@ use super::monitoring::*;
 use super::session::*;
 use super::state::*;
 use super::*;
-use crate::config::{new_id, AccountMeta, Config, ScheduleBinding, Settings};
 use crate::monitor;
-use crate::persistence::{AccountJournal, AccountMutation};
-use crate::providers::Registry;
-use crate::secrets::{AccountSecret, VaultFile};
+use crate::store::config::{new_id, AccountMeta, Config, ScheduleBinding, Settings};
+use crate::store::journal::{AccountJournal, AccountMutation};
+use crate::store::providers::Registry;
+use crate::store::secrets::{AccountSecret, VaultFile};
 use crate::supervisor::TargetSupervisor;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -180,9 +180,12 @@ fn stopping_during_start_completes_pending_command() {
 
 #[test]
 fn corrupt_vault_is_preserved_instead_of_recreated() {
-    let dir = std::env::temp_dir().join(format!("tron-corrupt-vault-{}", crate::config::new_id()));
+    let dir = std::env::temp_dir().join(format!(
+        "tron-corrupt-vault-{}",
+        crate::store::config::new_id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
-    let key = crate::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
+    let key = crate::store::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
     drop(VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap());
     let corrupt = b"existing vault evidence".to_vec();
     std::fs::write(dir.join("vault.bin"), &corrupt).unwrap();
@@ -199,7 +202,10 @@ fn corrupt_vault_is_preserved_instead_of_recreated() {
 
 #[test]
 fn supplied_os_key_never_creates_a_plaintext_device_key_file() {
-    let dir = std::env::temp_dir().join(format!("tron-os-key-vault-{}", crate::config::new_id()));
+    let dir = std::env::temp_dir().join(format!(
+        "tron-os-key-vault-{}",
+        crate::store::config::new_id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let key = std::array::from_fn::<_, 32, _>(|index| index as u8);
 
@@ -218,7 +224,7 @@ fn invalid_os_key_fails_init_instead_of_reporting_boot_success() {
     const COMMAND_ID: u64 = 9_223_372_036_854_700_001;
     let dir = std::env::temp_dir().join(format!(
         "tron-invalid-os-key-init-{}",
-        crate::config::new_id()
+        crate::store::config::new_id()
     ));
     let core = init(collect_event).unwrap();
     send(
@@ -255,10 +261,13 @@ fn account_transaction_recovery_is_idempotent_for_add_and_delete() {
         (AccountMutation::Delete, false, false),
         (AccountMutation::Delete, true, true),
     ] {
-        let dir =
-            std::env::temp_dir().join(format!("tron-account-recovery-{}", crate::config::new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tron-account-recovery-{}",
+            crate::store::config::new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
-        let key = crate::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
+        let key =
+            crate::store::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
         let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();
         vault
             .set(
@@ -439,7 +448,7 @@ fn init_parse_errors_never_echo_file_content() {
         let dir = std::env::temp_dir().join(format!(
             "tron-init-echo-{}-{}",
             file,
-            crate::config::new_id()
+            crate::store::config::new_id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(file), format!("\"{marker}\"")).unwrap();
@@ -880,10 +889,11 @@ fn deleting_an_account_cancels_its_pending_captcha_login_without_resurrecting_th
 
     // The stale async completion must not have written anything back: the vault has no entry
     // (LoginResult was the task's terminal event, so no straggler write can still land).
-    let key =
-        crate::secrets::load_or_create_device_key(&std::path::Path::new(&dir).join("device.key"))
-            .unwrap();
-    let vault = crate::secrets::VaultFile::unlock_with_key(
+    let key = crate::store::secrets::load_or_create_device_key(
+        &std::path::Path::new(&dir).join("device.key"),
+    )
+    .unwrap();
+    let vault = crate::store::secrets::VaultFile::unlock_with_key(
         &std::path::Path::new(&dir).join("vault.bin"),
         key,
     )
@@ -908,7 +918,7 @@ fn deleting_an_account_cancels_its_pending_captcha_login_without_resurrecting_th
 fn stale_login_completion_never_resurrects_a_deleted_account() {
     let dir = std::env::temp_dir().join(format!("tron-stale-persist-{}", new_id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let key = crate::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
+    let key = crate::store::secrets::load_or_create_device_key(&dir.join("device.key")).unwrap();
 
     // Account present → the async completion persists and updates the cached session.
     let mut vault = VaultFile::create_with_key(&dir.join("vault.bin"), key).unwrap();

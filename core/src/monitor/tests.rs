@@ -5,10 +5,10 @@ use super::quiz::*;
 use super::rollcall::*;
 use super::task_group::*;
 use super::*;
-use crate::providers::Endpoints;
-use crate::quiz::Answer;
-use crate::rollcall::{RollcallKind, SignOutcome};
-use crate::teacher_qr;
+use crate::tronclass::quiz::Answer;
+use crate::tronclass::rollcall::{RollcallKind, SignOutcome};
+use crate::tronclass::teacher_qr;
+use crate::tronclass::Endpoints;
 use crate::wire::{AttemptState, Event};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -555,7 +555,7 @@ async fn classroom_retry_skips_every_subject_already_confirmed_by_the_server() {
         base_url: "http://127.0.0.1:1".to_string(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     };
     let endpoints = Endpoints::derive(&account.base_url);
     let subjects = vec![
@@ -1025,7 +1025,7 @@ async fn quiz_prepare_budget_timeout_sends_retry_not_stuck_preparing() {
         base_url: base_url.clone(),
         client: crate::http::client(),
         username: "user".to_string(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let (tx, mut rx) = unbounded_channel::<MonitorMsg>();
     let key = ActivityKey::new(base_url, "quiz:exam", "act1");
@@ -1306,7 +1306,7 @@ fn account_at(id: &str, is_teacher: bool) -> Arc<Account> {
         base_url: "http://127.0.0.1:1".to_string(), // port 1: connection refused → fails fast
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     })
 }
 
@@ -1922,7 +1922,7 @@ async fn qr_teacher_prepare_failure_before_put_fallbacks_to_remote_with_one_put_
         base_url: teacher_base,
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let student = Arc::new(Account {
         id: "s1".to_string(),
@@ -1933,7 +1933,7 @@ async fn qr_teacher_prepare_failure_before_put_fallbacks_to_remote_with_one_put_
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base, "qrcode", "RC-PREPARE");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
@@ -2110,7 +2110,7 @@ async fn qr_teacher_first_fetch_failure_before_put_fallbacks_to_remote() {
         base_url: teacher_base,
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let student = Arc::new(Account {
         id: "s1".to_string(),
@@ -2121,7 +2121,7 @@ async fn qr_teacher_first_fetch_failure_before_put_fallbacks_to_remote() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base, "qrcode", "RC-FETCH");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
@@ -2290,7 +2290,7 @@ async fn qr_teacher_fanout_started_never_fallbacks_even_when_student_fails() {
         base_url: teacher_base,
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let student = Arc::new(Account {
         id: "s1".to_string(),
@@ -2301,7 +2301,7 @@ async fn qr_teacher_fanout_started_never_fallbacks_even_when_student_fails() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base, "qrcode", "RC-FANOUT");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
@@ -2381,7 +2381,7 @@ async fn qr_teacher_failure_without_remote_preserves_teacher_error() {
         base_url: teacher_base,
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let student = Arc::new(Account {
         id: "s1".to_string(),
@@ -2392,7 +2392,7 @@ async fn qr_teacher_failure_without_remote_preserves_teacher_error() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base, "qrcode", "RC-NOREMOTE");
     spawn_qr_teacher_assist(
@@ -2531,7 +2531,7 @@ async fn qr_remote_fetch_started_near_deadline_not_accepted_after() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base, "qrcode", "RC-DEADLINE-FETCH");
     let deadline = Instant::now() + Duration::from_millis(2000);
@@ -2685,7 +2685,7 @@ async fn qr_remote_fanout_does_not_start_put_after_deadline() {
             base_url: student_base.clone(),
             client: crate::http::client(),
             username: String::new(),
-            password: crate::secrets::Secret::default(),
+            password: crate::store::secrets::Secret::default(),
         })
     };
     let students = vec![mk_student("s1", "u1"), mk_student("s2", "u2")];
@@ -2839,7 +2839,7 @@ async fn qr_fallback_gets_only_remaining_time_not_new_window() {
         base_url: teacher_base,
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let student = Arc::new(Account {
         id: "s1".to_string(),
@@ -2850,7 +2850,7 @@ async fn qr_fallback_gets_only_remaining_time_not_new_window() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base, "qrcode", "RC-FALLBACK-REMAINING");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
@@ -2985,7 +2985,7 @@ async fn qr_total_acquire_plus_fanout_bounded_by_deadline() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-BOUNDED");
     let deadline = Instant::now() + Duration::from_millis(1200);
@@ -3370,7 +3370,7 @@ async fn qr_generation_change_during_remote_fetch_prevents_put() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-GEN-FETCH");
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -3476,7 +3476,7 @@ async fn qr_generation_change_before_next_fanout_chunk_prevents_later_put() {
             base_url: student_base.clone(),
             client: crate::http::client(),
             username: String::new(),
-            password: crate::secrets::Secret::default(),
+            password: crate::store::secrets::Secret::default(),
         })
     };
     let students: Vec<Arc<Account>> = (0..9).map(mk_student).collect();
@@ -3639,7 +3639,7 @@ async fn qr_remote_revision_change_during_fetch_cancels_old_and_prevents_put() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let (rev_tx, rev_rx) = watch::channel(0u64);
     let (plan_tx, plan_rx) = watch::channel(MonitorPlan {
@@ -3787,7 +3787,7 @@ async fn qr_teacher_fallback_refuses_stale_remote_lease_on_revision_change() {
         base_url: teacher_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let student = Arc::new(Account {
         id: "s1".to_string(),
@@ -3798,7 +3798,7 @@ async fn qr_teacher_fallback_refuses_stale_remote_lease_on_revision_change() {
         base_url: student_base.clone(),
         client: crate::http::client(),
         username: String::new(),
-        password: crate::secrets::Secret::default(),
+        password: crate::store::secrets::Secret::default(),
     });
     let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-REV-FALLBACK");
     let (tx, mut rx) = unbounded_channel();

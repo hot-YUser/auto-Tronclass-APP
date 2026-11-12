@@ -1,4 +1,4 @@
-use crate::providers::Endpoints;
+use crate::tronclass::Endpoints;
 use crate::wire::CourseSnapshot;
 use reqwest::Client;
 use serde_json::Value;
@@ -11,7 +11,9 @@ pub async fn list(client: &Client, base_url: &str) -> Result<Vec<CourseSnapshot>
         .send()
         .await
         .map_err(|_| "course_transport_failed".to_string())?;
-    if response.status().as_u16() == 401 || crate::rollcall::response_url_is_login(response.url()) {
+    if response.status().as_u16() == 401
+        || crate::tronclass::rollcall::response_url_is_login(response.url())
+    {
         return Err("course_session_expired".to_string());
     }
     if !response.status().is_success() {

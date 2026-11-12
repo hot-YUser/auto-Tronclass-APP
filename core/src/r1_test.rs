@@ -3,9 +3,9 @@
 //! the caller when the class is NOT full — proving recheck matches the caller's own `user_no`, not any
 //! entry / whole class). The e2e tests share one event sink → serialized via `SEQ`.
 
-use crate::config::new_id;
 use crate::fake;
-use crate::rollcall::{classify_response, CodeResult};
+use crate::store::config::new_id;
+use crate::tronclass::rollcall::{classify_response, CodeResult};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};
@@ -277,7 +277,7 @@ fn number_ambiguous_sign_stops_after_one_put_and_reports_unconfirmed() {
     // full monitor harness to expose an intermediate count: empty/204/unknown never Wrong,
     // the first ambiguous code stops the search, an explicit wrong would have advanced,
     // and the ARTT-equivalent success fixtures still map to Success.
-    use crate::rollcall::CodeResult;
+    use crate::tronclass::rollcall::CodeResult;
     // 1) empty/204 + unknown 2xx never classify Wrong
     for body in ["", "   ", r#"{}"#, r#"{"id":1}"#, "just text", "204"] {
         assert_ne!(classify_response(200, body), CodeResult::Wrong, "{body}");

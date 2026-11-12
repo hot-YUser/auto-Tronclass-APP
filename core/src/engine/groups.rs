@@ -6,7 +6,9 @@ use super::definitions::{check_revision, redefine, Redefinition};
 use super::monitoring::reconcile_monitor_with;
 use super::state::CoreState;
 use super::{reply_data, Core, FollowUp};
-use crate::config::{canonical_tenant, new_group_id, AccountGroup, DetectorSelection, TargetId};
+use crate::store::config::{
+    canonical_tenant, new_group_id, AccountGroup, DetectorSelection, TargetId,
+};
 use crate::wire::{Command, EventCb, GroupInput};
 use serde_json::json;
 use std::collections::HashSet;

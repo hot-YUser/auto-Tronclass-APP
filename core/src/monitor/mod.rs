@@ -18,11 +18,11 @@ mod task_group;
 #[cfg(test)]
 mod tests;
 
-use crate::answer::Source;
-use crate::config::TargetId;
 use crate::llm::LlmConfig;
-use crate::rollcall::{RollcallKind, SignOutcome};
-use crate::secrets::Secret;
+use crate::store::config::TargetId;
+use crate::store::secrets::Secret;
+use crate::tronclass::answer::Source;
+use crate::tronclass::rollcall::{RollcallKind, SignOutcome};
 use crate::wire::{AccountResultPhase, AnswerWire, EventCb};
 use actor::{Actor, Env};
 use poller::PollTuning;
@@ -417,8 +417,8 @@ impl MonitorConfig {
         }
     }
 
-    fn number_pacing(&self) -> crate::rollcall::NumberCfg {
-        crate::rollcall::NumberCfg {
+    fn number_pacing(&self) -> crate::tronclass::rollcall::NumberCfg {
+        crate::tronclass::rollcall::NumberCfg {
             cooldown_ms: self.number_cooldown_ms,
             max_cooldowns: self.number_max_cooldowns,
         }

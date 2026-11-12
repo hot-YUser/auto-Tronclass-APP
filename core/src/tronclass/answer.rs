@@ -7,8 +7,8 @@
 use crate::http;
 use crate::json;
 use crate::llm::{self, LlmConfig};
-use crate::providers::Endpoints;
-use crate::quiz::{self, Answer, Decision};
+use crate::tronclass::quiz::{self, Answer, Decision};
+use crate::tronclass::Endpoints;
 use crate::wire::EventCb;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -361,7 +361,7 @@ async fn to_data_url(
         .send()
         .await
         .ok()?;
-    let (bytes, mime) = crate::course_context::fetch_image_response(resp).await?;
+    let (bytes, mime) = crate::tronclass::course_context::fetch_image_response(resp).await?;
     let sub = mime.strip_prefix("image/").unwrap_or("png");
     let sub = if ["png", "jpeg", "gif", "webp"].contains(&sub) {
         sub
@@ -370,7 +370,7 @@ async fn to_data_url(
     };
     Some(format!(
         "data:image/{sub};base64,{}",
-        crate::login::encode_base64(&bytes)
+        crate::tronclass::login::encode_base64(&bytes)
     ))
 }
 

@@ -1,9 +1,9 @@
 //! What the core holds between commands.
 
-use crate::config::Config;
 use crate::monitor;
-use crate::providers::Registry;
-use crate::secrets::VaultFile;
+use crate::store::config::Config;
+use crate::store::providers::Registry;
+use crate::store::secrets::VaultFile;
 use crate::supervisor::TargetSupervisor;
 use crate::wire::MonitoringSnapshot;
 use std::collections::{HashMap, HashSet};
@@ -130,7 +130,7 @@ pub(super) fn open_vault_auto(
 ) -> Result<VaultFile, String> {
     let key = match host_key {
         Some(key) => key,
-        None => crate::secrets::load_or_create_device_key(&dir.join("device.key"))?,
+        None => crate::store::secrets::load_or_create_device_key(&dir.join("device.key"))?,
     };
     let vault_path = dir.join("vault.bin");
     if VaultFile::exists(&vault_path) {

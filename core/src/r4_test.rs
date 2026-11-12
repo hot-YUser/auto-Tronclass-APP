@@ -2,8 +2,8 @@
 //! and the R3c all-or-nothing prepare gate (retry-success / persistent-error / empty-closed). Drives
 //! everything over the FFI against the real-contract fake. Serialized via `SEQ` (shared global events).
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

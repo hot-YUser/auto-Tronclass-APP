@@ -35,7 +35,7 @@ impl AccountJournal {
             account_id: account_id.to_string(),
         };
         let bytes = serde_json::to_vec(&journal).map_err(|error| error.to_string())?;
-        crate::atomic_file::create_new(&path(data_dir), &bytes)
+        crate::store::atomic_file::create_new(&path(data_dir), &bytes)
             .map_err(|error| format!("create account transaction: {error}"))?;
         Ok(journal)
     }
@@ -56,7 +56,7 @@ impl AccountJournal {
     }
 
     pub fn complete(data_dir: &Path) -> Result<(), String> {
-        crate::atomic_file::remove(&path(data_dir))
+        crate::store::atomic_file::remove(&path(data_dir))
             .map_err(|error| format!("remove account transaction: {error}"))
     }
 }
@@ -71,7 +71,8 @@ mod tests {
 
     #[test]
     fn journal_is_secret_free_and_create_new() {
-        let dir = std::env::temp_dir().join(format!("tron-journal-{}", crate::config::new_id()));
+        let dir =
+            std::env::temp_dir().join(format!("tron-journal-{}", crate::store::config::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         AccountJournal::begin(&dir, AccountMutation::Add, "opaque-account").unwrap();
         let raw = std::fs::read_to_string(path(&dir)).unwrap();

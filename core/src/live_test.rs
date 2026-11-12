@@ -10,11 +10,11 @@
 //!      TRON_LLM_KEY, TRON_LLM_ENDPOINT, TRON_LLM_MODEL, TRON_COURSE(=55379),
 //!      and per-phase: TRON_EXAM_ID, TRON_ROLLCALL_ID, TRON_NUMBER_CODE.
 
-use crate::answer::{self, Source};
 use crate::llm::{self, LlmConfig};
-use crate::login::{self, LoginOutcome};
-use crate::providers::Endpoints;
-use crate::rollcall::{self, NumberCfg};
+use crate::tronclass::answer::{self, Source};
+use crate::tronclass::login::{self, LoginOutcome};
+use crate::tronclass::rollcall::{self, NumberCfg};
+use crate::tronclass::Endpoints;
 use crate::wire::EventCb;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -117,8 +117,8 @@ async fn live_llm() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn live_school_probe() {
-    use crate::login::{detect_login_kind, LoginKind};
-    let reg = crate::providers::Registry::factory();
+    use crate::tronclass::login::{detect_login_kind, LoginKind};
+    let reg = crate::store::providers::Registry::factory();
     let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()
@@ -221,7 +221,7 @@ fn live_monitor_pipeline() {
     mon_events().lock().unwrap().clear();
     let h = crate::core_init(Some(mon_collect));
     let dir = std::env::temp_dir()
-        .join(format!("tron-live-{}", crate::config::new_id()))
+        .join(format!("tron-live-{}", crate::store::config::new_id()))
         .to_string_lossy()
         .replace('\\', "/");
 
@@ -464,8 +464,8 @@ async fn live_exam_submit_contract() {
                 .unwrap_or_default();
             if !oid.is_empty() {
                 answers.insert(
-                    crate::quiz::subject_id(s),
-                    crate::quiz::Answer::Options(vec![oid]),
+                    crate::tronclass::quiz::subject_id(s),
+                    crate::tronclass::quiz::Answer::Options(vec![oid]),
                 );
             }
         }
@@ -534,7 +534,7 @@ async fn live_course_context() {
     let base = env("TRON_BASE_URL");
     let (client, _, _) = authed(&base, &env("TRON_USER"), &env("TRON_PASS")).await;
     let course = env("TRON_COURSE");
-    let text = crate::course_context::search_course_materials(
+    let text = crate::tronclass::course_context::search_course_materials(
         &client,
         &base,
         &course,

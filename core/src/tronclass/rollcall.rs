@@ -2,8 +2,8 @@
 //! `on_call_fine` recheck are async over a single account's session. Each account signs for itself
 //! with its own device id; shared computation (number code, radar solve) is done once by the caller.
 
-use crate::providers::Endpoints;
-use crate::radar::{self, GeoPoint, Observation};
+use crate::tronclass::radar::{self, GeoPoint, Observation};
+use crate::tronclass::Endpoints;
 use reqwest::Client;
 use serde_json::{json, Value};
 
@@ -1105,7 +1105,7 @@ mod tests {
         // is marked present for the caller), roster confirms via my_present, second bogus 2xx
         // must never be hit; without the roster mark the same first ambiguous must surface the
         // submitted_unconfirmed error without a second mutation.
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[tokio::test]
     async fn brute_force_number_is_sequential_with_barrier_proof() {
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1709,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn roster_guard_my_present_and_recheck_on_call_fine() {
         use crate::fake;
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use cookie_store::CookieStore;
         use reqwest_cookie_store::CookieStoreMutex;
         use std::sync::Arc;
@@ -1879,7 +1879,7 @@ mod tests {
 
     #[tokio::test]
     async fn qr_preflight_already_present_zero_put_and_success_without_side_effect() {
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use std::sync::atomic::Ordering;
         // Roster says the caller is already on_call_fine via my_present (authoritative).
         let roster = r#"{"status":"in_progress","rollcallStatus":"in_progress","student_rollcalls":[{"user_no":"u1","rollcall_status":"on_call_fine"},{"user_no":"c0","rollcall_status":"absent"}]}"#;
@@ -1935,7 +1935,7 @@ mod tests {
 
     #[tokio::test]
     async fn qr_preflight_absent_one_put_then_post_recheck_confirms_on_call_fine() {
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use std::sync::atomic::Ordering;
         // Absent on preflight, PUT 200, then roster flips to present for post-recheck (2nd GET).
         // Harness that mutates its roster payload after the PUT is observed.
@@ -2017,7 +2017,7 @@ mod tests {
     #[tokio::test]
     async fn qr_preflight_auth_lost_surfaces_session_invalid_with_zero_put_and_allows_relogin_retry(
     ) {
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use std::sync::atomic::Ordering;
         // Preflight GET returns a 200 login HTML page → SESSION_INVALID with 0 PUT.
         let roster = r#"{"status":"in_progress","student_rollcalls":[]}"#;
@@ -2058,7 +2058,7 @@ mod tests {
 
     #[tokio::test]
     async fn qr_preflight_network_and_invalid_response_are_fail_closed_no_blind_put() {
-        use crate::providers::Endpoints;
+        use crate::tronclass::Endpoints;
         use std::sync::atomic::Ordering;
         // 1) Network error: connect to a closed port (no server) → transport err, 0 PUT, NOT session invalid.
         let closed_base = {

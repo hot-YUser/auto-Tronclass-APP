@@ -1,4 +1,4 @@
-use crate::config::{
+use crate::store::config::{
     AccountGroup, Config, DetectorSelection, ManualOverride, PlatformBlock, ScheduleBinding,
     TargetId,
 };
@@ -1137,7 +1137,7 @@ fn coalesce_acknowledged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AccountMeta;
+    use crate::store::config::AccountMeta;
 
     fn student(id: &str, schedule: ScheduleBinding) -> AccountMeta {
         AccountMeta {

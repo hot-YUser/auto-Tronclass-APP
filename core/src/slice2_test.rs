@@ -2,8 +2,8 @@
 //! the four rollcall types + `on_call_fine`, the 15% gate, and the countdown/defer flow — all
 //! driven over the real FFI against the stateful fake TronClass.
 
-use crate::config::new_id;
 use crate::fake;
+use crate::store::config::new_id;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};

@@ -5,9 +5,9 @@ use super::commands::{Handled, Reply};
 use super::definitions::check_revision;
 use super::monitoring::emit_monitoring_snapshot;
 use super::state::CoreState;
-use crate::config::{new_id, AccountMeta, Config, DetectorSelection, ScheduleBinding};
-use crate::persistence::{AccountJournal, AccountMutation};
-use crate::secrets::{AccountSecret, Secret, VaultFile};
+use crate::store::config::{new_id, AccountMeta, Config, DetectorSelection, ScheduleBinding};
+use crate::store::journal::{AccountJournal, AccountMutation};
+use crate::store::secrets::{AccountSecret, Secret, VaultFile};
 use crate::wire::{emit, Event, EventCb, LogLevel, Problem};
 use serde_json::json;
 

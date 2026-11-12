@@ -3,10 +3,10 @@
 
 use super::poller::relogin;
 use super::{Account, ActivityKey, MonitorConfig, MonitorMsg, MonitorPlan, TaskGroup};
-use crate::providers::Endpoints;
-use crate::rollcall::{self, SignOutcome};
-use crate::secrets::Secret;
-use crate::teacher_qr::{self, FailureKind};
+use crate::store::secrets::Secret;
+use crate::tronclass::rollcall::{self, SignOutcome};
+use crate::tronclass::teacher_qr::{self, FailureKind};
+use crate::tronclass::Endpoints;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ pub(super) fn is_qr_remote_configured(cfg: &MonitorConfig) -> bool {
         .qr_remote_key
         .as_deref()
         .is_some_and(|k| !k.expose().trim().is_empty())
-        && crate::config::normalize_qr_remote_base_url(&cfg.qr_remote_base_url).is_ok()
+        && crate::store::config::normalize_qr_remote_base_url(&cfg.qr_remote_base_url).is_ok()
     {
         return true;
     }
@@ -44,8 +44,8 @@ pub(super) fn is_qr_remote_revision_change(old: &MonitorConfig, new: &MonitorCon
     if old.qr_remote_enabled != new.qr_remote_enabled {
         return true;
     }
-    let old_base = crate::config::normalize_qr_remote_base_url(&old.qr_remote_base_url).ok();
-    let new_base = crate::config::normalize_qr_remote_base_url(&new.qr_remote_base_url).ok();
+    let old_base = crate::store::config::normalize_qr_remote_base_url(&old.qr_remote_base_url).ok();
+    let new_base = crate::store::config::normalize_qr_remote_base_url(&new.qr_remote_base_url).ok();
     if old_base != new_base {
         return true;
     }
@@ -72,8 +72,10 @@ pub(super) fn is_meaningful_qr_remote_change(old: &MonitorConfig, new: &MonitorC
         return true;
     }
     if old_configured && new_configured {
-        let old_base = crate::config::normalize_qr_remote_base_url(&old.qr_remote_base_url).ok();
-        let new_base = crate::config::normalize_qr_remote_base_url(&new.qr_remote_base_url).ok();
+        let old_base =
+            crate::store::config::normalize_qr_remote_base_url(&old.qr_remote_base_url).ok();
+        let new_base =
+            crate::store::config::normalize_qr_remote_base_url(&new.qr_remote_base_url).ok();
         if old_base != new_base {
             return true;
         }
@@ -388,7 +390,7 @@ pub(super) async fn run_qr_remote(
     // revision change cancels old remote work and prevents later PUTs with stale key/base.
     let rollcall_id = key.id.clone();
     let mut deadline_hit = false;
-    for chunk in students.chunks(crate::teacher_qr::FANOUT_LIMIT) {
+    for chunk in students.chunks(crate::tronclass::teacher_qr::FANOUT_LIMIT) {
         if *qr_rev_rx.borrow() != qr_rev {
             return;
         }

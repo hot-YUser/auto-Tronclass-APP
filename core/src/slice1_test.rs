@@ -1,9 +1,10 @@
 //! Offline slice-1 unit tests: vault crypto, registry resolution, config CRUD, and login
 //! feature-detection. The end-to-end login-over-the-seam test lives in `seam_test.rs`.
 
-use crate::config::{new_id, AccountMeta, Config};
-use crate::providers::{Endpoints, Registry};
-use crate::secrets::{load_or_create_device_key, AccountSecret, VaultFile};
+use crate::store::config::{new_id, AccountMeta, Config};
+use crate::store::providers::Registry;
+use crate::store::secrets::{load_or_create_device_key, AccountSecret, VaultFile};
+use crate::tronclass::Endpoints;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     // A per-test path under the OS temp dir; unique via a CSPRNG id so tests don't collide.
@@ -185,7 +186,7 @@ fn config_account_crud_persists() {
         device_id: "dev-1".into(),
         is_teacher: false,
         course_id: None,
-        schedule: crate::config::ScheduleBinding::Disabled,
+        schedule: crate::store::config::ScheduleBinding::Disabled,
     });
     cfg.save(&path).unwrap();
 
@@ -210,7 +211,7 @@ fn corrupt_config_is_never_moved_or_replaced() {
 
 #[test]
 fn detect_login_kind_classifies_fixtures() {
-    use crate::login::{detect_login_kind, LoginKind};
+    use crate::tronclass::login::{detect_login_kind, LoginKind};
 
     let password_form = r#"<html><body>
         <form action="/do-login" method="post">

@@ -5,11 +5,12 @@ use super::commands::{Handled, Reply};
 use super::session::authed_client;
 use super::state::{CoreState, MonitorLifecycle, RunningMonitor, StoppedMonitor};
 use super::{lock_state, reply, Core, INTERNAL_ERROR};
-use crate::config::AccountMeta;
+use crate::monitor;
 use crate::monitor::MonitorConfig;
+use crate::store::config::AccountMeta;
 use crate::supervisor::EffectivePlan;
+use crate::tronclass::login;
 use crate::wire::{emit, Event, EventCb, LoginState, Problem, WireError};
-use crate::{login, monitor};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -419,7 +420,7 @@ pub(super) fn spawn_monitor_auth(
                 (
                     input.meta,
                     input.base_url,
-                    crate::secrets::Secret::new(input.password),
+                    crate::store::secrets::Secret::new(input.password),
                     outcome,
                 )
             });

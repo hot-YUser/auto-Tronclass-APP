@@ -161,7 +161,7 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], stream: bool, tools: 
         body["chat_template_kwargs"] = json!({ "thinking_mode": "enabled" });
     }
     if tools {
-        body["tools"] = json!([crate::course_context::tool_spec()]);
+        body["tools"] = json!([crate::tronclass::course_context::tool_spec()]);
         body["tool_choice"] = json!("auto");
     }
     body
@@ -465,7 +465,7 @@ async fn tool_loop(
                                 a.get("query").and_then(Value::as_str).map(str::to_string)
                             })
                             .unwrap_or_default();
-                        crate::course_context::search_course_materials(
+                        crate::tronclass::course_context::search_course_materials(
                             school,
                             ctx.base_url,
                             ctx.course_id,
