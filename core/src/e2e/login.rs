@@ -1,9 +1,7 @@
-//! End-to-end seam test over the real FFI entry points: the slice-1 login flow (Init → CreateVault
-//! → AddAccount → Login) against the in-repo fake TronClass. Still proves the three skeleton risks
-//! (async over FFI, unsolicited reverse-channel events, heartbeat) and adds:
-//!   - a successful real-form login (good creds) → `LoginResult{ok:true}`
-//!   - a false-positive guard: bad creds land the fake's 200-with-login-page, and the content-based
-//!     `verify_session` rejects it → `LoginResult{ok:false}` (never a silent/false success).
+//! Login over the real FFI entry points (Init → AddAccount → Login) against the fake school:
+//!   - good credentials log in through the real form → `LoginResult{ok:true}`
+//!   - bad credentials land on a 200 login page, which the content-based session check rejects
+//!     → `LoginResult{ok:false}`, never a false success.
 
 use crate::fake;
 use crate::store::config::new_id;
@@ -70,7 +68,7 @@ fn send(handle: *mut std::ffi::c_void, json: &str) {
 }
 
 fn account_id_by_label(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 
 #[test]
@@ -87,12 +85,6 @@ fn seam_login_flow_end_to_end() {
         &format!(r#"{{"id":1,"cmd":"Init","data_dir":"{data_dir}"}}"#),
     );
     assert!(wait_for(reply_ok(1), 10).is_some(), "Init should reply");
-
-    send(handle, r#"{"id":2,"cmd":"CreateVault"}"#);
-    assert!(
-        wait_for(reply_ok(2), 10).unwrap()["ok"] == true,
-        "CreateVault ok"
-    );
 
     // Good account → successful real-form login.
     send(

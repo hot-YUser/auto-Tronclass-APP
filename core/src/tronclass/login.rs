@@ -1,6 +1,6 @@
 //! Login: a single entry that routes on **detected login-page features** — never on school
-//! identity (docs 30). A common username/password form logs in directly; a captcha page grabs the
-//! image for the user to type (no OCR — docs 30); SSO / email-SPA pages defer to the browser-cookie
+//! identity. A common username/password form logs in directly; a captcha page grabs the
+//! image for the user to type (no OCR); SSO / email-SPA pages defer to the browser-cookie
 //! fallback (`ImportCookies`). `detect_login_kind` is pure and unit-tested.
 
 use crate::tronclass::Endpoints;
@@ -26,7 +26,7 @@ pub struct PasswordForm {
     pub captcha_field: Option<String>,
 }
 
-/// Captcha input-field allowlist (v1 `_classify_captcha`) — common static-`<img>` captcha field names.
+/// Captcha input-field allowlist — common static-`<img>` captcha field names.
 /// Deliberately NO bare `"code"` (it matches `session_code`/`authorization_code`). NOTE: Keycloak
 /// (`captchakey`/`captchacode`) is intentionally NOT here: an enforcing Keycloak realm serves the captcha
 /// image via AJAX JSON, not an `<img>`, so we can't auto-drive it — such tenants must use the
@@ -55,7 +55,7 @@ fn is_captcha_field(name: &str) -> bool {
 
 /// A public-cloud TronClass email login, extracted from the `<login-view>` web component. Its
 /// credentials POST plain to a discoverable endpoint (`{origin}/login?login=email`), so it logs in
-/// headlessly — no browser needed. Ground truth: v1 `tron_http.extract_public_cloud_email_login_form`.
+/// headlessly — no browser needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicCloudForm {
     pub action: String,
@@ -116,8 +116,8 @@ pub fn detect_login_kind(html: &str, page_url: &str) -> LoginKind {
     let form = find_password_form(html);
 
     // Public-cloud email SPA: a `<login-view>` web component. Its credentials POST to a discoverable
-    // endpoint, so extract the form and log in headlessly (ground truth: v1
-    // extract_public_cloud_email_login_form). Checked first — this page has no server-rendered form.
+    // endpoint, so extract the form and log in headlessly. Checked first: this page has no
+    // server-rendered form.
     if lower.contains("<login-view") {
         if let Some(form) = extract_public_cloud_form(html, page_url) {
             return LoginKind::PublicCloudEmail(form);
@@ -255,8 +255,7 @@ fn find_password_form(html: &str) -> Option<PasswordForm> {
     None
 }
 
-/// Extract the public-cloud email login form from a `<login-view>` page (ground truth: v1
-/// `extract_public_cloud_email_login_form`). Body = the component's hidden inputs + `next`/`org_id`/
+/// Extract the public-cloud email login form from a `<login-view>` page. Body = the component's hidden inputs + `next`/`org_id`/
 /// `submit=login` (+`remember_me` when set); the caller appends `email`/`password`. `None` if the
 /// component isn't the expected email login.
 fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudForm> {
@@ -320,7 +319,7 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
         };
     }
 
-    // setdefault (keep an existing hidden input; add ours only if absent) — matches v1.
+    // setdefault (keep an existing hidden input; add ours only if absent).
     if !fields.iter().any(|(n, _)| n == "next") {
         fields.push(("next".into(), next.clone()));
     }
@@ -347,7 +346,7 @@ fn extract_public_cloud_form(html: &str, page_url: &str) -> Option<PublicCloudFo
 }
 
 /// The public-cloud email login POST URL: `{origin}/login?login=email` (+ `next` when set). Built on
-/// `reqwest::Url` so the query is percent-encoded for us (v1 order: `next` before `login`).
+/// `reqwest::Url` so the query is percent-encoded for us.
 fn public_cloud_email_url(page_url: &str, next: &str) -> String {
     let Ok(mut u) = reqwest::Url::parse(page_url).and_then(|b| b.join("/login")) else {
         return "/login?login=email".to_string();
@@ -362,7 +361,7 @@ fn public_cloud_email_url(page_url: &str, next: &str) -> String {
     u.into()
 }
 
-/// One `?key=` value from a URL. ponytail: a tiny scan — enough for the single `next` param.
+/// One `?key=` value from a URL. a tiny scan — enough for the single `next` param.
 fn query_param(url: &str, key: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()?
@@ -372,7 +371,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Read a (possibly `:`-prefixed) HTML attribute's value by name, HTML-unescaping entities.
-/// ponytail: a light forward scanner, not a full attribute parser — sized for the `<login-view>` tag.
+/// a light forward scanner, not a full attribute parser — sized for the `<login-view>` tag.
 fn attr_value(html: &str, name: &str) -> Option<String> {
     let mut from = 0;
     while let Some(p) = html[from..].find(name) {
@@ -419,7 +418,7 @@ fn find_captcha_image(html: &str) -> Option<String> {
         };
         let src = src.as_utf8_str().to_string();
         let low = src.to_lowercase();
-        // strong-match toward v1's find_captcha_source regexes.
+        // strong-match toward an explicit captcha marker.
         if [
             "captcha",
             "verif",
@@ -618,7 +617,7 @@ pub fn encode_base64(input: &[u8]) -> String {
 /// The account's own identity for per-account recheck / my_present — the **login username**, lowercased.
 /// Confirmed against a real tenant (2026-07): a rollcall roster's `student_rollcalls[].user_no` is the
 /// login id itself (e.g. the account email), NOT any numeric id — and `/api/user` returns `{message}`
-/// here, so it is never a reliable source. Matches v1 `_current_user_no` (the active profile's `user`).
+/// here, so it is never a reliable source.
 pub fn user_no_from_username(username: &str) -> String {
     username.trim().to_lowercase()
 }

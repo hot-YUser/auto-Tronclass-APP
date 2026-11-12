@@ -1,5 +1,5 @@
-//! R3b: the LLM answerer contract (request body, option-letter rendering, reply parsing, correction
-//! re-ask, strip_think) + the two R3a acceptance bugs (numeric matching sort; single-vote). Pure
+//! the LLM answerer contract (request body, option-letter rendering, reply parsing, correction
+//! re-ask, strip_think) + two regressions (numeric matching sort; single-vote). Pure
 //! parsing units live in quiz.rs/llm.rs; the e2e here drive the request/parse end-to-end over the FFI.
 
 use crate::fake;
@@ -46,7 +46,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -120,9 +120,6 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(reply_ok(i), 5);
-    let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
@@ -139,11 +136,11 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     let dave = account_id("dave").unwrap();
     let clock_id = hz.next();
     let start_id = hz.next();
-    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    crate::e2e::support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
     wait_for(reply_ok(clock_id), 5);
     wait_for(reply_ok(start_id), 15);
     wait_for(
-        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &dave, "online"),
         10,
     );
     (hz, dave)

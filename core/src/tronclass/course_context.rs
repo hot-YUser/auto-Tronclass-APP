@@ -1,4 +1,4 @@
-//! R5 course-material tool + image fetcher (docs 31). The answerer calls `search_course_materials` to
+//! course-material tool + image fetcher. The answerer calls `search_course_materials` to
 //! pull the student's OWN course handouts (incl. PDF text) when a question lacks context; `<img>` images
 //! embedded in a subject are fetched (authed) and base64-inlined for the multimodal path. All GETs use the
 //! account's authed client; every failure degrades to a string / `None` — an error never enters the answer
@@ -23,7 +23,7 @@ const MAX_PDF_BYTES: usize = 20 * 1024 * 1024;
 /// a runaway/lying server from ballooning the request.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-/// The single tool the model may call (the SYSTEM_PROMPT has instructed it since R3b).
+/// The single tool the model may call.
 pub fn tool_spec() -> Value {
     json!({
         "type": "function",

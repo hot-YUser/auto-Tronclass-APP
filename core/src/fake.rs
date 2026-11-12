@@ -1,7 +1,7 @@
-//! A stateful fake TronClass for headless tests (docs 90 §10). Multiple accounts (any username,
+//! A stateful fake TronClass for headless tests. Multiple accounts (any username,
 //! password = "secret") get their own `session=sk-<user>` cookie; a `_test` control endpoint opens
 //! rollcalls; the four student answer endpoints record a per-user sign confirmed via `on_call_fine`;
-//! and the teacher QR endpoints model docs 32 — the teacher's own rollcall only *sources* the
+//! and the teacher QR endpoints model the teacher's own rollcall only *sources* the
 //! portable `data`, which a student then applies to *their own* rollcall id.
 
 use serde_json::{json, Value};
@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub const GOOD_USER: &str = "test";
 pub const GOOD_PASS: &str = "secret";
 const CSRF: &str = "tok123";
-/// Rotating QR `data` the teacher sources; portable across rollcalls (docs 32).
+/// Rotating QR `data` the teacher sources; portable across rollcalls.
 const QR_TOKEN: &str = "QRDATA-XYZ";
 
 const LOGIN_PAGE: &str = concat!(
@@ -95,7 +95,7 @@ struct QuizDef {
     allow_retake: bool,
     reveal: bool,
     submitted: bool, // once true, distribute mints a fresh (retake) instance id
-    // --- R4 per-family detection gate fields (real list-endpoint shapes) ---
+    // --- per-family detection gate fields (real list-endpoint shapes) ---
     is_started: bool,      // exam/questionnaire/courseware: activity has opened
     is_closed: bool,       // any: activity closed (past window)
     has_submitted: bool,   // exam/questionnaire/homework: caller already submitted → skip
@@ -107,7 +107,7 @@ struct QuizDef {
     end_time: String,      // exam: ISO-8601 UTC window end (real tenants send a string, not epoch)
 }
 
-/// R5: a course material (handout) the `search_course_materials` tool can read; a `.pdf` attachment is
+/// a course material (handout) the `search_course_materials` tool can read; a `.pdf` attachment is
 /// served on demand with `pdf_sentinel` as its text layer.
 struct MaterialDef {
     id: String,
@@ -125,21 +125,21 @@ struct FakeState {
     quizzes: Vec<QuizDef>,
     materials: Vec<MaterialDef>,
     llm_calls: u32,
-    llm_fail_times: u32, // first N /v1/chat/completions calls return empty content (R3c retry test)
+    llm_fail_times: u32, // first N /v1/chat/completions calls return empty content
     last_submission: Value,
     submissions: Value, // user -> most recent submission body (proves per-account instance/paper)
-    last_llm_request: Value, // the last /v1/chat/completions request body (R3b assertion)
+    last_llm_request: Value, // the last /v1/chat/completions request body
     captcha_required: bool,
     captcha_expected: String,
     sso_mode: bool,
     saw_radar_signal: bool, // set once a radar coord answer carried a radarSignal (beacon test)
-    expired: bool, // R4-D: authed requests serve a 200 login page until the account re-logins
-    expire_mode: String, // R4.1 #5: "login_page" (default) | "401" | "redirect" — how expiry manifests
-    sso_redirect: bool, // R4-C: GET /login 302-redirects to a DIFFERENT PATH with a RELATIVE form action
+    expired: bool,          // authed requests serve a 200 login page until the account re-logins
+    expire_mode: String,    // "login_page" (default) | "401" | "redirect" — how expiry manifests
+    sso_redirect: bool, // GET /login 302-redirects to a DIFFERENT PATH with a RELATIVE form action
     // (same-host; a true cross-host 302 would need a 2nd loopback port — not worth it)
-    sign_expired: bool, // R4.1 #2: ONLY the PUT answer_* (sign) routes expire; poll/detect stay healthy
-    sign_expire_user: String, // R4.1 #2: expire only this user's signs (empty = all) → per-account double-sign test
-    down: bool, // R4.1 stale-offline: the poll canary gets a 503 (transient blip, NOT auth-lost)
+    sign_expired: bool, // ONLY the PUT answer_* (sign) routes expire; poll/detect stay healthy
+    sign_expire_user: String, // expire only this user's signs (empty = all) → per-account double-sign test
+    down: bool,               // the poll canary gets a 503 (transient blip, NOT auth-lost)
 }
 
 pub async fn bind_ephemeral() -> (u16, TcpListener) {
@@ -203,7 +203,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         return response(200, "image/png", "", CAPTCHA_IMAGE);
     }
     if request_line.starts_with("GET /login") {
-        // SSO-redirect mode: 302 to a form on a different PATH whose action is relative (R4-C urljoin).
+        // SSO-redirect mode: 302 to a form on a different PATH whose action is relative.
         if state.lock().unwrap().sso_redirect {
             return redirect("/sso/login-page");
         }
@@ -294,7 +294,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         return json(200, r#"{"ok":true}"#);
     }
 
-    // R4-D / R4.1 #5: session expiry. `login_page` (default) → treat a valid cookie as no session (authed
+    // session expiry. `login_page` (default) → treat a valid cookie as no session (authed
     // reads serve a login page); `401`/`redirect` → intercept authed `/api` reads so the poll canary sees
     // that specific failure. A (re-)login POST clears the flag above.
     let raw_user = session_user(full);
@@ -374,7 +374,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         let user_text = llm_user_text(&msgs);
         let has_tool_result = msgs.iter().any(|m| m["role"] == "tool");
 
-        // R5 non-streaming tools path: call search_course_materials, then answer from its result.
+        // non-streaming tools path: call search_course_materials, then answer from its result.
         if !v["stream"].as_bool().unwrap_or(true) {
             if has_tool_result {
                 // Answer from the fetched material — the text after the PDF "內文）:" marker (the sentinel).
@@ -436,7 +436,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         });
         return json(200, r#"{"ok":true}"#);
     }
-    // R5: the executor GETs these (authed) — served here (no session gate needed). The document/url route
+    // the executor GETs these (authed) — served here (no session gate needed). The document/url route
     // returns an ABSOLUTE url (built from the request Host) so the executor's reqwest GET can resolve it.
     if let Some(uid) = request_line
         .strip_prefix("GET /_test/pdf/")
@@ -535,7 +535,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             .collect();
         return json(200, &format!(r#"{{"courses":[{}]}}"#, items.join(",")));
     }
-    // --- per-family detection lists (real endpoints/keys/gate fields; R4) ---
+    // --- per-family detection lists (real endpoints/keys/gate fields) ---
     if request_line.starts_with("GET /api/courses/") && request_line.contains("/exam-list") {
         let cid = course_id_from(request_line);
         let st = state.lock().unwrap();
@@ -594,7 +594,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         return json(200, &json!({ "classrooms": items }).to_string());
     }
     // courseware: material activities in the generic list, then a per-material quizzes chain. Also serves
-    // R5 course materials (the `search_course_materials` tool GETs this same list).
+    // course materials (the `search_course_materials` tool GETs this same list).
     if request_line.starts_with("GET /api/courses/") && request_line.contains("/activities") {
         let cid = course_id_from(request_line);
         let st = state.lock().unwrap();
@@ -694,7 +694,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
             .to_string(),
         );
     }
-    // R5 material chain: attachments of a material, then a preview url for an upload id.
+    // material chain: attachments of a material, then a preview url for an upload id.
     if let Some(aid) = api_suffix_id(request_line, "GET", "activities", "upload_references") {
         let st = state.lock().unwrap();
         let refs: Vec<Value> = st
@@ -833,7 +833,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         };
     }
     if let Some(id) = rollcall_route(request_line, "GET", "lite") {
-        // Real lite carries NO target coordinate (radar.rs §1) — only beacon metadata.
+        // Real lite carries NO target coordinate — only beacon metadata.
         let st = state.lock().unwrap();
         return match st.rollcalls.iter().find(|r| r.id == id) {
             Some(r) => json(
@@ -854,7 +854,7 @@ fn route(request_line: &str, full: &str, body: &str, state: &Arc<Mutex<FakeState
         ("answer", "radar"),
     ] {
         if let Some(id) = rollcall_route(request_line, "PUT", suffix) {
-            // R4.1 #2: signs-only expiry — the sign PUT alone serves a login page (poll/detect stay
+            // signs-only expiry — the sign PUT alone serves a login page (poll/detect stay
             // healthy), so the SIGN path is what discovers the dead session. Per-user for the double-sign test.
             {
                 let st = state.lock().unwrap();
@@ -926,7 +926,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
         return json(404, "{}");
     };
 
-    // number: real servers return distinguishable codes + a body success flag (docs 30 classifier).
+    // number: real servers return distinguishable codes + a body success flag.
     if kind == "number" {
         r.number_attempts += 1; // test counts these: a manual override must READ the code (1), not brute-force
         if r.number_fatal {
@@ -944,7 +944,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
         };
     }
 
-    // radar: the solver must reverse-locate from distances; lite carries no target (radar.rs §1).
+    // radar: the solver must reverse-locate from distances; lite carries no target.
     if kind == "radar" {
         let has_coords = v.get("latitude").is_some();
         if !has_coords {
@@ -968,7 +968,7 @@ fn answer(state: &Arc<Mutex<FakeState>>, id: &str, kind: &str, user: &str, body:
                 r.signed.insert(user.to_string());
                 return json(200, r#"{"success":true}"#);
             }
-            // Out of scope → HTTP 200 + nested error envelope (radar.rs §1: 200-with-error_code).
+            // Out of scope → HTTP 200 + nested error envelope (radar.rs: 200-with-error_code).
             return json(
                 200,
                 &format!(
@@ -1116,7 +1116,7 @@ fn json_str_or_null(s: &Option<String>) -> String {
 }
 
 /// A minimal, VALID single-page PDF whose text layer is `text` (correct byte-offset xref so `pdf-extract`
-/// parses it). `text` must not contain `(`/`)` (unescaped PDF string delimiters). Used to prove the R5
+/// parses it). `text` must not contain `(`/`)` (unescaped PDF string delimiters). Used to prove the
 /// executor→pdf-extract→answer chain end-to-end.
 pub fn minimal_pdf(text: &str) -> Vec<u8> {
     let stream = format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET");
@@ -1149,7 +1149,7 @@ pub fn minimal_pdf(text: &str) -> Vec<u8> {
 }
 
 /// The user question text from `messages[1]` — a plain string, or the concatenated text parts of a
-/// multimodal parts list (R5).
+/// multimodal parts list.
 fn llm_user_text(msgs: &[Value]) -> String {
     match msgs.get(1).map(|m| &m["content"]) {
         Some(Value::String(s)) => s.clone(),
@@ -1165,7 +1165,7 @@ fn llm_user_text(msgs: &[Value]) -> String {
 /// The canned answer shared by the streaming + non-streaming fake-LLM paths (keeps existing tests green).
 fn llm_canned(user_text: &str, calls: u32, fail_times: u32) -> String {
     if calls <= fail_times {
-        String::new() // R3c: first N calls empty → subject unanswered → re-prepare
+        String::new() // first N calls empty → subject unanswered → re-prepare
     } else if user_text.contains("\nA. ") {
         "A,B".to_string()
     } else if user_text.contains("' ||| '") {

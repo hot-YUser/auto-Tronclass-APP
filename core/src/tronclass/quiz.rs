@@ -1,4 +1,4 @@
-//! Quiz decision layer (docs 31) — **pure, zero I/O, unit-tested.** `decide_paper` looks at each
+//! Quiz decision layer — **pure, zero I/O, unit-tested.** `decide_paper` looks at each
 //! subject: a server-leaked correct answer → `Replay`; otherwise → `Pending` (LLM answers it later).
 //! Every scored subject gets a real answer; nothing is blind-guessed.
 //!
@@ -135,7 +135,7 @@ fn decide_type(qtype: &str) -> &str {
     }
 }
 
-/// Flatten group/matching containers into individually-answerable leaf subjects (v1 answer_flow.py
+/// Flatten group/matching containers into individually-answerable leaf subjects (
 /// :148-183). Run on every subjects-array fetch (exam/questionnaire/classroom/courseware). A matching
 /// container with `sub_subjects` → one `single_selection` per left item (id-sorted), `parent_id`-tagged,
 /// options = the sub's own else a consecutive id-sorted block of the container options (`k=opts/n`);
@@ -301,7 +301,7 @@ pub fn correct_answers_contents(s: &Value) -> Vec<String> {
     items.into_iter().map(|(_, c)| c).collect()
 }
 
-// ===== R3b: LLM-reply parsing (pure; answer.rs::parse_answer delegates here) =====
+// ===== LLM-reply parsing (pure; answer.rs::parse_answer delegates here) =====
 
 /// Option index → spreadsheet letter (0→A, 25→Z, 26→AA, …) for rendering; parsing handles single letters.
 pub fn option_label(mut i: usize) -> String {
@@ -563,7 +563,7 @@ pub fn parse_blanks(reply: &str, count: usize) -> Vec<String> {
     parts
 }
 
-/// Number of blanks (v1 answer_flow.py:84-88): authoritative `answer_number`; else marker count
+/// Number of blanks: authoritative `answer_number`; else marker count
 /// (`__blank__` / runs of ≥2 `_` / runs of ≥2 full-width `＿`); else leaked `correct_answers` count; else 1.
 pub fn blank_count(subject: &Value) -> usize {
     if let Some(n) = subject.get("answer_number").and_then(Value::as_i64) {

@@ -1133,7 +1133,7 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn qr_remote_old_json_defaults_and_validation() {
-        // Old schema v1 config without qr fields must load with defaults (enabled false, default base).
+        // A config without qr fields must load with defaults (enabled false, default base).
         let old = json!({
             "schema_version": CONFIG_SCHEMA_VERSION,
             "config_revision": 0,

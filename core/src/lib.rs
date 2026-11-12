@@ -20,46 +20,7 @@ mod wire;
 pub mod fake;
 
 #[cfg(test)]
-mod test_support;
-
-#[cfg(test)]
-mod seam_test;
-
-#[cfg(test)]
-mod slice1_test;
-
-#[cfg(test)]
-mod slice2_test;
-
-#[cfg(test)]
-mod slice3_test;
-
-#[cfg(test)]
-mod slice4_test;
-
-#[cfg(test)]
-mod teacher_qr_test;
-
-#[cfg(test)]
-mod r1_test;
-
-#[cfg(test)]
-mod r2_test;
-
-#[cfg(test)]
-mod r3a_test;
-
-#[cfg(test)]
-mod r3b_test;
-
-#[cfg(test)]
-mod r4_test;
-
-#[cfg(test)]
-mod r5_test;
-
-#[cfg(test)]
-mod live_test;
+mod e2e;
 
 use engine::Core;
 

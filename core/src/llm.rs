@@ -1,4 +1,4 @@
-//! LLM client (docs 31). OpenAI-compatible endpoints use the standard request shape by default;
+//! LLM client. OpenAI-compatible endpoints use the standard request shape by default;
 //! the NVIDIA NIM reasoning extensions are sent only for the explicitly recognised NIM endpoint.
 //! Reasoning is streamed as `ReasoningChunk` events when a provider returns the optional
 //! `reasoning_content` field, and only the **clean final answer** is returned. The API key comes
@@ -32,13 +32,13 @@ pub struct LlmConfig {
     pub api_key: String,
     /// Reasoning-model token budget. `0` → the safe default (see `resolve_max_tokens`).
     pub max_tokens: u32,
-    /// R5: allow the model to call `search_course_materials` (needs a course_id + authed client).
+    /// allow the model to call `search_course_materials` (needs a course_id + authed client).
     pub enable_tools: bool,
-    /// R5: how many tool ROUNDS are allowed; the loop runs `+2` turns so a final-answer turn always follows.
+    /// how many tool ROUNDS are allowed; the loop runs `+2` turns so a final-answer turn always follows.
     pub max_tool_iterations: u32,
 }
 
-/// R5 tool-calling context: the authed account's `base_url` + the quiz's `course_id`, used by the
+/// tool-calling context: the authed account's `base_url` + the quiz's `course_id`, used by the
 /// course-material executor. The executor runs on the account's authed `school` client — NEVER the
 /// cookie-less LLM client (school cookies must not reach the model endpoint; the two clients are
 /// kept strictly separate, see `answer_question`).
@@ -72,8 +72,8 @@ pub fn build_client() -> Result<Client, String> {
         .map_err(|error| format!("llm client: {error}"))
 }
 
-/// The answerer contract system prompt (docs 31). Verbatim — includes the `search_course_materials`
-/// tool paragraph, which is inert with no `tools` array (ponytail: tools + multimodal are a later round).
+/// The answerer contract system prompt. Verbatim — includes the `search_course_materials`
+/// tool paragraph, which is inert with no `tools` array (tools + multimodal are a later round).
 const SYSTEM_PROMPT: &str = "You are an exam-answering assistant. You are given ONE question. Reply with ONLY the answer itself — no explanation, no labels, no extra punctuation, no preamble like 'The answer is'.
 - Multiple choice (lettered options): reply with ONLY the option LETTER(S) — never the option's text and never a number. One letter for a single answer (e.g. B); comma-separated for multiple (e.g. A,C). For multiple-answer questions, select ALL correct options. A left-item like '貓 →' is a single-choice: reply the letter of the option it matches.
 - Fill-in-the-blank or cloze: the blank answers in order, separated by ' ||| ' (three vertical bars) when there is more than one blank, and nothing else.
@@ -170,7 +170,7 @@ fn build_request_body(cfg: &LlmConfig, messages: &[Value], stream: bool, tools: 
 /// Answer one question given the non-system `messages` (the user question, plus assistant+correction
 /// turns on a re-ask). Prepends the system prompt. Returns the clean answer text, or `None` on
 /// failure/empty (caller must then skip the subject — never blank). With `tools` set, runs the
-/// non-streaming tool-calling loop (course-material lookup); otherwise the streaming path (R3b).
+/// non-streaming tool-calling loop (course-material lookup); otherwise the streaming path.
 /// `llm_client` is the cookie-less LLM client; `school` is the account's authed client used ONLY
 /// for same-origin course-material fetches inside the tool loop — the two must never be conflated.
 #[allow(clippy::too_many_arguments)]
@@ -270,7 +270,7 @@ fn flush_reasoning(
     pending.clear();
 }
 
-/// The R3b streaming path (no tools): SSE, reasoning streamed delta-by-delta as `ReasoningChunk`.
+/// The streaming path (no tools): SSE, reasoning streamed delta-by-delta as `ReasoningChunk`.
 #[allow(clippy::too_many_arguments)]
 async fn stream_answer(
     llm_client: &Client,
@@ -387,7 +387,7 @@ async fn stream_answer(
     (!answer.is_empty()).then(|| answer.to_string())
 }
 
-/// R5 tool-calling loop (non-streaming): the model may call `search_course_materials`; we run the
+/// tool-calling loop (non-streaming): the model may call `search_course_materials`; we run the
 /// executor, feed the result back, and loop. Bounded by `max_iterations + 2` so a final-answer turn
 /// always follows the last tool round. Each turn emits ONE `ReasoningChunk`; never raises — degrades to
 /// the last clean content. `school` is the account's authed client, used ONLY for the course-material

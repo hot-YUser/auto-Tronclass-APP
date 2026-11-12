@@ -1,4 +1,4 @@
-//! Slice-2 end-to-end (headless): multi-account concurrent monitoring, the merged activity model,
+//! end-to-end (headless): multi-account concurrent monitoring, the merged activity model,
 //! the four rollcall types + `on_call_fine`, the 15% gate, and the countdown/defer flow — all
 //! driven over the real FFI against the stateful fake TronClass.
 
@@ -53,7 +53,7 @@ fn send(handle: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(handle, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 
 fn start_fake() -> String {
@@ -113,10 +113,10 @@ fn signed(rollcall_id: &str, account: &str) -> impl Fn(&Value) -> bool {
 }
 
 #[test]
-fn slice2_multi_account_monitoring_and_four_types() {
+fn multi_account_monitoring_and_four_types() {
     let base_a = start_fake();
     let base_b = start_fake();
-    let data_dir = std::env::temp_dir().join(format!("tron-slice2-{}", new_id()));
+    let data_dir = std::env::temp_dir().join(format!("tron-monitoring-{}", new_id()));
     let data_dir = data_dir.to_string_lossy().replace('\\', "/");
 
     let h = crate::core_init(Some(collect));
@@ -141,9 +141,6 @@ fn slice2_multi_account_monitoring_and_four_types() {
         ),
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
-    let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
 
     // Four accounts: alice/bob on A (students), a teacher on A (for QR), carol on B.
     for (label, base, extra) in [
@@ -167,9 +164,9 @@ fn slice2_multi_account_monitoring_and_four_types() {
     let carol = account_id("carol").unwrap();
 
     let clock_id = next();
-    let clock = crate::test_support::apply_clock_command(
+    let clock = crate::e2e::support::apply_clock_command(
         clock_id,
-        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
+        crate::e2e::support::latest_monitoring_snapshot(&snapshot()).unwrap(),
     );
     send(h, &clock);
     wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
@@ -177,13 +174,13 @@ fn slice2_multi_account_monitoring_and_four_types() {
         let start_id = next();
         send(
             h,
-            &crate::test_support::start_account_command(start_id, account),
+            &crate::e2e::support::start_account_command(start_id, account),
         );
         wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     }
     for account in [&alice, &bob, &teacher, &carol] {
         wait_for(
-            |v| crate::test_support::event_account_login_state(v, account, "online"),
+            |v| crate::e2e::support::event_account_login_state(v, account, "online"),
             10,
         )
         .unwrap_or_else(|| panic!("{account} 未上線"));
@@ -386,7 +383,7 @@ fn slice2_multi_account_monitoring_and_four_types() {
     assert_eq!(missing["ok"], false);
 
     let i = next();
-    send(h, &crate::test_support::stop_all_command(i));
+    send(h, &crate::e2e::support::stop_all_command(i));
     wait_for(reply_ok(i), 5);
     unsafe { crate::core_free(h) };
 }

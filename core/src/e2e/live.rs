@@ -1,7 +1,7 @@
-//! Live real-server integration tests — the ultimate ground truth (docs 90; the fake is offline & self-authored).
+//! Live real-server integration tests — the ultimate ground truth.
 //! Every test is `#[ignore]`: they hit a REAL TronClass tenant + real LLM and only run when explicitly asked
 //! with credentials in the environment. NEVER hardcode secrets here — 憑證一律由執行者以下方 TRON_* 環境變數
-//! 提供（本 repo 不含 v1 的 scripts/_v2_*.py 輔助腳本；seed 與 cleanup 需以教師帳號手動進行，見各 phase 註解）。
+//! 提供（seed 與 cleanup 需以教師帳號手動進行，見各 phase 註解）。
 //!
 //! 執行方式：先設定下方 TRON_* 環境變數，再執行
 //!   cargo test --lib live_ -- --ignored --nocapture --test-threads=1
@@ -233,8 +233,6 @@ fn live_monitor_pipeline() {
         &serde_json::json!({"id":2,"cmd":"UpdateConfig","patch":{"attendance_gate_percent":0.0,"countdown_secs":2}}),
     );
     mon_wait(mon_reply_ok(2), 5).expect("UpdateConfig 未回覆 ok");
-    mon_send(h, &serde_json::json!({"id":3,"cmd":"CreateVault"}));
-    mon_wait(mon_reply_ok(3), 5).expect("CreateVault 未回覆 ok");
     mon_send(
         h,
         &serde_json::json!({"id":4,"cmd":"AddAccount","label":"stu","school":base,"username":user,"password":pass}),
@@ -246,21 +244,21 @@ fn live_monitor_pipeline() {
         .iter()
         .filter_map(|raw| serde_json::from_str(raw).ok())
         .collect::<Vec<_>>();
-    let account = crate::test_support::account_id(&events, "stu").expect("student account id");
-    let clock: serde_json::Value = serde_json::from_str(&crate::test_support::apply_clock_command(
+    let account = crate::e2e::support::account_id(&events, "stu").expect("student account id");
+    let clock: serde_json::Value = serde_json::from_str(&crate::e2e::support::apply_clock_command(
         5,
-        crate::test_support::latest_monitoring_snapshot(&events).unwrap(),
+        crate::e2e::support::latest_monitoring_snapshot(&events).unwrap(),
     ))
     .unwrap();
     mon_send(h, &clock);
     mon_wait(mon_reply_ok(5), 5).expect("ApplyScheduleClock 未回覆 ok");
     let start: serde_json::Value =
-        serde_json::from_str(&crate::test_support::start_account_command(6, &account)).unwrap();
+        serde_json::from_str(&crate::e2e::support::start_account_command(6, &account)).unwrap();
     mon_send(h, &start);
     mon_wait(mon_reply_ok(6), 15).expect("StartTarget 未回覆 ok");
 
     let online = mon_wait(
-        |v| crate::test_support::event_account_login_state(v, &account, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &account, "online"),
         25,
     )
     .expect("帳號未上線");

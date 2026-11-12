@@ -1,6 +1,6 @@
-//! School registry (docs 40). Logic vs data are separated: **no school literal lives in this
+//! School registry. Logic vs data are separated: **no school literal lives in this
 //! `.rs` file** — the factory seed is a bundled JSON data file (assets/providers.seed.json,
-//! generated from v1's schools.toml), and at runtime the source of truth is a copy in the user's
+//! the bundled school list), and at runtime the source of truth is a copy in the user's
 //! data dir. A school is just a `base_url`; every endpoint derives from it. The user can still add
 //! their own school in-UI or type a raw base_url (which `resolve` passes through verbatim).
 
@@ -29,7 +29,7 @@ pub struct Registry {
     pub schools: Vec<School>,
 }
 
-// Data, not code — keeps school names out of the binary's source (docs 40 / 90 §2).
+// Data, not code — keeps school names out of the binary's source.
 const FACTORY_SEED: &str = include_str!("../assets/providers.seed.json");
 
 /// 載入 registry 失敗的種類。**分開是為了安全，也為了可診斷**：
@@ -83,7 +83,7 @@ impl Registry {
     }
 
     /// Load the user's registry, seeding it from the factory on first run. Deleting the file
-    /// re-seeds it (docs 40: the on-disk copy is the single source of truth once written).
+    /// re-seeds it.
     pub fn load_or_seed(path: &Path) -> Result<Loaded, RegistryError> {
         match fs::read(path) {
             // serde 的錯誤本體刻意不帶出:它會逐字回吐檔案內容。只留下我們自己產生的隔離檔名。

@@ -602,7 +602,7 @@ pub(super) fn spawn_qr_remote(
 }
 
 /// Teacher opens its OWN qr rollcall as the rotating-`data` source; each student then signs THEIR own
-/// rollcall id on THEIR own endpoint with that data (docs 32). Because the token is valid only ~1–4 s,
+/// rollcall id on THEIR own endpoint with that data. Because the token is valid only ~1–4 s,
 /// this re-sources and re-sends every ~1.5 s for up to ~12 s until each student confirms. A session lost
 /// mid-flight is recovered once (teacher and per-student). Actor shutdown aborts this task at its
 /// next await point; the bounded abort-safe `QrCleanupGuard` still closes the teacher's data source.

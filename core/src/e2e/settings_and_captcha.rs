@@ -1,4 +1,4 @@
-//! Slice-4 tests (headless). Pure gates plus e2e over the FFI: settings persistence, captcha
+//! tests (headless). Pure gates plus e2e over the FFI: settings persistence, captcha
 //! login, SSO→cookie fallback routing, and platform-key unlock.
 
 use crate::fake;
@@ -87,7 +87,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -140,7 +140,7 @@ impl Drop for Harness {
 }
 fn data_dir(tag: &str) -> String {
     std::env::temp_dir()
-        .join(format!("tron-slice4-{tag}-{}", new_id()))
+        .join(format!("tron-settings-{tag}-{}", new_id()))
         .to_string_lossy()
         .replace('\\', "/")
 }
@@ -190,9 +190,6 @@ fn captcha_login_challenge_and_submit() {
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
 
     // Turn on the fake's captcha login page.
     post(
@@ -261,9 +258,6 @@ fn captcha_wrong_answer_fails() {
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     post(
         &base,
         "/_test/captcha",
@@ -308,9 +302,6 @@ fn sso_login_routes_to_cookie_fallback() {
         &format!(r#"{{"id":{i},"cmd":"Init","data_dir":"{dir}"}}"#),
     );
     wait_for(ok_reply(i), 10).expect("Init 未回覆 ok");
-    let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
     post(&base, "/_test/sso", r#"{"enabled":true}"#);
 
     let i = hz.next();
@@ -347,7 +338,7 @@ fn sso_login_routes_to_cookie_fallback() {
     wait_for(reply_ok(i), 5);
     assert!(
         wait_for(
-            |v| crate::test_support::event_account_login_state(v, &carol, "error"),
+            |v| crate::e2e::support::event_account_login_state(v, &carol, "error"),
             5
         )
         .is_some(),
@@ -378,9 +369,6 @@ fn schedule_closed_suppresses_monitoring() {
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
 
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
-    let i = hz.next();
     send(
         hz.h,
         &format!(
@@ -390,9 +378,9 @@ fn schedule_closed_suppresses_monitoring() {
     wait_for(ok_reply(i), 5).expect("AddAccount 未回覆 ok");
     let frank = account_id("frank").unwrap();
     let clock_id = hz.next();
-    let clock = crate::test_support::apply_clock_command(
+    let clock = crate::e2e::support::apply_clock_command(
         clock_id,
-        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
+        crate::e2e::support::latest_monitoring_snapshot(&snapshot()).unwrap(),
     );
     send(hz.h, &clock);
     wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
@@ -402,7 +390,7 @@ fn schedule_closed_suppresses_monitoring() {
         &format!(r#"{{"id":{login_id},"cmd":"Login","account_id":"{frank}"}}"#),
     );
     wait_for(
-        |v| crate::test_support::event_account_login_state(v, &frank, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &frank, "online"),
         10,
     )
     .expect("帳號未上線");
@@ -422,7 +410,7 @@ fn schedule_closed_suppresses_monitoring() {
     );
 
     let i = hz.next();
-    send(hz.h, &crate::test_support::stop_all_command(i));
+    send(hz.h, &crate::e2e::support::stop_all_command(i));
     wait_for(reply_ok(i), 5);
 }
 
@@ -486,11 +474,11 @@ fn boot_monitoring(tag: &str, gate: f64) -> (Harness, String) {
     let eve = account_id("eve").unwrap();
     let clock_id = hz.next();
     let start_id = hz.next();
-    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &eve);
+    crate::e2e::support::activate_account(hz.h, clock_id, start_id, &snapshot(), &eve);
     wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
     wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     wait_for(
-        |v| crate::test_support::event_account_login_state(v, &eve, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &eve, "online"),
         10,
     )
     .expect("帳號未上線");

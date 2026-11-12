@@ -27,7 +27,7 @@ pub(super) struct QuizActivity {
     pub(super) activity_token: String,
     pub(super) source: Source,
     pub(super) course: String,
-    pub(super) course_id: String, // R5: course the tool executor searches for materials
+    pub(super) course_id: String, // course the tool executor searches for materials
     pub(super) activity_id: String,
     pub(super) stem: String, // homework question stem, from the detection payload
     pub(super) attempts: HashMap<String, PerAccountAttempt>,
@@ -1013,7 +1013,7 @@ pub(super) fn spawn_submit(env: &Env, key: &ActivityKey, job: SubmitJob) {
             {
                 Ok((sid, retake)) => {
                     // resubmit gate: EXAM + pref + the SUBMIT RESPONSE's allow_retake_exam + a submission
-                    // id (v1 answer_flow.py:456) — a single-attempt exam must not burn its one graded attempt.
+                    // id — a single-attempt exam must not burn its one graded attempt.
                     if resubmit && retake && !sid.is_empty() {
                         let correction =
                             answer::resubmit_correct(&acc.client, &ep, &activity_id, &sid).await;
@@ -1027,8 +1027,8 @@ pub(super) fn spawn_submit(env: &Env, key: &ActivityKey, job: SubmitJob) {
                 Err(error) => Err(submit_failure(error)),
             },
             Source::ClassroomExam => {
-                // per-subject POST with the full exam wrapper (flat body → 400). ponytail: v1 also gates
-                // on the server's started_subjects_count≥1 (R2.5); here each answered subject is posted.
+                // per-subject POST with the full exam wrapper (flat body → 400). the server also gates
+                // on the server's started_subjects_count≥1; here each answered subject is posted.
                 submit_classroom(
                     &acc,
                     &ep,

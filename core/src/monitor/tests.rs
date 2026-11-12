@@ -179,7 +179,7 @@ fn exam_answerable_gates_iso_expiry_and_absent_started() {
         &json!({"is_started": true, "is_closed": false, "end_time": "2000-01-01T00:00:00Z"}),
         now
     ));
-    // absent is_started → v1 treats as not-started → skip.
+    // absent is_started → treated as not started → skip.
     assert!(!exam_answerable(
         &json!({"end_time": "2099-01-01T00:00:00Z"}),
         now

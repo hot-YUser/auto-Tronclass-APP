@@ -158,7 +158,7 @@ pub async fn read_number_code(client: &Client, ep: &Endpoints, id: &str) -> Opti
     number_code_from_payload(&v)
 }
 
-/// Coerce one JSON value into a 4-digit code (v1 `coerce_number_code`). The real server exposes
+/// Coerce one JSON value into a 4-digit code. The real server exposes
 /// `number_code` as a STRING **or an INT** — an int `123` is the code `"0123"` — so reading it only as
 /// a string (the old code) returned None on every int tenant and fell to a needless brute-force.
 fn coerce_number_code(v: &Value) -> Option<String> {
@@ -174,7 +174,7 @@ fn coerce_number_code(v: &Value) -> Option<String> {
     (text.len() == 4 && text.bytes().all(|b| b.is_ascii_digit())).then_some(text)
 }
 
-/// Pull a 4-digit `number_code` out of a student_rollcalls-style payload (v1 `parse_number_code_payload`).
+/// Pull a 4-digit `number_code` out of a student_rollcalls-style payload.
 /// Robust to the observed shapes: top-level `{number_code}`, `{data:{number_code}}`, a
 /// `student_rollcalls`/`data` array of student items, or a bare list of them.
 fn number_code_from_payload(payload: &Value) -> Option<String> {
@@ -209,7 +209,7 @@ fn number_code_from_payload(payload: &Value) -> Option<String> {
     }
 }
 
-/// Confirm the account is actually marked present after a sign (v1 `confirmed_present`). Confirmed iff
+/// Confirm the account is actually marked present after a sign. Confirmed iff
 /// **my_present** (the caller's own `user_no` entry is present), **or** the whole class is present
 /// (present==total), **or** the top-level status is present. NEVER "any entry" — that would mask the
 /// caller's own sign failure whenever a classmate is present. Empty `user_no` skips my_present.
@@ -271,7 +271,7 @@ pub fn classify_response(status: u16, body: &str) -> CodeResult {
     CodeResult::Ambiguous
 }
 
-// Number-answer body markers (v1 `number_rollcall`), matched case-insensitively against body+message.
+// Number-answer body markers, matched case-insensitively against body+message.
 const UNAUTHORIZED_MARKERS: &[&str] = &[
     "unauthorized",
     "forbidden",
@@ -350,7 +350,7 @@ fn classify_number_2xx(body: &str) -> CodeResult {
     CodeResult::Ambiguous
 }
 
-/// The human message a payload carries (v1 `_payload_message`) — the first non-empty of these keys.
+/// The human message a payload carries — the first non-empty of these keys.
 fn payload_message(p: &Value) -> String {
     [
         "message",
@@ -377,7 +377,7 @@ fn has_marker(text_lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| text_lower.contains(m))
 }
 
-/// The token every sign type's auth-lost `Err` carries, so `is_auth_lost` recognises it (R4.1 #2).
+/// The token every sign type's auth-lost `Err` carries, so `is_auth_lost` recognises it.
 pub const SESSION_INVALID: &str = "session invalid";
 
 /// The URL half of the auth-lost decision: a final URL that landed on a login page. ONE shared
@@ -420,7 +420,7 @@ pub fn is_auth_lost(err: &str) -> bool {
 }
 
 /// number: submit the shared code once (classified), or brute-force it. Success is the response
-/// success flag — not just a recheck (rollcall.rs §3). Returns the winning code so it can be shared.
+/// success flag — not just a recheck. Returns the winning code so it can be shared.
 /// An `Ambiguous` (submitted-unconfirmed) 2xx never tries another code: it runs the bounded
 /// `on_call_fine` recheck once and, if still unconfirmed, surfaces `submitted_unconfirmed` without
 /// retrying the mutation. Explicit `Wrong` still advances; explicit `Success` still requires confirmation.
@@ -580,7 +580,7 @@ pub async fn sign_radar(
     for strat in strategies {
         match strat.as_str() {
             "empty_answer" => {
-                // Empty main path (rollcall.rs / radar.rs §1): plain `{}`, no api_version, no beacon.
+                // Empty main path (rollcall.rs / radar.rs): plain `{}`, no api_version, no beacon.
                 let resp = client
                     .put(ep.answer_radar(id))
                     .json(&json!({}))
@@ -615,10 +615,10 @@ pub async fn sign_radar(
     Err(last_err)
 }
 
-/// `global_wgs84` = the radar.rs §11 driver (steps 1-5): `lite` (no coords) → probe the 12 earth-scale
+/// `global_wgs84` = the radar.rs driver (steps 1-5): `lite` (no coords) → probe the 12 earth-scale
 /// anchors → `solve_global_radar` → standard sampling rings → refined estimate. Any submit that lands
-/// in scope (HTTP 2xx, no error_code) is a hit → recheck → sign. ponytail: steps 6-7 (supplement
-/// rings / unbounded chessboard grid / rate-limit cooldown) + concurrent anchor probing are R2.5.
+/// in scope (HTTP 2xx, no error_code) is a hit → recheck → sign. steps 6-7 (supplement
+/// rings / unbounded chessboard grid / rate-limit cooldown) + concurrent anchor probing are not implemented.
 async fn radar_solve_and_sign(
     client: &Client,
     ep: &Endpoints,
@@ -668,7 +668,7 @@ async fn radar_solve_and_sign(
     match radar_probe(client, ep, id, est2, device_id, beacon).await {
         ProbeOutcome::AuthLost => Err(format!("radar probe: {SESSION_INVALID}")),
         ProbeOutcome::InRange => radar_confirm(client, ep, id, user_no).await,
-        _ => Err("radar: estimate not within scope (supplement/grid deferred to R2.5)".into()),
+        _ => Err("radar: estimate not within scope".into()),
     }
 }
 
@@ -688,7 +688,7 @@ async fn radar_confirm(
     }
 }
 
-/// `lite` (radar.rs §1): carries NO target coordinate — only `use_beacon` + `beacon_nonce`.
+/// `lite`: carries NO target coordinate — only `use_beacon` + `beacon_nonce`.
 async fn radar_lite(client: &Client, ep: &Endpoints, id: &str) -> (bool, String) {
     let v: Value = match client.get(ep.lite(id)).send().await {
         Ok(r) => crate::http::read_bounded_json(r, crate::http::MAX_API_JSON, "radar lite")
@@ -715,7 +715,7 @@ enum ProbeOutcome {
     NoInfo,
 }
 
-/// Submit one coordinate answer (radar.rs §1 body) and classify the response.
+/// Submit one coordinate answer and classify the response.
 async fn radar_probe(
     client: &Client,
     ep: &Endpoints,
@@ -758,9 +758,9 @@ async fn radar_probe(
     parse_scope(status, &text)
 }
 
-/// radar.rs §1 distance extraction — **error_code first, regardless of status** (a real server returns
+/// radar.rs distance extraction — **error_code first, regardless of status** (a real server returns
 /// out-of-scope as `200 + error_code`; a status-first check would misread every off-target anchor as
-/// in-range → no distances → the solver never runs → radar fully dead; exact status is a §12 unknown).
+/// in-range → no distances → the solver never runs → radar fully dead; exact status is unknown).
 fn parse_scope(status: u16, body: &str) -> ProbeOutcome {
     let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
     if has_scope_error(&v) {
@@ -775,7 +775,7 @@ fn parse_scope(status: u16, body: &str) -> ProbeOutcome {
     ProbeOutcome::NoInfo
 }
 
-/// Nested walk (radar.rs §1): body; if dict, descend keys `data,result,error,errors,scope,rollcall`;
+/// Nested walk: body; if dict, descend keys `data,result,error,errors,scope,rollcall`;
 /// if list, first 3 elements. Collect the dicts to inspect (bounded depth).
 fn walk_dicts<'a>(v: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>>, depth: u32) {
     if depth > 6 {
@@ -822,7 +822,7 @@ fn extract_distance(v: &Value) -> Option<f64> {
     None
 }
 
-/// beacon signature (radar.rs §1): `md5(nonce+deviceId+userId+ts) + "," + ts`. ts = unix seconds.
+/// beacon signature: `md5(nonce+deviceId+userId+ts) + "," + ts`. ts = unix seconds.
 fn radar_signature(nonce: &str, device_id: &str, user_no: &str, ts: i64) -> String {
     use md5::{Digest, Md5};
     let mut h = Md5::new();
@@ -906,7 +906,7 @@ async fn qr_roster_preflight(
 }
 
 /// qr teacher-assist: `data` sourced from the TEACHER's own qr rollcall is submitted to the
-/// STUDENT's real `student_rollcall_id` (docs 32 — the token is portable; teacher rollcall is only
+/// STUDENT's real `student_rollcall_id` (the token is portable; teacher rollcall is only
 /// the data source, never the sign target). An authoritative `student_rollcalls` preflight is
 /// performed immediately before the PUT: if the roster already marks the monitored user
 /// `on_call_fine`, return `qr(already-present)` with ZERO PUT; otherwise emit exactly one PUT

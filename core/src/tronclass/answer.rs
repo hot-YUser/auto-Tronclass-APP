@@ -1,4 +1,4 @@
-//! Auto-answer flow helpers (docs 31): fetch a paper, build the LLM prompt, parse the answer, detect
+//! Auto-answer flow helpers: fetch a paper, build the LLM prompt, parse the answer, detect
 //! an account's existing answer, and build the **exact per-source submission body**. The orchestration
 //! (prepare → conflict → countdown → submit) lives in `monitor.rs`; the network + pure builders live here.
 //!
@@ -38,7 +38,7 @@ impl Source {
     }
 }
 
-/// Re-ask correction (docs 31 R3b) — verbatim; sent as the user turn after threading the bad reply.
+/// Re-ask correction — verbatim; sent as the user turn after threading the bad reply.
 const CORRECTION_PROMPT: &str = "Your previous reply could not be used as an answer. Answer this question NOW in the exact required format: for multiple choice reply ONLY the option LETTER(S) (e.g. B or A,C) — never the option text; for fill-in give the blank text (multiple blanks separated by ' ||| '); for open questions a short direct answer. Do NOT explain, and NEVER leave it blank.";
 
 pub struct Paper {
@@ -46,7 +46,7 @@ pub struct Paper {
     pub subjects: Vec<Value>,
 }
 
-/// Fetch the paper for an activity, per the family's real contract (docs 31). exam/classroom/
+/// Fetch the paper for an activity, per the family's real contract. exam/classroom/
 /// questionnaire use their own `distribute` segment; courseware its subjects endpoint — all four run
 /// `quiz::flatten_paper`. vote synthesizes subjects from `vote_option_items`; homework synthesizes one
 /// `short_answer` from the stem. `stem` is the activity's raw description (from detection), if any.
@@ -165,7 +165,7 @@ pub async fn shared_answers(
     max_reask: u32,
     prior: &std::collections::HashMap<String, Answer>,
 ) -> std::collections::HashMap<String, Answer> {
-    // Seed with answers already resolved on an earlier prepare (R3c re-prepare) — a still-missing
+    // Seed with answers already resolved on an earlier prepare — a still-missing
     // subject is re-asked; a leaked answer (Replay) still overwrites (authoritative).
     let mut answers = prior.clone();
     for plan in quiz::decide_paper(subjects) {
@@ -182,7 +182,7 @@ pub async fn shared_answers(
                     .iter()
                     .find(|s| quiz::subject_id(s) == plan.subject_id)
                 {
-                    // R5: build the user content ONCE per subject (may fetch + base64 images) and reuse it
+                    // build the user content ONCE per subject (may fetch + base64 images) and reuse it
                     // on every re-ask — never re-download/re-encode a subject's images per attempt.
                     let user_content =
                         build_user_content(school, llm_client, base_url, subject).await;
@@ -194,7 +194,7 @@ pub async fn shared_answers(
                         });
                     let mut last_reply = String::new();
                     for attempt in 0..max_reask.max(1) {
-                        // Non-accumulating (v1): each re-ask is a fresh, bounded list carrying ONLY the
+                        // Non-accumulating: each re-ask is a fresh, bounded list carrying ONLY the
                         // most recent bad reply — a growing "wrong again" chain degrades reasoning models.
                         let messages = if attempt == 0 {
                             vec![json!({ "role": "user", "content": user_content.clone() })]
@@ -235,7 +235,7 @@ pub async fn shared_answers(
 }
 
 /// The ids of every non-`Skip` subject (per `decide_paper`) absent from `answers`. Empty ⇒ the paper is
-/// fully answered and ready to submit — the R3c all-or-nothing gate (never submit a half-paper).
+/// fully answered and ready to submit — the all-or-nothing gate (never submit a half-paper).
 pub fn missing_subjects(
     subjects: &[Value],
     answers: &std::collections::HashMap<String, Answer>,
@@ -247,7 +247,7 @@ pub fn missing_subjects(
         .collect()
 }
 
-/// User content (docs 31 R3b): stem + each option `<LETTER>. <content>` (letters, no ids); for
+/// User content: stem + each option `<LETTER>. <content>` (letters, no ids); for
 /// fill/cloze a blank-count hint. short_answer = stem only. The SYSTEM_PROMPT does the rest.
 fn build_prompt(subject: &Value) -> String {
     let mut p = quiz::clean_html(quiz::stem(subject));
@@ -271,7 +271,7 @@ fn build_prompt(subject: &Value) -> String {
     p
 }
 
-/// R5 multimodal: the user message content. A plain string unless the subject's stem or an option carries
+/// multimodal: the user message content. A plain string unless the subject's stem or an option carries
 /// `<img>`, in which case a parts list `[{text}, {image_url:data-url}, …]` (dedup, cap 5) so the model can
 /// see the image. Each img: a `data:` url passes through; else a SAFE fetch → base64. A fetch that
 /// fails or violates the URL policy is DROPPED — never sent to the model as its raw URL (that would
@@ -376,7 +376,7 @@ async fn to_data_url(
 
 /// Map the LLM reply back to a concrete answer for the subject's type (delegates to the pure quiz
 /// parsers). single_selection/true_or_false keep one option; multiple_selection + a degenerate
-/// matching keep all (v1); blanks split on ' ||| '; short_answer verbatim.
+/// matching keep all; blanks split on ' ||| '; short_answer verbatim.
 fn parse_answer(subject: &Value, qtype: &str, text: &str) -> Option<Answer> {
     match qtype {
         "single_selection" | "true_or_false" | "multiple_selection" | "matching" => {
@@ -420,7 +420,7 @@ pub fn existing_answer(subject: &Value) -> Option<Answer> {
         .map(|s| Answer::Text(s.to_string()))
 }
 
-// --- pure per-source submission bodies (unit-tested; shapes are docs 31 + corrections) ---
+// --- pure per-source submission bodies (unit-tested; shapes as real tenants accept them) ---
 
 /// One subject's answer as an exam-wrapper subject entry (verbatim). Adds `parent_id` for a flattened
 /// matching sub; fill/cloze blanks → `answers:[{sort,content}]` (0-based sort, first pass).
@@ -496,7 +496,7 @@ pub fn homework_body(text: &str) -> Value {
 }
 
 /// Submit an exam; return `(submission_id, allow_retake_exam)` — both from the response (the retake
-/// flag gates the resubmit-for-correct pass; docs 31 / v1 answer_flow.py:456).
+/// flag gates the resubmit-for-correct pass; the submit response).
 pub async fn submit_exam(
     client: &Client,
     ep: &Endpoints,
@@ -522,7 +522,7 @@ pub async fn submit_exam(
     )
     .await?;
     // submission_id comes back as an INTEGER (e.g. 681504) — reading it as_str gave "" and disabled the
-    // resubmit-for-correct pass; accept int OR string, with the v1 `id` fallback (confirmed live 2026-07).
+    // resubmit-for-correct pass; accept int OR string, with `id` as the fallback.
     let sid = json::id_at(&v, &["submission_id", "id"]).unwrap_or_default();
     if sid.is_empty() {
         return Err("submit exam: response missing submission_id".to_string());
@@ -534,7 +534,7 @@ pub async fn submit_exam(
     Ok((sid, retake))
 }
 
-/// Resubmit for full marks (docs 31 / v1 answer_flow.py:499-523): read `correct_answers_data.correct_answers`
+/// Resubmit for full marks: read `correct_answers_data.correct_answers`
 /// from the review FIRST — a fresh distribute MINTS a new retake instance, so a missing or EMPTY
 /// review errors out before any distribute and can never consume a retake. Only with a confirmed
 /// review does it **re-distribute** for the fresh `exam_paper_instance_id` (the original 400s) and
@@ -622,7 +622,7 @@ fn overlay_entry(subject: &Value, review: &Value) -> Option<Value> {
         }
     }
     if !set {
-        // review blanks: keep the server's RAW sort (v1 answer_flow.py:511).
+        // review blanks: keep the server's RAW sort.
         if let Some(arr) = review
             .get("answers")
             .or_else(|| review.get("correct_answers"))

@@ -1,4 +1,4 @@
-//! Slice-3 end-to-end (headless): detect an exam → prepare (fake LLM, streamed reasoning) → per-account
+//! end-to-end (headless): detect an exam → prepare (fake LLM, streamed reasoning) → per-account
 //! conflict → SetAnswer → countdown → auto-submit, over the FFI. Also proves LLM runs **once** per
 //! activity (shared) even with two accounts, and that a blank/failed LLM subject is never submitted.
 
@@ -45,7 +45,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn submitted(quiz_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (q, a) = (quiz_id.to_string(), account.to_string());
@@ -84,9 +84,9 @@ fn post(base_url: &str, path: &str, body: &str) -> String {
 }
 
 #[test]
-fn slice3_quiz_prepare_conflict_and_submit() {
+fn quiz_prepare_conflict_and_submit() {
     let base = start_fake();
-    let data_dir = std::env::temp_dir().join(format!("tron-slice3-{}", new_id()));
+    let data_dir = std::env::temp_dir().join(format!("tron-quiz-{}", new_id()));
     let data_dir = data_dir.to_string_lossy().replace('\\', "/");
     let h = crate::core_init(Some(collect));
     let mut id = 0u64;
@@ -111,9 +111,6 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     );
     wait_for(reply_ok(i), 5);
     let i = next();
-    send(h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(reply_ok(i), 5);
-    let i = next();
     send(
         h,
         &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"fake-key"}}"#),
@@ -134,9 +131,9 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     let bob = account_id("bob").unwrap();
 
     let clock_id = next();
-    let clock = crate::test_support::apply_clock_command(
+    let clock = crate::e2e::support::apply_clock_command(
         clock_id,
-        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
+        crate::e2e::support::latest_monitoring_snapshot(&snapshot()).unwrap(),
     );
     send(h, &clock);
     assert!(wait_for(reply_ok(clock_id), 5).is_some());
@@ -144,11 +141,11 @@ fn slice3_quiz_prepare_conflict_and_submit() {
         let start_id = next();
         send(
             h,
-            &crate::test_support::start_account_command(start_id, account),
+            &crate::e2e::support::start_account_command(start_id, account),
         );
         assert!(wait_for(reply_ok(start_id), 15).is_some());
         wait_for(
-            |v| crate::test_support::event_account_login_state(v, account, "online"),
+            |v| crate::e2e::support::event_account_login_state(v, account, "online"),
             10,
         );
     }
@@ -271,7 +268,7 @@ fn slice3_quiz_prepare_conflict_and_submit() {
     );
 
     let i = next();
-    send(h, &crate::test_support::stop_all_command(i));
+    send(h, &crate::e2e::support::stop_all_command(i));
     wait_for(reply_ok(i), 5);
     unsafe { crate::core_free(h) };
 }

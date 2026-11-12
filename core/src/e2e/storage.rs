@@ -1,4 +1,4 @@
-//! Offline slice-1 unit tests: vault crypto, registry resolution, config CRUD, and login
+//! Offline unit tests: vault crypto, registry resolution, config CRUD, and login
 //! feature-detection. The end-to-end login-over-the-seam test lives in `seam_test.rs`.
 
 use crate::store::config::{new_id, AccountMeta, Config};
@@ -8,7 +8,7 @@ use crate::tronclass::Endpoints;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     // A per-test path under the OS temp dir; unique via a CSPRNG id so tests don't collide.
-    std::env::temp_dir().join(format!("tron-slice1-{}-{}", name, new_id()))
+    std::env::temp_dir().join(format!("tron-storage-{}-{}", name, new_id()))
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn registry_resolves_key_alias_and_raw_url() {
 #[test]
 fn factory_registry_seeds_tronclass_schools() {
     let reg = Registry::factory();
-    // Seeded from v1 schools.toml — all list-or-none (school equality): a broad set, not a curated few.
+    // The seed list: all list-or-none (school equality): a broad set, not a curated few.
     assert!(
         reg.schools.len() >= 30,
         "expected the full TronClass school seed, got {}",
@@ -255,7 +255,7 @@ fn detect_login_kind_classifies_fixtures() {
         }
         other => panic!("expected Captcha, got {other:?}"),
     }
-    // R4-C: "captcha" in page COPY but the form has NO captcha field → plain PasswordForm, not Captcha
+    // "captcha" in page COPY but the form has NO captcha field → plain PasswordForm, not Captcha
     // (the whole-page substring used to wrongly block schools whose form is just username+password).
     let copy_only = r#"<html><body><p>No captcha needed — just sign in.</p>
         <form action="/login" method="post">
@@ -271,7 +271,7 @@ fn detect_login_kind_classifies_fixtures() {
         "captcha in copy without a captcha field must NOT be the captcha branch"
     );
 
-    // R4-C: every named input is echoed on POST, not only type=hidden (some CAS/Keycloak themes render
+    // every named input is echoed on POST, not only type=hidden (some CAS/Keycloak themes render
     // the token as a visible input).
     let visible_token = r#"<html><body>
         <form action="/login" method="post">

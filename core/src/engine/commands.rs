@@ -87,14 +87,6 @@ fn handle(st: Option<&mut CoreState>, cb: EventCb, id: u64, command: Command) ->
             }
             Ok(Reply::Done)
         }
-        // The vault opens with the device key at Init. These remain only so an older host's
-        // start-up sequence still completes.
-        (Command::CreateVault { .. } | Command::Unlock { .. }, st) => {
-            match st.is_some_and(|st| st.vault.is_some()) {
-                true => Ok(Reply::Done),
-                false => Err("vault not ready".into()),
-            }
-        }
         (command, Some(st)) => run(st, cb, id, command),
         (command, None) => Err(uninitialized(&command).into()),
     }
@@ -266,10 +258,9 @@ fn run(st: &mut CoreState, cb: EventCb, id: u64, command: Command) -> Handled {
             account_id, text, ..
         } => session::submit_captcha(st, &account_id, text),
 
-        Command::Init { .. }
-        | Command::Shutdown { .. }
-        | Command::CreateVault { .. }
-        | Command::Unlock { .. } => unreachable!("handled before the state is needed"),
+        Command::Init { .. } | Command::Shutdown { .. } => {
+            unreachable!("handled before the state is needed")
+        }
         Command::Login { .. }
         | Command::ImportCookies { .. }
         | Command::ListCommonCourses { .. } => unreachable!("handled asynchronously"),

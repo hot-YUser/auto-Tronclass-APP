@@ -1,5 +1,5 @@
-//! R4 + R3c e2e: per-family detection & gates, session-expiry re-login, SSO-redirect login urljoin,
-//! and the R3c all-or-nothing prepare gate (retry-success / persistent-error / empty-closed). Drives
+//! per-family detection & gates, session-expiry re-login, SSO-redirect login urljoin,
+//! and the all-or-nothing prepare gate (retry-success / persistent-error / empty-closed). Drives
 //! everything over the FFI against the real-contract fake. Serialized via `SEQ` (shared global events).
 
 use crate::fake;
@@ -53,7 +53,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -95,7 +95,7 @@ impl Drop for Harness {
         unsafe { crate::core_free(self.h) };
     }
 }
-/// Boot one account monitoring. `budget`/`reask` tune the R3c retry loop; poll cadences are fast.
+/// Boot one account monitoring. `budget`/`reask` tune the retry loop; poll cadences are fast.
 fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
     events().lock().unwrap().clear();
     let mut hz = Harness {
@@ -121,9 +121,6 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
-    let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
@@ -140,11 +137,11 @@ fn boot(tag: &str, base: &str, budget: u64, reask: u32) -> (Harness, String) {
     let dave = account_id("dave").unwrap();
     let clock_id = hz.next();
     let start_id = hz.next();
-    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    crate::e2e::support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
     wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
     wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     wait_for(
-        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &dave, "online"),
         10,
     )
     .expect("帳號未上線");
@@ -220,7 +217,7 @@ fn per_family_detection_and_gates() {
         "/_test/open_quiz",
         r#"{"activity_id":"EMPTY1","course_id":"C1","source":"exam","subjects":[]}"#,
     );
-    // ISO end_time in the past, not yet is_closed → v1 time-expiry gate → not answerable.
+    // ISO end_time in the past, not yet is_closed → time-expiry gate → not answerable.
     post(
         &base,
         "/_test/open_quiz",
@@ -258,7 +255,7 @@ fn per_family_detection_and_gates() {
     drop(hz);
 }
 
-/// SSO-redirect login (R4-C urljoin): `/login` 302s to `/sso/login-page` whose form action is RELATIVE
+/// SSO-redirect login: `/login` 302s to `/sso/login-page` whose form action is RELATIVE
 /// (`authenticate`). Only a correct urljoin posts to `/sso/authenticate` → session established → online.
 /// A base-join would post to `/authenticate` (404) → login fails → never online.
 #[test]
@@ -268,13 +265,13 @@ fn sso_redirect_login_resolves_relative_action() {
     post(&base, "/_test/sso_redirect", r#"{"enabled":true}"#); // target activation logs in
     let (hz, dave) = boot("sso", &base, 30, 1);
     assert!(
-        any(|v| crate::test_support::event_account_login_state(v, &dave, "online")),
+        any(|v| crate::e2e::support::event_account_login_state(v, &dave, "online")),
         "SSO relative-action login came online"
     );
     drop(hz);
 }
 
-/// Session-expiry auto re-login (R4-D): after the session is invalidated mid-run, the poll canary sees
+/// Session-expiry auto re-login: after the session is invalidated mid-run, the poll canary sees
 /// the 200-login-page, re-logins, and the account recovers to online (not stuck offline).
 #[test]
 fn session_expiry_recovers_to_online() {
@@ -285,7 +282,7 @@ fn session_expiry_recovers_to_online() {
     post(&base, "/_test/expire", r#"{"expired":true}"#);
     assert!(
         wait_for(
-            |v| crate::test_support::event_account_login_state(v, &dave, "online"),
+            |v| crate::e2e::support::event_account_login_state(v, &dave, "online"),
             20
         )
         .is_some(),
@@ -294,7 +291,7 @@ fn session_expiry_recovers_to_online() {
     drop(hz);
 }
 
-/// R4.1 #5: the poll canary recovers from a 401 and from a redirect-to-login (not just the inline
+/// the poll canary recovers from a 401 and from a redirect-to-login (not just the inline
 /// 200-login-page mode already covered) — each re-logins back to online.
 fn expiry_mode_recovers(tag: &str, mode: &str) {
     let base = start_fake();
@@ -307,7 +304,7 @@ fn expiry_mode_recovers(tag: &str, mode: &str) {
     );
     assert!(
         wait_for(
-            |v| crate::test_support::event_account_login_state(v, &dave, "online"),
+            |v| crate::e2e::support::event_account_login_state(v, &dave, "online"),
             20
         )
         .is_some(),
@@ -326,7 +323,7 @@ fn expiry_redirect_recovers_to_online() {
     expiry_mode_recovers("expredir", "redirect");
 }
 
-/// R4.1 stale-offline: a transient 503 blip flips the badge to offline; when polling succeeds again the
+/// a transient 503 blip flips the badge to offline; when polling succeeds again the
 /// poller edge-triggers back to online (the old code emitted offline but never re-emitted online).
 #[test]
 fn transient_down_then_ok_clears_stale_offline() {
@@ -337,7 +334,7 @@ fn transient_down_then_ok_clears_stale_offline() {
     post(&base, "/_test/down", r#"{"enabled":true}"#);
     assert!(
         wait_for(
-            |v| crate::test_support::event_account_login_state(v, &dave, "error"),
+            |v| crate::e2e::support::event_account_login_state(v, &dave, "error"),
             3
         )
         .is_none(),
@@ -364,7 +361,7 @@ fn transient_down_then_ok_clears_stale_offline() {
     drop(hz);
 }
 
-/// R3c retry-success: the LLM returns empty on the first call then succeeds. With max_reask=1, prepare #1
+/// retry-success: the LLM returns empty on the first call then succeeds. With max_reask=1, prepare #1
 /// leaves the subject unanswered → re-prepare → prepare #2 answers it → the WHOLE paper submits.
 #[test]
 fn r3c_retry_then_whole_paper_submits() {
@@ -388,7 +385,7 @@ fn signed_in(rc: &str) -> impl Fn(&Value) -> bool + '_ {
     move |v| v["event"] == "SignedIn" && v["rollcall_id"] == rc
 }
 
-/// R4.1 #2: a session that dies EXACTLY during a sign (poll/detect stay healthy) must not silently lose
+/// a session that dies EXACTLY during a sign (poll/detect stay healthy) must not silently lose
 /// the rollcall — after re-login the same account is re-signed → `SignedIn`. Covers number, radar, and
 /// self_registration (each sign kind now flags auth-lost via the shared `response_auth_lost`).
 fn sign_time_expiry_recovers(tag: &str, open_json: &str, rc: &str) {
@@ -430,7 +427,7 @@ fn sign_time_expiry_self_reg_recovers() {
     );
 }
 
-/// R4.1 #2 double-sign guard: two accounts on one rollcall — A signs OK, B's session expires during its
+/// two accounts on one rollcall — A signs OK, B's session expires during its
 /// sign. After B re-logins, ONLY B is re-signed (A stays signed exactly once, never double-signed).
 #[test]
 fn double_sign_guard_only_reauthed_account_resigns() {
@@ -461,18 +458,17 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         r#"{"id":2,"cmd":"UpdateConfig","patch":{"countdown_secs":2,"quiz_detect_secs":1,"poll_idle_secs":1,"prepare_retry_budget_secs":30}}"#,
         "UpdateConfig",
     );
-    step(&mut hz, r#"{"id":3,"cmd":"CreateVault"}"#, "CreateVault");
     step(
         &mut hz,
         &format!(
-            r#"{{"id":4,"cmd":"AddAccount","label":"acctA","school":"{base}","username":"aa","password":"secret"}}"#
+            r#"{{"id":3,"cmd":"AddAccount","label":"acctA","school":"{base}","username":"aa","password":"secret"}}"#
         ),
         "AddAccount(acctA)",
     );
     step(
         &mut hz,
         &format!(
-            r#"{{"id":5,"cmd":"AddAccount","label":"acctB","school":"{base}","username":"bb","password":"secret"}}"#
+            r#"{{"id":4,"cmd":"AddAccount","label":"acctB","school":"{base}","username":"bb","password":"secret"}}"#
         ),
         "AddAccount(acctB)",
     );
@@ -484,9 +480,9 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         r#"{"enabled":true,"user":"bb"}"#,
     ); // only B's signs expire
     let clock_id = hz.next();
-    let clock = crate::test_support::apply_clock_command(
+    let clock = crate::e2e::support::apply_clock_command(
         clock_id,
-        crate::test_support::latest_monitoring_snapshot(&snapshot()).unwrap(),
+        crate::e2e::support::latest_monitoring_snapshot(&snapshot()).unwrap(),
     );
     send(hz.h, &clock);
     wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
@@ -494,7 +490,7 @@ fn double_sign_guard_only_reauthed_account_resigns() {
         let start_id = hz.next();
         send(
             hz.h,
-            &crate::test_support::start_account_command(start_id, account),
+            &crate::e2e::support::start_account_command(start_id, account),
         );
         wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     }
@@ -521,7 +517,7 @@ fn double_sign_guard_only_reauthed_account_resigns() {
     drop(hz);
 }
 
-/// R3c persistent-unanswerable: the LLM never answers. Within the (short) retry budget the paper is NEVER
+/// persistent-unanswerable: the LLM never answers. Within the (short) retry budget the paper is NEVER
 /// submitted; at the deadline exactly one `quiz_unanswerable` Error is emitted.
 #[test]
 fn r3c_persistent_unanswerable_errors_no_submit() {

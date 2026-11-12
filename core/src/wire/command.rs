@@ -100,12 +100,6 @@ pub enum Command {
         #[serde(default)]
         device_key_b64: Option<Secret>,
     },
-    CreateVault {
-        id: u64,
-    },
-    Unlock {
-        id: u64,
-    },
     AddAccount {
         id: u64,
         label: String,
@@ -261,8 +255,6 @@ impl Command {
     pub fn id(&self) -> u64 {
         match self {
             Self::Init { id, .. }
-            | Self::CreateVault { id }
-            | Self::Unlock { id }
             | Self::AddAccount { id, .. }
             | Self::DeleteAccount { id, .. }
             | Self::Login { id, .. }

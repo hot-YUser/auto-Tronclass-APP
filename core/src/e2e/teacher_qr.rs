@@ -1,5 +1,5 @@
 //! QR teacher-assist across two INDEPENDENT fake TronClass endpoints (teacher on one host, student on
-//! another). Locks in the fixes ported from PR #1:
+//! another). Locks in the following:
 //!   * the student signs on ITS OWN endpoint (not the teacher's), and a cross-tenant teacher is a valid
 //!     data source (the token is portable), so a teacher on `base_a` assists a rollcall on `base_b`;
 //!   * a session lost mid-flight is recovered once on BOTH sides (teacher source + student sign);
@@ -45,7 +45,7 @@ fn send(handle: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(handle, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn signed(rollcall_id: &str, account: &str) -> impl Fn(&Value) -> bool {
     let (account, rollcall_id) = (account.to_string(), rollcall_id.to_string());
@@ -123,7 +123,6 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
 
         cmd(format!(r#""cmd":"Init","data_dir":"{data_dir}""#));
         cmd(r#""cmd":"UpdateConfig","patch":{"countdown_secs":1,"poll_idle_secs":1}"#.to_string());
-        cmd(r#""cmd":"CreateVault""#.to_string());
         // Teacher lives on teacher_base; the monitored student lives on a DIFFERENT host.
         cmd(format!(
             r#""cmd":"AddAccount","label":"teacher","school":"{teacher_base}","username":"teacher","password":"secret","is_teacher":true,"course_id":"C1""#
@@ -146,7 +145,7 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
     .is_some());
     let clock_id = id + 2;
     let start_id = id + 3;
-    crate::test_support::activate_account(h, clock_id, start_id, &snapshot(), &student);
+    crate::e2e::support::activate_account(h, clock_id, start_id, &snapshot(), &student);
     assert!(wait_for(
         move |v| v["event"] == "Reply" && v["id"] == clock_id && v["ok"] == true,
         5
@@ -159,7 +158,7 @@ fn teacher_qr_cross_endpoint_sign_and_session_recovery() {
     .is_some());
     for account in [&teacher, &student] {
         assert!(wait_for(
-            |v| crate::test_support::event_account_login_state(v, account, "online"),
+            |v| crate::e2e::support::event_account_login_state(v, account, "online"),
             10
         )
         .is_some());

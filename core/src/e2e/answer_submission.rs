@@ -1,4 +1,4 @@
-//! R3a: auto-answer submit/fetch contracts over the FFI against the real-contract fake, plus pure
+//! auto-answer submit/fetch contracts over the FFI against the real-contract fake, plus pure
 //! per-type body-shape assertions. The e2e (red gate) proves the wire shapes end-to-end; the pure
 //! `answer.rs`/`quiz.rs` unit tests assert every builder field-by-field. Serialized via `SEQ`.
 
@@ -46,7 +46,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -121,9 +121,6 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     );
     wait_for(reply_ok(i), 5);
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(reply_ok(i), 5);
-    let i = hz.next();
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"SetLlmKey","key":"k"}}"#),
@@ -140,11 +137,11 @@ fn boot(tag: &str, base: &str) -> (Harness, String) {
     let dave = account_id("dave").unwrap();
     let clock_id = hz.next();
     let start_id = hz.next();
-    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    crate::e2e::support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
     wait_for(reply_ok(clock_id), 5);
     wait_for(reply_ok(start_id), 15);
     wait_for(
-        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &dave, "online"),
         10,
     );
     (hz, dave)

@@ -1,4 +1,4 @@
-//! R1 tests: the number-answer response classifier (pure) and, over the FFI against the real-contract
+//! the number-answer response classifier (pure) and, over the FFI against the real-contract
 //! fake, the brute-force success-flag path, the fatal-abort path, and the my_present recheck (confirms
 //! the caller when the class is NOT full — proving recheck matches the caller's own `user_no`, not any
 //! entry / whole class). The e2e tests share one event sink → serialized via `SEQ`.
@@ -115,7 +115,7 @@ fn send(h: *mut std::ffi::c_void, json: &str) {
     unsafe { crate::core_send(h, json.as_ptr(), json.len()) };
 }
 fn account_id(label: &str) -> Option<String> {
-    crate::test_support::account_id(&snapshot(), label)
+    crate::e2e::support::account_id(&snapshot(), label)
 }
 fn start_fake() -> String {
     let (ptx, prx) = std::sync::mpsc::channel();
@@ -193,9 +193,6 @@ fn boot(tag: &str) -> (Harness, String, String) {
     );
     wait_for(ok_reply(i), 5).expect("UpdateConfig 未回覆 ok");
     let i = hz.next();
-    send(hz.h, &format!(r#"{{"id":{i},"cmd":"CreateVault"}}"#));
-    wait_for(ok_reply(i), 5).expect("CreateVault 未回覆 ok");
-    let i = hz.next();
     send(
         hz.h,
         &format!(
@@ -206,11 +203,11 @@ fn boot(tag: &str) -> (Harness, String, String) {
     let dave = account_id("dave").unwrap();
     let clock_id = hz.next();
     let start_id = hz.next();
-    crate::test_support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
+    crate::e2e::support::activate_account(hz.h, clock_id, start_id, &snapshot(), &dave);
     wait_for(ok_reply(clock_id), 5).expect("ApplyScheduleClock 未回覆 ok");
     wait_for(ok_reply(start_id), 15).expect("StartTarget 未回覆 ok");
     wait_for(
-        |v| crate::test_support::event_account_login_state(v, &dave, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &dave, "online"),
         10,
     )
     .expect("帳號未上線");
@@ -238,7 +235,7 @@ fn number_brute_finds_code_via_success_flag() {
 fn number_fatal_aborts_the_round() {
     let _g = SEQ.lock().unwrap();
     let (hz, base, dave) = boot("fatal");
-    // A 403 on the answer endpoint (session invalid) triggers re-login + re-sign (R4.1 #2); a PERMANENT
+    // A 403 on the answer endpoint (session invalid) triggers re-login + re-sign; a PERMANENT
     // 403 re-logins fine yet keeps failing → after MAX_RESIGN bounded retries it surfaces a sign_failed.
     post(
         &base,

@@ -336,7 +336,7 @@ fn poisoned_state_lock_recovers_instead_of_wedging_the_core() {
     const ID: u64 = 424_242;
     send(
         &core,
-        format!(r#"{{"id":{ID},"cmd":"CreateVault"}}"#).as_bytes(),
+        format!(r#"{{"id":{ID},"cmd":"GetMonitoringSnapshot"}}"#).as_bytes(),
     );
     let events = events
         .lock()
@@ -347,7 +347,7 @@ fn poisoned_state_lock_recovers_instead_of_wedging_the_core() {
         .expect("a command must complete despite a poisoned lock");
     assert_eq!(reply["ok"], false);
     assert_eq!(
-        reply["error"], "vault not ready",
+        reply["error"], "not initialized",
         "the command must run normally (poison recovered), not fail with the seam panic error"
     );
 }
@@ -556,7 +556,7 @@ fn account_id_by_label(label: &str) -> Option<String> {
     let guard = events()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    crate::test_support::account_id(&guard, label)
+    crate::e2e::support::account_id(&guard, label)
 }
 
 fn data_dir(tag: &str) -> String {
@@ -624,14 +624,14 @@ fn active_target_only_blocks_its_accounts_and_legacy_switch_is_removed() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let definition = crate::test_support::latest_monitoring_snapshot(&event_snapshot).unwrap();
+    let definition = crate::e2e::support::latest_monitoring_snapshot(&event_snapshot).unwrap();
     send(
         &core,
-        crate::test_support::apply_clock_command(4, definition).as_bytes(),
+        crate::e2e::support::apply_clock_command(4, definition).as_bytes(),
     );
     send(
         &core,
-        crate::test_support::start_account_command(5, &a).as_bytes(),
+        crate::e2e::support::start_account_command(5, &a).as_bytes(),
     );
     assert!(wait_for(
         |v| v["event"] == "Reply" && v["id"] == 5 && v["ok"] == true,
@@ -639,7 +639,7 @@ fn active_target_only_blocks_its_accounts_and_legacy_switch_is_removed() {
     )
     .is_some());
     assert!(wait_for(
-        |v| crate::test_support::event_account_login_state(v, &a, "online"),
+        |v| crate::e2e::support::event_account_login_state(v, &a, "online"),
         10
     )
     .is_some());
@@ -670,7 +670,7 @@ fn active_target_only_blocks_its_accounts_and_legacy_switch_is_removed() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let revision = crate::test_support::latest_monitoring_snapshot(&current).unwrap()
+    let revision = crate::e2e::support::latest_monitoring_snapshot(&current).unwrap()
         ["config_revision"]
         .as_u64()
         .unwrap();
@@ -729,8 +729,6 @@ fn login_progress_is_published_only_through_monitoring_snapshots() {
         format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
-    send(&core, r#"{"id":2,"cmd":"CreateVault"}"#.as_bytes());
-    assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
     send(
         &core,
         format!(
@@ -739,7 +737,7 @@ fn login_progress_is_published_only_through_monitoring_snapshots() {
         .as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 3, 5).is_some());
-    assert!(wait_for(|v| crate::test_support::event_has_account(v, "dave"), 5).is_some());
+    assert!(wait_for(|v| crate::e2e::support::event_has_account(v, "dave"), 5).is_some());
     let acc = account_id_by_label("dave").expect("account id");
 
     events()
@@ -763,11 +761,11 @@ fn login_progress_is_published_only_through_monitoring_snapshots() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let logging_in = events.iter().position(|event| {
-        crate::test_support::event_account_login_state(event, &acc, "logging_in")
+        crate::e2e::support::event_account_login_state(event, &acc, "logging_in")
     });
     let online = events
         .iter()
-        .position(|event| crate::test_support::event_account_login_state(event, &acc, "online"));
+        .position(|event| crate::e2e::support::event_account_login_state(event, &acc, "online"));
     assert!(
         logging_in.is_some(),
         "login starts with a full snapshot containing logging_in"
@@ -810,8 +808,6 @@ fn deleting_an_account_cancels_its_pending_captcha_login_without_resurrecting_th
         format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
-    send(&core, r#"{"id":2,"cmd":"CreateVault"}"#.as_bytes());
-    assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
     post(
         &base,
         "/_test/captcha",
@@ -825,7 +821,7 @@ fn deleting_an_account_cancels_its_pending_captcha_login_without_resurrecting_th
         .as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 3, 5).is_some());
-    assert!(wait_for(|v| crate::test_support::event_has_account(v, "dave"), 5).is_some());
+    assert!(wait_for(|v| crate::e2e::support::event_has_account(v, "dave"), 5).is_some());
     let acc = account_id_by_label("dave").expect("account id");
 
     send(
@@ -862,7 +858,7 @@ fn deleting_an_account_cancels_its_pending_captcha_login_without_resurrecting_th
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let revision = crate::test_support::latest_monitoring_snapshot(&current).unwrap()
+    let revision = crate::e2e::support::latest_monitoring_snapshot(&current).unwrap()
         ["config_revision"]
         .as_u64()
         .unwrap();
@@ -1541,8 +1537,6 @@ fn account_mutations_recover_a_stale_journal_before_mutating() {
         format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
-    send(&core, r#"{"id":2,"cmd":"CreateVault"}"#.as_bytes());
-    assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
     send(
         &core,
         r#"{"id":3,"cmd":"AddAccount","label":"dave","school":"thu","username":"dave","password":"secret"}"#
@@ -1631,8 +1625,6 @@ fn captcha_timeout_reports_failure_and_allows_relogin() {
         format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
-    send(&core, r#"{"id":2,"cmd":"CreateVault"}"#.as_bytes());
-    assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
     post(
         &base,
         "/_test/captcha",
@@ -1884,8 +1876,6 @@ fn settings_event_never_contains_raw_qr_key_and_redaction_covers_it() {
         format!(r#"{{"id":1,"cmd":"Init","data_dir":"{dir}"}}"#).as_bytes(),
     );
     assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 1, 10).is_some());
-    send(&core, r#"{"id":2,"cmd":"CreateVault"}"#.as_bytes());
-    assert!(wait_for(|v| v["event"] == "Reply" && v["id"] == 2, 5).is_some());
     let raw_key = "qr-secret-value";
     send(
         &core,

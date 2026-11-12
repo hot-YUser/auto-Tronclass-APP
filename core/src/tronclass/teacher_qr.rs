@@ -2,7 +2,7 @@
 //!
 //! The teacher rollcall only supplies the rotating `data` value. Student submission always uses the
 //! student's own client, endpoint set, rollcall id, and device id (see `rollcall::sign_qr_with_teacher_data`
-//! and `monitor::sign_qr_student`). Contract ported from the proven Python v1 teacher flow
+//! and `monitor::sign_qr_student`). Contract ported from the teacher flow real tenants accept
 //! (`build_teacher_rollcall_payload(kind="qr")`); still needs a real teacher tenant to fully verify.
 
 use crate::json;
@@ -48,7 +48,7 @@ pub struct Source {
     pub rollcall_id: String,
 }
 
-/// Python v1 `build_teacher_rollcall_payload(kind="qr")` contract. The old v2 placeholder body used
+/// payload real tenants accept. A minimal body used
 /// `latitude/longitude/altitude: 0.0`, `number_code: null`, `duration: 3600` — this aligns with the
 /// values the working Python teacher flow actually sends.
 pub fn build_create_payload(title: &str) -> Value {

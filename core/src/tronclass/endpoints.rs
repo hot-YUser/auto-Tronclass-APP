@@ -24,8 +24,8 @@ impl Endpoints {
         format!("{}/api/radar/rollcalls?api_version=1.1.0", self.base)
     }
 
-    // --- Quiz detection: per-account × per-course fan-out (docs 31; NOT a global list) ---
-    // v1 does NOT multi-page; page_size=50 covers a semester's courses.
+    // --- Quiz detection: per-account × per-course fan-out ---
+    // page_size=50 covers a semester's courses.
     pub fn my_courses(&self) -> String {
         format!("{}/api/my-courses?page=1&page_size=50", self.base)
     }
@@ -36,7 +36,7 @@ impl Endpoints {
             self.base
         )
     }
-    /// exam family list (real endpoint; `exams` key). v1 sends `conditions=` + page params.
+    /// exam family list (real endpoint; `exams` key).
     pub fn course_exam_list(&self, cid: &str) -> String {
         format!(
             "{}/api/courses/{cid}/exam-list?conditions=&page=1&page_size=50",
@@ -69,14 +69,14 @@ impl Endpoints {
         )
     }
 
-    // --- exam (docs 31) ---
+    // --- exam ---
     pub fn exam_qualification(&self, id: &str) -> String {
         format!("{}/api/exam/{id}/check-exam-qualification", self.base)
     }
     pub fn exam_distribute(&self, id: &str) -> String {
         format!("{}/api/exams/{id}/distribute", self.base)
     }
-    /// distribute for questionnaire / classroom (same shape as exam, different segment; docs 31).
+    /// distribute for questionnaire / classroom (same shape as exam, different segment).
     pub fn questionnaire_distribute(&self, id: &str) -> String {
         format!("{}/api/questionnaire/{id}/distribute", self.base)
     }
@@ -90,7 +90,7 @@ impl Endpoints {
     pub fn activity_detail(&self, id: &str) -> String {
         format!("{}/api/activities/{id}", self.base)
     }
-    /// R5 course-material tool: a material's file attachments, and a preview URL for an upload id.
+    /// course-material tool: a material's file attachments, and a preview URL for an upload id.
     pub fn upload_references(&self, activity_id: &str) -> String {
         format!(
             "{}/api/activities/{activity_id}/upload_references",
@@ -143,7 +143,7 @@ impl Endpoints {
     pub fn answer_radar(&self, id: &str) -> String {
         format!("{}/api/rollcall/{id}/answer", self.base)
     }
-    /// Radar coordinate answer (radar.rs §1) — carries `?api_version=1.76`; the empty `{}` path does not.
+    /// Radar coordinate answer — carries `?api_version=1.76`; the empty `{}` path does not.
     pub fn answer_radar_coord(&self, id: &str) -> String {
         format!("{}/api/rollcall/{id}/answer?api_version=1.76", self.base)
     }
