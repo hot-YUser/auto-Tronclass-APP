@@ -1,3 +1,24 @@
+use super::actor::*;
+use super::detect::*;
+use super::qr::*;
+use super::quiz::*;
+use super::rollcall::*;
+use super::task_group::*;
+use super::*;
+use crate::providers::Endpoints;
+use crate::quiz::Answer;
+use crate::rollcall::{RollcallKind, SignOutcome};
+use crate::teacher_qr;
+use crate::wire::{AttemptState, Event};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+
 fn test_plan_tx() -> watch::Sender<MonitorPlan> {
     watch::channel(MonitorPlan {
         generation: 1,
@@ -17,8 +38,6 @@ fn leaked_qr_rev_tx() -> &'static watch::Sender<u64> {
 fn leaked_qr_rev_rx() -> watch::Receiver<u64> {
     leaked_qr_rev_tx().subscribe()
 }
-use super::*;
-use serde_json::json;
 
 #[test]
 fn production_quiz_prepared_emitter_matches_v1_contract() {
@@ -77,7 +96,7 @@ fn production_quiz_prepared_emitter_matches_v1_contract() {
             subjects,
             generated_answers,
             existing_answers,
-            overrides: Map::new(),
+            overrides: HashMap::new(),
             conflicts: HashSet::from(["1".to_string()]),
             submitted_subjects: HashSet::new(),
         },
@@ -124,22 +143,26 @@ fn production_quiz_prepared_emitter_matches_v1_contract() {
 }
 
 #[test]
-fn end_time_reads_an_epoch_or_iso_text_and_separates_absent_from_invalid() {
+fn a_time_field_is_an_epoch_or_iso_text_and_absent_is_not_invalid() {
+    let read = |activity: Value| TimeField::read(&activity, "end_time");
     assert_eq!(
-        end_epoch(&json!({"end_time": 1_609_459_200_i64})),
-        Some(1_609_459_200)
+        read(json!({ "end_time": 1_609_459_200_i64 })),
+        TimeField::At(1_609_459_200)
     );
     assert_eq!(
-        end_epoch(&json!({"end_time": "2021-01-01T00:00:00Z"})),
-        Some(1_609_459_200)
+        read(json!({ "end_time": "2021-01-01T00:00:00Z" })),
+        TimeField::At(1_609_459_200)
     );
-    assert_eq!(end_epoch(&json!({})), None);
-    assert_eq!(end_time(&json!({})), EndTime::Absent);
-    assert_eq!(end_time(&json!({"end_time": null})), EndTime::Absent);
-    assert_eq!(end_time(&json!({"end_time": "  "})), EndTime::Absent);
+    for absent in [
+        json!({}),
+        json!({ "end_time": null }),
+        json!({ "end_time": "  " }),
+    ] {
+        assert_eq!(read(absent), TimeField::Absent);
+    }
     assert_eq!(
-        end_time(&json!({"end_time": "not-a-date"})),
-        EndTime::Invalid
+        read(json!({ "end_time": "not-a-date" })),
+        TimeField::Invalid
     );
 }
 
@@ -216,14 +239,36 @@ fn cfg_countdown(secs: u64) -> MonitorConfig {
     }
 }
 
+/// The surroundings of a handler under test, assembled from the pieces the test holds on to.
+fn env_from(
+    cb: EventCb,
+    cfg: &MonitorConfig,
+    accounts: &HashMap<String, Arc<Account>>,
+    tx: &UnboundedSender<MonitorMsg>,
+    group: &Arc<TaskGroup>,
+) -> Env {
+    let (runtime_tx, _) = unbounded_channel();
+    let plan = MonitorPlan {
+        generation: 1,
+        routes: Vec::new(),
+    };
+    let mut env = Env::new(cb, cfg.clone(), plan, tx.clone(), group.clone(), runtime_tx);
+    env.accounts = accounts.clone();
+    env
+}
+
+/// The surroundings of a handler that only reads the settings.
+fn env_with(cfg: &MonitorConfig) -> Env {
+    let (tx, _) = unbounded_channel();
+    let (panic_tx, _) = unbounded_channel();
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
+    env_from(noop_cb, cfg, &HashMap::new(), &tx, &group)
+}
+
 /// A single-account quiz with one unresolved conflict and no live countdown — the exact state
 /// after a user holds a paper that still has a conflict.
 fn quiz_with_conflict() -> (HashMap<ActivityKey, QuizActivity>, ActivityKey) {
-    let key = (
-        "http://x".to_string(),
-        "quiz:exam".to_string(),
-        "act1".to_string(),
-    );
+    let key = ActivityKey::new("http://x", "quiz:exam", "act1");
     let attempt = PerAccountAttempt {
         state: AttemptState::Ready,
         prepare_generation: 1,
@@ -234,9 +279,9 @@ fn quiz_with_conflict() -> (HashMap<ActivityKey, QuizActivity>, ActivityKey) {
         ]),
         instance_id: "instance-acc1".to_string(),
         subjects: vec![json!({ "id": "subj1", "type": "short_answer", "content": "Question" })],
-        generated_answers: Map::from([("subj1".to_string(), Answer::Text("llm".to_string()))]),
-        existing_answers: Map::from([("subj1".to_string(), Answer::Text("old".to_string()))]),
-        overrides: Map::new(),
+        generated_answers: HashMap::from([("subj1".to_string(), Answer::Text("llm".to_string()))]),
+        existing_answers: HashMap::from([("subj1".to_string(), Answer::Text("old".to_string()))]),
+        overrides: HashMap::new(),
         conflicts: HashSet::from(["subj1".to_string()]),
         submitted_subjects: HashSet::new(),
     };
@@ -265,16 +310,18 @@ fn held_quiz_does_not_rearm_countdown_when_conflict_resolves() {
     let (mut quizzes, key) = quiz_with_conflict();
     quizzes.get_mut(&key).unwrap().held = true; // user held while a conflict was still open
     let cfg = cfg_countdown(15);
-    on_quiz_set_answer(
-        &mut quizzes,
-        &cfg,
-        noop_cb,
-        "token1",
-        "acc1",
-        "subj1",
-        AnswerWire::Text { value: "x".into() },
-    )
-    .unwrap();
+    let env = env_with(&cfg);
+    quiz::find_mut(&mut quizzes, "token1")
+        .and_then(|quiz| {
+            set_answer(
+                quiz,
+                &env,
+                "acc1",
+                "subj1",
+                AnswerWire::Text { value: "x".into() },
+            )
+        })
+        .unwrap();
     let q = quizzes.get(&key).unwrap();
     assert!(
         q.attempts["acc1"].conflicts.is_empty(),
@@ -290,16 +337,18 @@ fn held_quiz_does_not_rearm_countdown_when_conflict_resolves() {
 fn unheld_quiz_rearms_countdown_when_conflict_resolves() {
     let (mut quizzes, key) = quiz_with_conflict(); // held = false
     let cfg = cfg_countdown(15);
-    on_quiz_set_answer(
-        &mut quizzes,
-        &cfg,
-        noop_cb,
-        "token1",
-        "acc1",
-        "subj1",
-        AnswerWire::Text { value: "x".into() },
-    )
-    .unwrap();
+    let env = env_with(&cfg);
+    quiz::find_mut(&mut quizzes, "token1")
+        .and_then(|quiz| {
+            set_answer(
+                quiz,
+                &env,
+                "acc1",
+                "subj1",
+                AnswerWire::Text { value: "x".into() },
+            )
+        })
+        .unwrap();
     let q = quizzes.get(&key).unwrap();
     assert!(
         q.countdown_deadline.is_some(),
@@ -312,17 +361,18 @@ fn invalid_typed_answer_does_not_resolve_conflict() {
     let (mut quizzes, key) = quiz_with_conflict();
     let cfg = cfg_countdown(15);
 
-    let result = on_quiz_set_answer(
-        &mut quizzes,
-        &cfg,
-        noop_cb,
-        "token1",
-        "acc1",
-        "subj1",
-        AnswerWire::Options {
-            option_ids: vec!["not-for-text".into()],
-        },
-    );
+    let env = env_with(&cfg);
+    let result = quiz::find_mut(&mut quizzes, "token1").and_then(|quiz| {
+        set_answer(
+            quiz,
+            &env,
+            "acc1",
+            "subj1",
+            AnswerWire::Options {
+                option_ids: vec!["not-for-text".into()],
+            },
+        )
+    });
 
     assert!(result.is_err());
     assert!(quizzes[&key].attempts["acc1"].conflicts.contains("subj1"));
@@ -342,17 +392,19 @@ fn late_participant_gets_own_waiting_attempt_and_cancels_countdown() {
         .clear();
     quizzes.get_mut(&key).unwrap().countdown_deadline = Some(Instant::now());
 
-    on_quiz_detected(
+    quiz::on_detected(
         &mut quizzes,
         &plan_for("acc2", &["acc2"]),
-        1,
-        "http://x".to_string(),
-        "exam".to_string(),
-        String::new(),
-        String::new(),
-        "act1".to_string(),
-        "acc2".to_string(),
-        String::new(),
+        QuizDetected {
+            generation: 1,
+            account_id: "acc2".to_string(),
+            base_url: "http://x".to_string(),
+            source: Source::Exam,
+            course: String::new(),
+            course_id: String::new(),
+            activity_id: "act1".to_string(),
+            stem: String::new(),
+        },
     );
 
     let quiz = &quizzes[&key];
@@ -374,21 +426,21 @@ fn stale_prepare_generation_cannot_overwrite_new_attempt() {
     attempt.prepare_generation = 2;
     let cfg = cfg_countdown(15);
 
-    on_quiz_prepared(
+    let env = env_with(&cfg);
+    on_prepared(
         &mut quizzes,
-        &cfg,
-        noop_cb,
-        key.clone(),
+        &env,
+        &key,
         vec![PreparedAttempt {
             account_id: "acc1".to_string(),
             generation: 1,
             instance_id: "stale-instance".to_string(),
             subjects: vec![json!({ "id": "stale", "type": "short_answer" })],
-            generated_answers: Map::from([(
+            generated_answers: HashMap::from([(
                 "stale".to_string(),
                 Answer::Text("stale".to_string()),
             )]),
-            existing_answers: Map::new(),
+            existing_answers: HashMap::new(),
         }],
     );
 
@@ -421,7 +473,7 @@ fn paper_contract_ignores_existing_answer_but_not_option_identity() {
 fn changed_paper_contract_drops_partial_answers() {
     let prior = PriorAnswers {
         contract: vec![json!({ "id": "s1", "options": [{ "id": "old" }] })],
-        answers: Map::from([("s1".to_string(), Answer::Options(vec!["old".to_string()]))]),
+        answers: HashMap::from([("s1".to_string(), Answer::Options(vec!["old".to_string()]))]),
     };
     let changed = vec![json!({ "id": "s1", "options": [{ "id": "new" }] })];
 
@@ -447,22 +499,15 @@ fn gone_attempt_does_not_block_another_ready_account() {
             answer_contract: None,
             instance_id: String::new(),
             subjects: Vec::new(),
-            generated_answers: Map::new(),
-            existing_answers: Map::new(),
-            overrides: Map::new(),
+            generated_answers: HashMap::new(),
+            existing_answers: HashMap::new(),
+            overrides: HashMap::new(),
             conflicts: HashSet::new(),
             submitted_subjects: HashSet::new(),
         },
     );
 
-    on_quiz_prepare_gone(
-        &mut quizzes,
-        &cfg_countdown(15),
-        noop_cb,
-        key.clone(),
-        "acc2".to_string(),
-        3,
-    );
+    on_prepare_gone(&mut quizzes, &env_with(&cfg_countdown(15)), &key, "acc2", 3);
 
     assert_eq!(quizzes[&key].attempts["acc2"].state, AttemptState::Gone);
     assert!(quizzes[&key].countdown_deadline.is_some());
@@ -480,11 +525,11 @@ fn failed_classroom_submit_retains_completed_subjects_for_retry() {
     attempt.conflicts.clear();
     attempt.state = AttemptState::Submitting;
 
-    on_quiz_submit_result(
+    on_submit_result(
         &mut quizzes,
-        noop_cb,
-        key.clone(),
-        "acc1".to_string(),
+        &env_with(&cfg_countdown(15)),
+        &key,
+        "acc1",
         Err(QuizSubmitFailure {
             error: "second subject failed".to_string(),
             completed_subjects: vec!["subj1".to_string()],
@@ -517,7 +562,7 @@ async fn classroom_retry_skips_every_subject_already_confirmed_by_the_server() {
         json!({"id": "s1", "type": "short_answer"}),
         json!({"id": "s2", "type": "short_answer"}),
     ];
-    let answers = Map::from([
+    let answers = HashMap::from([
         ("s1".to_string(), Answer::Text("a".to_string())),
         ("s2".to_string(), Answer::Text("b".to_string())),
     ]);
@@ -550,7 +595,7 @@ fn hold_is_rejected_once_submission_has_begun() {
     q.attempts.get_mut("acc1").unwrap().state = AttemptState::Submitting;
     q.countdown_deadline = Some(Instant::now());
 
-    let err = on_quiz_hold(q).expect_err("a begun submission must not be held");
+    let err = hold(q).expect_err("a begun submission must not be held");
     assert!(err.contains("submission has begun"), "unexpected: {err}");
     let q = &quizzes[&key];
     assert!(!q.held, "hold must not mutate once submission began");
@@ -566,8 +611,7 @@ fn discard_is_rejected_once_submission_has_begun() {
     let q = quizzes.get_mut(&key).unwrap();
     q.attempts.get_mut("acc1").unwrap().state = AttemptState::Submitted;
 
-    let err =
-        on_quiz_discard(q, noop_cb).expect_err("a committed submission must not be discarded");
+    let err = discard(q, noop_cb).expect_err("a committed submission must not be discarded");
     assert!(err.contains("submission has begun"), "unexpected: {err}");
     assert!(!quizzes[&key].discarded);
 }
@@ -575,105 +619,49 @@ fn discard_is_rejected_once_submission_has_begun() {
 #[test]
 fn hold_and_discard_work_before_submission() {
     let (mut quizzes, key) = quiz_with_conflict();
-    assert!(on_quiz_hold(quizzes.get_mut(&key).unwrap()).is_ok());
+    assert!(hold(quizzes.get_mut(&key).unwrap()).is_ok());
     assert!(quizzes[&key].held);
-    assert!(on_quiz_discard(quizzes.get_mut(&key).unwrap(), noop_cb).is_ok());
+    assert!(discard(quizzes.get_mut(&key).unwrap(), noop_cb).is_ok());
     assert!(quizzes[&key].discarded);
 }
 
 #[test]
-fn quiz_seen_key_includes_source_course_and_activity() {
-    // The same activity id must not collide across families or courses.
-    assert_ne!(
-        quiz_seen_key("exam", "c1", "42"),
-        quiz_seen_key("courseware-quiz", "c1", "42")
-    );
-    assert_ne!(
-        quiz_seen_key("exam", "c1", "42"),
-        quiz_seen_key("exam", "c2", "42")
-    );
-    assert_eq!(
-        quiz_seen_key("exam", "c1", "42"),
-        quiz_seen_key("exam", "c1", "42")
-    );
+fn the_seen_key_separates_families_and_courses() {
+    let exam = seen_key(Source::Exam, "c1", "42");
+    assert_ne!(exam, seen_key(Source::CoursewareQuiz, "c1", "42"));
+    assert_ne!(exam, seen_key(Source::Exam, "c2", "42"));
+    assert_eq!(exam, seen_key(Source::Exam, "c1", "42"));
 }
 
 #[test]
-fn emit_quiz_detects_same_activity_id_across_families() {
-    let account = Arc::new(Account {
-        id: "acc1".to_string(),
-        device_id: String::new(),
-        user_no: String::new(),
-        is_teacher: false,
-        course_id: None,
-        base_url: "http://127.0.0.1:1".to_string(),
-        client: crate::http::client(),
-        username: String::new(),
-        password: crate::secrets::Secret::default(),
-    });
+fn an_activity_id_shared_by_two_families_is_reported_once_for_each() {
+    let account = account_at("acc1", false);
+    let endpoints = Endpoints::derive(&account.base_url);
     let (tx, mut rx) = unbounded_channel();
-    let mut seen = HashSet::new();
-    emit_quiz(
-        &tx,
-        &account,
-        &mut seen,
-        QuizDetection {
-            source: "exam",
-            course_id: "c1",
-            activity: &json!({"id": "42"}),
-            stem: "",
-            generation: 1,
-        },
-    );
-    emit_quiz(
-        &tx,
-        &account,
-        &mut seen,
-        QuizDetection {
-            source: "courseware-quiz",
-            course_id: "c1",
-            activity: &json!({"id": "42"}),
-            stem: "",
-            generation: 1,
-        },
-    );
-    emit_quiz(
-        &tx,
-        &account,
-        &mut seen,
-        QuizDetection {
-            source: "exam",
-            course_id: "c1",
-            activity: &json!({"id": "42"}),
-            stem: "",
-            generation: 1,
-        },
-    ); // duplicate
+    let scan = Scan {
+        account: &account,
+        endpoints: &endpoints,
+        tx: &tx,
+        generation: 1,
+    };
+    let mut scanner = QuizScanner::default();
+    let activity = json!({ "id": "42" });
+    scanner.report(&scan, Source::Exam, "c1", &activity);
+    scanner.report(&scan, Source::CoursewareQuiz, "c1", &activity);
+    scanner.report(&scan, Source::Exam, "c1", &activity);
 
-    let first = rx.try_recv().expect("exam detected");
-    match first {
-        MonitorMsg::QuizDetected {
-            source,
-            course_id,
-            activity_id,
-            ..
-        } => {
-            assert_eq!(source, "exam");
-            assert_eq!(course_id, "c1");
-            assert_eq!(activity_id, "42");
-        }
-        _ => panic!("unexpected first message variant"),
-    }
-    let second = rx
-        .try_recv()
-        .expect("same id detected under the courseware family");
-    match second {
-        MonitorMsg::QuizDetected { source, .. } => assert_eq!(source, "courseware-quiz"),
-        _ => panic!("unexpected second message variant"),
-    }
-    assert!(
-        rx.try_recv().is_err(),
-        "a duplicate detection must be deduped"
+    let reported: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|message| match message {
+            MonitorMsg::QuizDetected(found) => (found.source, found.course_id, found.activity_id),
+            _ => panic!("unexpected message"),
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            (Source::Exam, "c1".to_string(), "42".to_string()),
+            (Source::CoursewareQuiz, "c1".to_string(), "42".to_string()),
+        ]
     );
 }
 
@@ -758,28 +746,8 @@ fn plan_for(detector: &str, participants: &[&str]) -> MonitorPlan {
 fn gate_activity(participants: &[&str]) -> Activity {
     Activity {
         activity_token: "token".to_string(),
-        kind: RollcallKind::Number,
-        course: String::new(),
-        participants: participants.iter().map(|s| s.to_string()).collect(),
-        attendance_rate: None,
-        number_code: None,
-        code_requested: false,
-        gate_pending: true,
-        gate_in_flight: false,
-        gate_next_check: None,
-        countdown_deadline: None,
-        acted: false,
-        sign_pending: false,
-        signed: HashSet::new(),
-        sign_failed: HashSet::new(),
-        needs_resign: HashSet::new(),
-        resign_attempts: HashMap::new(),
-        sources: HashSet::new(),
-        plan_generation: 1,
-        mutation_blocked: false,
-        mutation_started: false,
-        source_failed_without_mutation: false,
-        qr_source_failed_reason: None,
+        participants: participants.iter().map(|id| id.to_string()).collect(),
+        ..Activity::new(RollcallKind::Number, String::new(), 1)
     }
 }
 
@@ -788,47 +756,20 @@ fn qr_without_teacher_stays_unacted_and_manual_retry_explains_recovery() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
-    let key = (
-        "http://x".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://x", "qrcode", "qr1");
     let mut activity = gate_activity(&["acc1"]);
     activity.kind = RollcallKind::Qr;
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
-    dispatch_signs_for(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        &key,
-        vec!["acc1".to_string()],
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    let env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    dispatch_signs_for(&mut activities, &env, &key, vec!["acc1".to_string()]);
     assert!(
         !activities[&key].acted,
         "no teacher means no outbound request, so the activity must not become acted"
     );
-    let error = on_sign_now(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        &key,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    )
-    .unwrap_err();
+    let error = on_sign_now(&mut activities, &env, &key).unwrap_err();
     assert!(error.contains("teacher helper") && error.contains("stop monitoring"));
 }
 
@@ -837,33 +778,17 @@ fn held_gate_rechecks_on_bounded_cadence_with_at_most_one_inflight() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
     let mut activities = HashMap::new();
     let t0 = Instant::now();
 
     // First detection starts the initial check (empty accounts → the spawn fails, so simulate the
     // in-flight request by setting the flag the way a successful spawn would).
-    on_detected(
-        &mut activities,
-        DetectionContext {
-            accounts: &accounts,
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan_for("acc1", &["acc1"]),
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
-        detected_for("acc1", "rc1"),
-    );
-    let key = (
-        "http://x".to_string(),
-        "number".to_string(),
-        "rc1".to_string(),
-    );
+    let mut env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    env.set_plan(plan_for("acc1", &["acc1"]));
+    rollcall::on_detected(&mut activities, &env, detected_for("acc1", "rc1"));
+    let key = ActivityKey::new("http://x", "number", "rc1");
     {
         let a = activities.get_mut(&key).unwrap();
         assert!(a.gate_pending && !a.gate_in_flight && a.gate_next_check.is_none());
@@ -871,16 +796,7 @@ fn held_gate_rechecks_on_bounded_cadence_with_at_most_one_inflight() {
     }
 
     // Below-threshold result → hold, clear in-flight, schedule the next check on the cadence.
-    on_gate(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        noop_cb,
-        &cfg,
-        key.clone(),
-        Some(5.0),
-    );
+    on_gate(&mut activities, &env, &key, Some(5.0));
     let a = &activities[&key];
     assert!(a.gate_pending, "below threshold → still holding");
     assert!(
@@ -893,18 +809,7 @@ fn held_gate_rechecks_on_bounded_cadence_with_at_most_one_inflight() {
     // Before the deadline no new check may start, even on a tick.
     let before = t0 + GATE_RECHECK_INTERVAL - Duration::from_millis(1);
     assert!(!gate_check_due(&activities[&key], before));
-    on_tick(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        before,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    rollcall::on_tick(&mut activities, &env, before);
     assert!(
         activities[&key].gate_next_check.is_some(),
         "not due → schedule untouched"
@@ -913,18 +818,7 @@ fn held_gate_rechecks_on_bounded_cadence_with_at_most_one_inflight() {
 
     // Due: one check may start. The empty accounts map makes the spawn fail, so the activity is
     // paced again instead of being wedged by a stuck in-flight flag.
-    on_tick(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        t0 + GATE_RECHECK_INTERVAL,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    rollcall::on_tick(&mut activities, &env, t0 + GATE_RECHECK_INTERVAL);
     assert!(!activities[&key].gate_in_flight);
     assert!(activities[&key].gate_next_check.is_some());
 
@@ -934,18 +828,7 @@ fn held_gate_rechecks_on_bounded_cadence_with_at_most_one_inflight() {
         a.gate_in_flight = true;
         a.gate_next_check = None;
     }
-    on_tick(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        t0 + GATE_RECHECK_INTERVAL,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    rollcall::on_tick(&mut activities, &env, t0 + GATE_RECHECK_INTERVAL);
     let a = &activities[&key];
     assert!(a.gate_in_flight, "the in-flight request is untouched");
     assert!(
@@ -959,47 +842,22 @@ fn stale_gate_result_after_defer_never_rearms_the_countdown() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
     let mut activities = HashMap::new();
-    on_detected(
-        &mut activities,
-        DetectionContext {
-            accounts: &accounts,
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan_for("acc1", &["acc1"]),
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
-        detected_for("acc1", "rc1"),
-    );
-    let key = (
-        "http://x".to_string(),
-        "number".to_string(),
-        "rc1".to_string(),
-    );
+    let mut env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    env.set_plan(plan_for("acc1", &["acc1"]));
+    rollcall::on_detected(&mut activities, &env, detected_for("acc1", "rc1"));
+    let key = ActivityKey::new("http://x", "number", "rc1");
     activities.get_mut(&key).unwrap().gate_in_flight = true;
 
-    on_defer(&mut activities, noop_cb, &key);
+    on_defer(&mut activities, &env, &key);
     let a = &activities[&key];
     assert!(a.countdown_deadline.is_none());
     assert!(!a.gate_pending && !a.gate_in_flight && a.gate_next_check.is_none());
 
     // The in-flight gate response lands AFTER the Defer — it must be completely inert.
-    on_gate(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        noop_cb,
-        &cfg,
-        key.clone(),
-        Some(90.0),
-    );
+    on_gate(&mut activities, &env, &key, Some(90.0));
     let a = &activities[&key];
     assert!(
         a.countdown_deadline.is_none(),
@@ -1014,56 +872,22 @@ fn passing_gate_arms_the_countdown_exactly_once() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
     let mut activities = HashMap::new();
-    on_detected(
-        &mut activities,
-        DetectionContext {
-            accounts: &accounts,
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan_for("acc1", &["acc1"]),
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
-        detected_for("acc1", "rc1"),
-    );
-    let key = (
-        "http://x".to_string(),
-        "number".to_string(),
-        "rc1".to_string(),
-    );
+    let mut env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    env.set_plan(plan_for("acc1", &["acc1"]));
+    rollcall::on_detected(&mut activities, &env, detected_for("acc1", "rc1"));
+    let key = ActivityKey::new("http://x", "number", "rc1");
     activities.get_mut(&key).unwrap().gate_in_flight = true;
 
-    on_gate(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        noop_cb,
-        &cfg,
-        key.clone(),
-        Some(50.0),
-    );
+    on_gate(&mut activities, &env, &key, Some(50.0));
     let armed = activities[&key].countdown_deadline;
     assert!(armed.is_some(), "at/above threshold → countdown armed");
     assert!(!activities[&key].gate_pending);
 
     // A duplicate/stale result (e.g. from a late duplicate spawn) must not re-arm or extend it.
-    on_gate(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        noop_cb,
-        &cfg,
-        key.clone(),
-        Some(80.0),
-    );
+    on_gate(&mut activities, &env, &key, Some(80.0));
     assert_eq!(
         activities[&key].countdown_deadline, armed,
         "deadline is set exactly once"
@@ -1093,7 +917,7 @@ fn relogin_backoff_paces_attempts_and_gives_up_bounded() {
     for attempt in 2..=RELOGIN_MAX_ATTEMPTS {
         assert_eq!(relogin_failed(&mut backoff, "a", at), attempt);
         if attempt < RELOGIN_MAX_ATTEMPTS {
-            let delay = RELOGIN_BASE_DELAY_SECS * 2_u64.pow(attempt - 1);
+            let delay = RELOGIN_BASE_DELAY.as_secs() * 2_u64.pow(attempt - 1);
             assert!(!relogin_due(
                 &backoff,
                 "a",
@@ -1119,14 +943,10 @@ fn sign_now_after_dispatch_retries_only_bounded_failed_accounts() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
     let mut activities = HashMap::new();
-    let key = (
-        "http://x".to_string(),
-        "number".to_string(),
-        "rc1".to_string(),
-    );
+    let key = ActivityKey::new("http://x", "number", "rc1");
     let mut a = gate_activity(&["acc1", "acc2", "acc3"]);
     a.acted = true; // already dispatched once
     a.signed.insert("acc1".to_string());
@@ -1149,18 +969,8 @@ fn sign_now_after_dispatch_retries_only_bounded_failed_accounts() {
     assert!(retryable_accounts(&activities[&key]).is_empty());
 
     // Nothing retryable → SignNow is a real Err, never a fake ok.
-    let result = on_sign_now(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        &key,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    let env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    let result = on_sign_now(&mut activities, &env, &key);
     assert!(result.is_err());
     assert!(
         activities[&key].acted,
@@ -1218,49 +1028,51 @@ async fn quiz_prepare_budget_timeout_sends_retry_not_stuck_preparing() {
         password: crate::secrets::Secret::default(),
     });
     let (tx, mut rx) = unbounded_channel::<MonitorMsg>();
-    let key: ActivityKey = (base_url, "quiz:exam".to_string(), "act1".to_string());
+    let key = ActivityKey::new(base_url, "quiz:exam", "act1");
     let mut generations = HashMap::new();
     generations.insert("acc1".to_string(), 1_u64);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
-    spawn_quiz_prepare(
-        vec![account],
-        Source::Exam,
-        "act1".to_string(),
-        "tok".to_string(),
-        "c1".to_string(),
-        String::new(),
-        LlmConfig {
-            endpoint: format!("http://{llm_addr}/v1/chat/completions"),
-            model: "m".to_string(),
-            api_key: "k".to_string(),
-            max_tokens: 0,
-            enable_tools: false,
-            max_tool_iterations: 0,
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
+    let env = env_from(noop_cb, &cfg_countdown(15), &HashMap::new(), &tx, &group);
+    spawn_prepare(
+        &env,
+        PrepareJob {
+            participants: vec![account],
+            source: Source::Exam,
+            activity_id: "act1".to_string(),
+            activity_token: "tok".to_string(),
+            course_id: "c1".to_string(),
+            stem: String::new(),
+            llm: LlmConfig {
+                endpoint: format!("http://{llm_addr}/v1/chat/completions"),
+                model: "m".to_string(),
+                api_key: "k".to_string(),
+                max_tokens: 0,
+                enable_tools: false,
+                max_tool_iterations: 0,
+            },
+            max_reask: 0,
+            // One second for the whole round, far below the LLM client's read-idle timeout.
+            prepare_budget_secs: 1,
+            priors: HashMap::new(),
+            generations,
+            reusable: Vec::new(),
+            key: key.clone(),
         },
-        0,
-        1, // 1s overall budget — far below the LLM's 180s read-idle
-        HashMap::new(),
-        generations,
-        Vec::new(),
-        &group,
-        tx,
-        key.clone(),
-        noop_cb,
     );
     let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("a deadline-capped prepare must report within the budget")
         .expect("a message must arrive");
     match message {
-        MonitorMsg::QuizPrepareRetry {
+        MonitorMsg::QuizPrepareRetry(PrepareRetry {
             key: got_key,
             account_id,
             generation,
             partial,
             missing,
             ..
-        } => {
+        }) => {
             assert_eq!(got_key, key, "the retry carries the activity key");
             assert_eq!(account_id, "acc1");
             assert_eq!(generation, 1);
@@ -1292,7 +1104,7 @@ async fn quiz_prepare_budget_timeout_sends_retry_not_stuck_preparing() {
 #[tokio::test]
 async fn task_group_panic_reports_core_panicked_once_and_pings() {
     let (panic_tx, mut panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(record_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(record_cb, panic_tx));
     group.spawn(async { panic!("boom: helper died") });
 
     tokio::time::timeout(Duration::from_secs(5), panic_rx.recv())
@@ -1318,7 +1130,7 @@ async fn task_group_panic_reports_core_panicked_once_and_pings() {
 #[tokio::test]
 async fn task_group_normal_completion_and_cancel_report_no_panic() {
     let (panic_tx, mut panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(record_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(record_cb, panic_tx));
 
     // Normal completion → no ping, no event.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -1400,7 +1212,7 @@ async fn task_group_drop_aborts_children() {
 #[tokio::test]
 async fn task_group_spawn_after_cancel_aborts_immediately() {
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     group.cancel();
     let started = Arc::new(AtomicBool::new(false));
     let s = started.clone();
@@ -1503,34 +1315,22 @@ async fn late_participant_after_acted_is_dispatched_alone_not_full_redispatch() 
     let cfg = cfg_countdown(15);
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
     accounts.insert("acc1".to_string(), account_at("acc1", false));
     accounts.insert("acc2".to_string(), account_at("acc2", false));
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "number".to_string(),
-        "rc1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "number", "rc1");
     let mut activity = gate_activity(&["acc1"]);
     activity.acted = true; // already dispatched
     activity.signed.insert("acc1".to_string());
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
     // acc2 detects the SAME already-acted rollcall after the dispatch.
-    on_detected(
+    let mut env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    env.set_plan(plan_for("acc2", &["acc2"]));
+    rollcall::on_detected(
         &mut activities,
-        DetectionContext {
-            accounts: &accounts,
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan_for("acc2", &["acc2"]),
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
+        &env,
         Detected {
             generation: 1,
             account_id: "acc2".to_string(),
@@ -1577,33 +1377,19 @@ async fn redispatch_qr_routes_through_teacher_assist_never_unsupported_spawn() {
     let cfg = cfg_countdown(15);
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
     accounts.insert("acc1".to_string(), account_at("acc1", false));
     accounts.insert("teacher1".to_string(), account_at("teacher1", true));
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr1");
     let mut activity = gate_activity(&["acc1"]);
     activity.kind = RollcallKind::Qr;
     activity.acted = true;
     activity.needs_resign.insert("acc1".to_string());
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
-    redispatch_signs(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        "acc1",
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    let env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    redispatch_signs(&mut activities, &env, "acc1");
 
     // The teacher-assist flow owns the restore: it tries (and fails) against the unreachable
     // host and reports a REAL qr error — never spawn_sign's generic "unsupported here".
@@ -1656,31 +1442,17 @@ fn redispatch_qr_without_teacher_stays_pending_and_never_fake_dispatches() {
     let cfg = cfg_countdown(15);
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr1");
     let mut activity = gate_activity(&["acc1"]);
     activity.kind = RollcallKind::Qr;
     activity.acted = true;
     activity.needs_resign.insert("acc1".to_string());
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
-    redispatch_signs(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        "acc1",
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    let env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    redispatch_signs(&mut activities, &env, "acc1");
 
     // 0 偽派發: no teacher → nothing dispatchable — no SignResult (not even an "unsupported"
     // one) may be produced, and the account stays pending for a later restore.
@@ -1721,30 +1493,16 @@ async fn manual_qr_no_teacher_remote_configured_reaches_dispatch_not_requires_te
     let cfg = cfg_qr_remote_configured(15);
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
     accounts.insert("acc1".to_string(), account_at("acc1", false));
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr1");
     let mut activity = gate_activity(&["acc1"]);
     activity.kind = RollcallKind::Qr;
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
-    let result = on_sign_now(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        &key,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    let env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    let result = on_sign_now(&mut activities, &env, &key);
     assert!(
         result.is_ok(),
         "remote-configured QR without teacher must reach dispatch, not requires-teacher, got: {result:?}"
@@ -1778,13 +1536,9 @@ async fn manual_qr_no_teacher_remote_configured_reaches_dispatch_not_requires_te
 fn manual_qr_disabled_or_missing_key_still_requires_teacher() {
     let (tx, _rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let accounts: HashMap<String, Arc<Account>> = HashMap::new();
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr1");
     for cfg in [
         cfg_countdown(15),
         {
@@ -1806,19 +1560,8 @@ fn manual_qr_disabled_or_missing_key_still_requires_teacher() {
         let mut activity = gate_activity(&["acc1"]);
         activity.kind = RollcallKind::Qr;
         let mut activities = HashMap::from([(key.clone(), activity)]);
-        let err = on_sign_now(
-            &mut activities,
-            &accounts,
-            &tx,
-            &group,
-            &cfg,
-            noop_cb,
-            &key,
-            leaked_plan_tx(),
-            0,
-            leaked_qr_rev_rx(),
-        )
-        .unwrap_err();
+        let env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+        let err = on_sign_now(&mut activities, &env, &key).unwrap_err();
         assert!(
             err.contains("teacher helper"),
             "disabled/missing-key QR must retain teacher-required behavior, got: {err}"
@@ -1832,34 +1575,22 @@ async fn late_qr_no_teacher_remote_configured_is_dispatched_exactly_once() {
     let cfg = cfg_qr_remote_configured(15);
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
     accounts.insert("acc1".to_string(), account_at("acc1", false));
     accounts.insert("acc2".to_string(), account_at("acc2", false));
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr1");
     let mut activity = gate_activity(&["acc1"]);
     activity.kind = RollcallKind::Qr;
     activity.acted = true;
     activity.signed.insert("acc1".to_string());
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
-    on_detected(
+    let mut env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    env.set_plan(plan_for("acc2", &["acc2"]));
+    rollcall::on_detected(
         &mut activities,
-        DetectionContext {
-            accounts: &accounts,
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan_for("acc2", &["acc2"]),
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
+        &env,
         Detected {
             generation: 1,
             account_id: "acc2".to_string(),
@@ -1902,34 +1633,22 @@ fn late_qr_no_source_stays_undispatched_and_redispatch_stays_pending() {
     let cfg = cfg_countdown(15);
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let mut accounts: HashMap<String, Arc<Account>> = HashMap::new();
     accounts.insert("acc1".to_string(), account_at("acc1", false));
     accounts.insert("acc2".to_string(), account_at("acc2", false));
-    let key = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
+    let key = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr1");
     let mut activity = gate_activity(&["acc1"]);
     activity.kind = RollcallKind::Qr;
     activity.acted = true;
     activity.signed.insert("acc1".to_string());
     let mut activities = HashMap::from([(key.clone(), activity)]);
 
-    on_detected(
+    let mut env = env_from(noop_cb, &cfg, &accounts, &tx, &group);
+    env.set_plan(plan_for("acc2", &["acc2"]));
+    rollcall::on_detected(
         &mut activities,
-        DetectionContext {
-            accounts: &accounts,
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan_for("acc2", &["acc2"]),
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
+        &env,
         Detected {
             generation: 1,
             account_id: "acc2".to_string(),
@@ -1947,28 +1666,13 @@ fn late_qr_no_source_stays_undispatched_and_redispatch_stays_pending() {
     assert!(activities[&key].participants.contains("acc2"));
 
     // Also: redispatch with no source must stay pending (no fake dispatch).
-    let key2 = (
-        "http://127.0.0.1:1".to_string(),
-        "qrcode".to_string(),
-        "qr2".to_string(),
-    );
+    let key2 = ActivityKey::new("http://127.0.0.1:1", "qrcode", "qr2");
     let mut activity2 = gate_activity(&["acc1"]);
     activity2.kind = RollcallKind::Qr;
     activity2.acted = true;
     activity2.needs_resign.insert("acc1".to_string());
     let mut activities2 = HashMap::from([(key2.clone(), activity2)]);
-    redispatch_signs(
-        &mut activities2,
-        &accounts,
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        "acc1",
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    redispatch_signs(&mut activities2, &env, "acc1");
     assert!(activities2[&key2].needs_resign.contains("acc1"));
     assert!(rx.try_recv().is_err());
 }
@@ -2010,7 +1714,7 @@ fn overlapping_group_routes_fan_out_once_and_union_sources() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let plan = MonitorPlan {
         generation: 9,
         routes: vec![
@@ -2038,21 +1742,9 @@ fn overlapping_group_routes_fan_out_once_and_union_sources() {
         course_id: Some("course".into()),
     };
     let mut activities = HashMap::new();
-    on_detected(
-        &mut activities,
-        DetectionContext {
-            accounts: &HashMap::new(),
-            tx: &tx,
-            group: &group,
-            cb: noop_cb,
-            cfg: &cfg,
-            plan: &plan,
-            plan_tx: leaked_plan_tx(),
-            qr_rev: 0,
-            qr_rev_rx: leaked_qr_rev_rx(),
-        },
-        detection,
-    );
+    let mut env = env_from(noop_cb, &cfg, &HashMap::new(), &tx, &group);
+    env.set_plan(plan);
+    rollcall::on_detected(&mut activities, &env, detection);
     let activity = activities.values().next().unwrap();
     assert_eq!(
         activity.participants,
@@ -2072,13 +1764,10 @@ fn removing_last_source_cancels_pending_but_retains_authorized_execution() {
     authorized.sources.insert(TargetId::account("b"));
     authorized.acted = true;
     let mut activities = HashMap::from([
-        (("x".into(), "number".into(), "pending".into()), pending),
-        (
-            ("x".into(), "number".into(), "authorized".into()),
-            authorized,
-        ),
+        (ActivityKey::new("x", "number", "pending"), pending),
+        (ActivityKey::new("x", "number", "authorized"), authorized),
     ]);
-    cancel_removed_sources(
+    drop_removed_sources(
         &mut activities,
         &mut HashMap::new(),
         &MonitorPlan {
@@ -2086,8 +1775,8 @@ fn removing_last_source_cancels_pending_but_retains_authorized_execution() {
             routes: Vec::new(),
         },
     );
-    assert!(!activities.keys().any(|key| key.2 == "pending"));
-    assert!(activities.keys().any(|key| key.2 == "authorized"));
+    assert!(!activities.keys().any(|key| key.id == "pending"));
+    assert!(activities.keys().any(|key| key.id == "authorized"));
 }
 
 #[test]
@@ -2095,41 +1784,20 @@ fn definition_barrier_denies_mutation_until_rollback() {
     let cfg = cfg_countdown(15);
     let (tx, _rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
-    let key = ("x".into(), "number".into(), "rollcall".into());
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
+    let key = ActivityKey::new("x", "number", "rollcall");
     let mut activity = gate_activity(&["a"]);
     activity.sources.insert(TargetId::account("a"));
     activity.mutation_blocked = true;
     let mut activities = HashMap::from([(key.clone(), activity)]);
-    dispatch_signs(
-        &mut activities,
-        &HashMap::new(),
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        &key,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    let env = env_from(noop_cb, &cfg, &HashMap::new(), &tx, &group);
+    dispatch_signs(&mut activities, &env, &key);
     assert!(
         !activities[&key].acted,
         "barrier must deny the mutation permit"
     );
     activities.get_mut(&key).unwrap().mutation_blocked = false;
-    dispatch_signs(
-        &mut activities,
-        &HashMap::new(),
-        &tx,
-        &group,
-        &cfg,
-        noop_cb,
-        &key,
-        leaked_plan_tx(),
-        0,
-        leaked_qr_rev_rx(),
-    );
+    dispatch_signs(&mut activities, &env, &key);
     assert!(
         activities[&key].acted,
         "rollback re-enables the pending permit"
@@ -2244,7 +1912,7 @@ async fn qr_teacher_prepare_failure_before_put_fallbacks_to_remote_with_one_put_
     let student_base = format!("http://{student_addr}");
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let teacher = Arc::new(Account {
         id: "teacher1".to_string(),
         device_id: String::new(),
@@ -2267,7 +1935,7 @@ async fn qr_teacher_prepare_failure_before_put_fallbacks_to_remote_with_one_put_
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (student_base, "qrcode".to_string(), "RC-PREPARE".to_string());
+    let key = ActivityKey::new(student_base, "qrcode", "RC-PREPARE");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
     spawn_qr_teacher_assist(
         teacher,
@@ -2432,7 +2100,7 @@ async fn qr_teacher_first_fetch_failure_before_put_fallbacks_to_remote() {
     let student_base = format!("http://{student_addr}");
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let teacher = Arc::new(Account {
         id: "teacher1".to_string(),
         device_id: String::new(),
@@ -2455,7 +2123,7 @@ async fn qr_teacher_first_fetch_failure_before_put_fallbacks_to_remote() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (student_base, "qrcode".to_string(), "RC-FETCH".to_string());
+    let key = ActivityKey::new(student_base, "qrcode", "RC-FETCH");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
     spawn_qr_teacher_assist(
         teacher,
@@ -2612,7 +2280,7 @@ async fn qr_teacher_fanout_started_never_fallbacks_even_when_student_fails() {
     let student_base = format!("http://{student_addr}");
     let (tx, _rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let teacher = Arc::new(Account {
         id: "teacher1".to_string(),
         device_id: String::new(),
@@ -2635,7 +2303,7 @@ async fn qr_teacher_fanout_started_never_fallbacks_even_when_student_fails() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (student_base, "qrcode".to_string(), "RC-FANOUT".to_string());
+    let key = ActivityKey::new(student_base, "qrcode", "RC-FANOUT");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
     spawn_qr_teacher_assist(
         teacher,
@@ -2703,7 +2371,7 @@ async fn qr_teacher_failure_without_remote_preserves_teacher_error() {
     let student_base = format!("http://{student_addr}");
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let teacher = Arc::new(Account {
         id: "teacher1".to_string(),
         device_id: String::new(),
@@ -2726,11 +2394,7 @@ async fn qr_teacher_failure_without_remote_preserves_teacher_error() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (
-        student_base,
-        "qrcode".to_string(),
-        "RC-NOREMOTE".to_string(),
-    );
+    let key = ActivityKey::new(student_base, "qrcode", "RC-NOREMOTE");
     spawn_qr_teacher_assist(
         teacher,
         vec![student],
@@ -2869,14 +2533,10 @@ async fn qr_remote_fetch_started_near_deadline_not_accepted_after() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (
-        student_base,
-        "qrcode".to_string(),
-        "RC-DEADLINE-FETCH".to_string(),
-    );
+    let key = ActivityKey::new(student_base, "qrcode", "RC-DEADLINE-FETCH");
     let deadline = Instant::now() + Duration::from_millis(2000);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let remote_base_owned = remote_base.clone();
     let key_owned = key.clone();
     group.spawn(async move {
@@ -3029,14 +2689,10 @@ async fn qr_remote_fanout_does_not_start_put_after_deadline() {
         })
     };
     let students = vec![mk_student("s1", "u1"), mk_student("s2", "u2")];
-    let key: ActivityKey = (
-        student_base.clone(),
-        "qrcode".to_string(),
-        "RC-DEADLINE-FANOUT".to_string(),
-    );
+    let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-DEADLINE-FANOUT");
     let deadline = Instant::now() + Duration::from_millis(1500);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let rb = remote_base.clone();
     let key2 = key.clone();
     group.spawn(async move {
@@ -3173,7 +2829,7 @@ async fn qr_fallback_gets_only_remaining_time_not_new_window() {
     let student_base = format!("http://{student_addr}");
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let teacher = Arc::new(Account {
         id: "teacher1".to_string(),
         device_id: String::new(),
@@ -3196,11 +2852,7 @@ async fn qr_fallback_gets_only_remaining_time_not_new_window() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (
-        student_base,
-        "qrcode".to_string(),
-        "RC-FALLBACK-REMAINING".to_string(),
-    );
+    let key = ActivityKey::new(student_base, "qrcode", "RC-FALLBACK-REMAINING");
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
     // Paused time auto-advances: the teacher fails at ~11s, so the fallback starts with ~1s left
     // and its 5s token fetch must be cut off by the original deadline.
@@ -3335,14 +2987,10 @@ async fn qr_total_acquire_plus_fanout_bounded_by_deadline() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (
-        student_base.clone(),
-        "qrcode".to_string(),
-        "RC-BOUNDED".to_string(),
-    );
+    let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-BOUNDED");
     let deadline = Instant::now() + Duration::from_millis(1200);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let rb = remote_base.clone();
     let key2 = key.clone();
     group.spawn(async move {
@@ -3390,199 +3038,261 @@ async fn qr_total_acquire_plus_fanout_bounded_by_deadline() {
     group.cancel();
     tokio::time::resume();
 }
-// --- generation isolation (QR-only) ---
+// --- the actor's handling of QR job messages ---
 
-#[test]
-fn qr_generation_stale_qr_result_is_dropped_without_mutation() {
-    let (runtime_tx, mut runtime_rx) = unbounded_channel();
-    let (self_tx, mut _self_rx) = unbounded_channel::<MonitorMsg>();
-    let key: ActivityKey = (
-        "http://x".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
-    let mut activities: HashMap<ActivityKey, Activity> =
-        HashMap::from([(key.clone(), gate_activity(&["s1"]))]);
-    activities.get_mut(&key).unwrap().kind = RollcallKind::Qr;
+/// An actor on plan `generation` that already knows `activities`, with what it publishes to the
+/// engine and what it sends itself.
+fn actor_at(
+    generation: u64,
+    cfg: MonitorConfig,
+    activities: impl IntoIterator<Item = (ActivityKey, Activity)>,
+) -> (
+    Actor,
+    UnboundedReceiver<RuntimeEvent>,
+    UnboundedReceiver<MonitorMsg>,
+) {
+    let (tx, rx) = unbounded_channel();
+    let (runtime_tx, runtime_rx) = unbounded_channel();
+    let (panic_tx, _) = unbounded_channel();
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let plan = MonitorPlan {
-        generation: 2,
+        generation,
         routes: Vec::new(),
     };
-    let generation = 1u64;
-    let result: Result<SignOutcome, String> = Ok(SignOutcome {
+    let mut actor = Actor::new(Env::new(noop_cb, cfg, plan, tx, group, runtime_tx));
+    actor.activities.extend(activities);
+    (actor, runtime_rx, rx)
+}
+
+fn qr_key() -> ActivityKey {
+    ActivityKey::new("http://x", "qrcode", "qr1")
+}
+
+fn qr_activity(participants: &[&str], generation: u64) -> Activity {
+    Activity {
+        kind: RollcallKind::Qr,
+        plan_generation: generation,
+        ..gate_activity(participants)
+    }
+}
+
+fn qr_result(
+    account_id: &str,
+    generation: u64,
+    mutation_attempted: bool,
+    result: Result<SignOutcome, String>,
+) -> MonitorMsg {
+    MonitorMsg::QrSignResult {
+        key: qr_key(),
+        account_id: account_id.to_string(),
+        generation,
+        mutation_attempted,
+        result,
+    }
+}
+
+fn qr_signed(account_id: &str, generation: u64) -> MonitorMsg {
+    let outcome = SignOutcome {
         method: "qr".to_string(),
         discovered_code: None,
-    });
-    if generation != plan.generation {
-        // dropped
-    } else if let Some(a) = activities.get(&key) {
-        if a.plan_generation != generation {
-        } else {
-            publish_rollcall_result(&runtime_tx, &activities, &key, "s1", &result);
-            on_sign_result(
-                &mut activities,
-                &self_tx,
-                noop_cb,
-                key.clone(),
-                "s1".to_string(),
-                result,
-            );
-        }
-    }
-    assert!(
-        activities[&key].signed.is_empty(),
-        "stale must not mark signed"
-    );
-    assert!(activities[&key].needs_resign.is_empty() && activities[&key].sign_failed.is_empty());
-    assert!(
-        runtime_rx.try_recv().is_err(),
-        "stale must not publish runtime event"
-    );
-    assert!(_self_rx.try_recv().is_err(), "stale must not emit AuthLost");
-    let mut activities2: HashMap<ActivityKey, Activity> =
-        HashMap::from([(key.clone(), gate_activity(&["s1"]))]);
-    activities2.get_mut(&key).unwrap().kind = RollcallKind::Qr;
-    let plan2 = MonitorPlan {
-        generation: 1,
-        routes: Vec::new(),
     };
-    let generation2 = 1u64;
-    let result2: Result<SignOutcome, String> = Ok(SignOutcome {
-        method: "qr".to_string(),
-        discovered_code: None,
-    });
-    if generation2 == plan2.generation {
-        if let Some(a) = activities2.get(&key) {
-            if a.plan_generation == generation2 {
-                publish_rollcall_result(&runtime_tx, &activities2, &key, "s1", &result2);
-                on_sign_result(
-                    &mut activities2,
-                    &self_tx,
-                    noop_cb,
-                    key.clone(),
-                    "s1".to_string(),
-                    result2,
-                );
-            }
-        }
+    qr_result(account_id, generation, true, Ok(outcome))
+}
+
+fn qr_source_failed(generation: u64, reason: &str) -> MonitorMsg {
+    let (ack, _) = tokio::sync::oneshot::channel();
+    MonitorMsg::QrSourceFailed {
+        key: qr_key(),
+        generation,
+        reason: reason.to_string(),
+        ack,
     }
-    assert!(
-        activities2[&key].signed.contains("s1"),
-        "matching generation must apply"
-    );
+}
+
+fn untouched(activity: &Activity) -> bool {
+    activity.signed.is_empty()
+        && activity.sign_failed.is_empty()
+        && activity.needs_resign.is_empty()
+        && activity.resign_attempts.is_empty()
 }
 
 #[test]
-fn qr_generation_missing_activity_is_dropped() {
-    let (runtime_tx, mut runtime_rx) = unbounded_channel();
-    let (self_tx, _self_rx) = unbounded_channel::<MonitorMsg>();
-    let key: ActivityKey = (
-        "http://x".to_string(),
-        "qrcode".to_string(),
-        "missing".to_string(),
-    );
-    let mut activities: HashMap<ActivityKey, Activity> = HashMap::new();
-    let plan = MonitorPlan {
-        generation: 1,
-        routes: Vec::new(),
-    };
-    let generation = 1u64;
-    let result: Result<SignOutcome, String> = Ok(SignOutcome {
-        method: "qr".to_string(),
-        discovered_code: None,
-    });
-    if generation != plan.generation {
-    } else if let Some(a) = activities.get(&key) {
-        if a.plan_generation != generation {
-        } else {
-            publish_rollcall_result(&runtime_tx, &activities, &key, "s1", &result);
-            on_sign_result(
-                &mut activities,
-                &self_tx,
-                noop_cb,
-                key.clone(),
-                "s1".to_string(),
-                result,
-            );
-        }
-    } else {
-        // missing -> dropped
-    }
+fn a_qr_result_from_an_older_plan_is_dropped() {
+    let (mut actor, mut runtime_rx, mut rx) =
+        actor_at(2, cfg_countdown(15), [(qr_key(), qr_activity(&["s1"], 1))]);
+    actor.handle(qr_signed("s1", 1));
+    assert!(untouched(&actor.activities[&qr_key()]));
     assert!(
         runtime_rx.try_recv().is_err(),
-        "missing activity must not publish"
+        "a stale result is not published"
     );
+    assert!(rx.try_recv().is_err(), "a stale result starts nothing");
 }
 
 #[test]
-fn qr_generation_old_inflight_result_dropped_after_commit() {
-    let (runtime_tx, mut runtime_rx) = unbounded_channel();
-    let (self_tx, _self_rx) = unbounded_channel::<MonitorMsg>();
-    let key: ActivityKey = (
-        "http://x".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
-    let activities: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
-        let mut a = gate_activity(&["s1"]);
-        a.kind = RollcallKind::Qr;
-        a
-    })]);
-    let plan_new = MonitorPlan {
-        generation: 2,
-        routes: Vec::new(),
-    };
-    let gen_old = 1u64;
-    if gen_old != plan_new.generation {
-        // dropped
-    } else {
-        panic!("old must be considered stale");
-    }
-    assert!(activities[&key].signed.is_empty());
+fn a_qr_result_for_an_activity_detected_under_an_older_plan_is_dropped() {
+    let (mut actor, mut runtime_rx, _rx) =
+        actor_at(2, cfg_countdown(15), [(qr_key(), qr_activity(&["s1"], 1))]);
+    actor.handle(qr_signed("s1", 2));
+    assert!(untouched(&actor.activities[&qr_key()]));
     assert!(runtime_rx.try_recv().is_err());
-    let gen_new = 2u64;
-    if gen_new != plan_new.generation {
-        panic!("new plan must match");
-    } else if let Some(a) = activities.get(&key) {
-        if a.plan_generation != gen_new {
-            // dropped because retained activity still 1 -> correct per spec
-        } else {
-            panic!("retained activity must still be stale vs new generation");
-        }
-    }
-    assert!(
-        activities[&key].signed.is_empty(),
-        "retained activity stays stale vs new generation"
+}
+
+#[test]
+fn a_qr_result_for_an_unknown_activity_is_dropped() {
+    let (mut actor, mut runtime_rx, _rx) = actor_at(1, cfg_countdown(15), []);
+    actor.handle(qr_signed("s1", 1));
+    assert!(actor.activities.is_empty());
+    assert!(runtime_rx.try_recv().is_err());
+}
+
+#[test]
+fn a_qr_result_of_the_current_plan_is_applied_and_published() {
+    let (mut actor, mut runtime_rx, _rx) =
+        actor_at(2, cfg_countdown(15), [(qr_key(), qr_activity(&["s1"], 2))]);
+    actor.handle(qr_signed("s1", 2));
+    let activity = &actor.activities[&qr_key()];
+    assert!(activity.signed.contains("s1"));
+    assert_eq!(activity.qr, QrSource::Mutating);
+    assert!(matches!(
+        runtime_rx.try_recv(),
+        Ok(RuntimeEvent::AccountResult {
+            phase: AccountResultPhase::Succeeded,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_source_failure_leaves_the_activity_untouched_and_retryable() {
+    let unauthorized = "qr remote unauthorized";
+    let (mut actor, _runtime_rx, _rx) = actor_at(
+        1,
+        cfg_countdown(15),
+        [(qr_key(), qr_activity(&["acc1", "acc2"], 1))],
     );
-    let mut fresh: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
-        let mut a = gate_activity(&["s1"]);
-        a.kind = RollcallKind::Qr;
-        a.plan_generation = 2;
-        a
-    })]);
-    let result: Result<SignOutcome, String> = Ok(SignOutcome {
-        method: "qr".to_string(),
-        discovered_code: None,
+    actor.handle(qr_source_failed(1, unauthorized));
+    for account in ["acc1", "acc2"] {
+        actor.handle(qr_result(account, 1, false, Err(unauthorized.to_string())));
+    }
+    let activity = &actor.activities[&qr_key()];
+    assert_eq!(
+        activity.qr,
+        QrSource::Failed {
+            reason: unauthorized.to_string()
+        }
+    );
+    assert!(
+        untouched(activity),
+        "nothing was sent, so nothing is counted"
+    );
+
+    // A request that did go out replaces that state for good.
+    actor.handle(qr_result("acc1", 1, true, Err("boom".to_string())));
+    actor.handle(qr_source_failed(1, "late"));
+    let activity = &actor.activities[&qr_key()];
+    assert_eq!(activity.qr, QrSource::Mutating);
+    assert!(activity.sign_failed.contains("acc1"));
+    assert_eq!(activity.resign_attempts.get("acc1"), Some(&1));
+}
+
+#[test]
+fn a_source_failure_is_recorded_even_when_the_results_arrive_first() {
+    let (mut actor, _runtime_rx, _rx) = actor_at(
+        1,
+        cfg_countdown(15),
+        [(qr_key(), qr_activity(&["acc1"], 1))],
+    );
+    actor.handle(qr_result("acc1", 1, false, Err("no token".to_string())));
+    assert_eq!(actor.activities[&qr_key()].qr, QrSource::Untried);
+    actor.handle(qr_source_failed(1, "no token"));
+    assert!(matches!(
+        actor.activities[&qr_key()].qr,
+        QrSource::Failed { .. }
+    ));
+    assert!(untouched(&actor.activities[&qr_key()]));
+}
+
+#[tokio::test]
+async fn a_newly_usable_remote_retries_only_what_failed_for_want_of_a_source() {
+    let failed = || QrSource::Failed {
+        reason: "qr remote: no data".to_string(),
+    };
+    let mut activity = qr_activity(&["acc1", "acc2", "acc3"], 1);
+    activity.signed.insert("acc1".to_string());
+    activity.needs_resign.insert("acc3".to_string());
+    activity.sign_failed.insert("acc2".to_string());
+    activity.resign_attempts.insert("acc2".to_string(), 1);
+    activity.qr = failed();
+    let (mut actor, _runtime_rx, _rx) = actor_at(1, cfg_countdown(15), [(qr_key(), activity)]);
+    for id in ["acc1", "acc2", "acc3"] {
+        actor
+            .env
+            .accounts
+            .insert(id.to_string(), account_at(id, false));
+    }
+    let remote = |key: &str| {
+        let mut cfg = cfg_countdown(15);
+        cfg.qr_remote_enabled = true;
+        cfg.qr_remote_base_url = "https://qr.example".to_string();
+        cfg.qr_remote_key = Some(Arc::new(Secret::new(key.to_string())));
+        MonitorMsg::ConfigUpdated(Box::new(cfg))
+    };
+
+    actor.handle(remote("k1"));
+    let activity = &actor.activities[&qr_key()];
+    assert_eq!(
+        activity.qr,
+        QrSource::Untried,
+        "the failure is cleared for the retry"
+    );
+    assert!(
+        activity.signed.contains("acc1"),
+        "a signed account stays signed"
+    );
+    assert!(
+        activity.needs_resign.contains("acc3"),
+        "an account waiting on its session is not this retry's business"
+    );
+    assert!(!activity.sign_failed.contains("acc2"));
+    assert!(!activity.resign_attempts.contains_key("acc2"));
+
+    // The same settings again are not a change.
+    actor.activities.get_mut(&qr_key()).unwrap().qr = failed();
+    actor.handle(remote("k1"));
+    assert_eq!(actor.activities[&qr_key()].qr, failed());
+
+    // A rotated key is.
+    actor.handle(remote("k2"));
+    assert_eq!(actor.activities[&qr_key()].qr, QrSource::Untried);
+
+    // An activity that may have sent a request is never retried.
+    actor.activities.get_mut(&qr_key()).unwrap().qr = QrSource::Mutating;
+    actor.handle(remote("k3"));
+    assert_eq!(actor.activities[&qr_key()].qr, QrSource::Mutating);
+}
+
+#[test]
+fn a_change_is_visible_to_tasks_that_subscribe_after_it() {
+    // Nothing is subscribed when these changes happen: a plain watch `send` would drop them.
+    let (mut actor, _runtime_rx, _rx) = actor_at(1, cfg_countdown(15), []);
+    let (_, before) = actor.env.qr_revision();
+    actor.handle(MonitorMsg::ConfigUpdated(Box::new(
+        cfg_qr_remote_configured(15),
+    )));
+    actor.handle(MonitorMsg::ApplyPlan {
+        plan: MonitorPlan {
+            generation: 5,
+            routes: Vec::new(),
+        },
+        cancel_removed_pending: false,
     });
-    if gen_new == plan_new.generation {
-        if let Some(a) = fresh.get(&key) {
-            if a.plan_generation == gen_new {
-                publish_rollcall_result(&runtime_tx, &fresh, &key, "s1", &result);
-                on_sign_result(
-                    &mut fresh,
-                    &self_tx,
-                    noop_cb,
-                    key.clone(),
-                    "s1".to_string(),
-                    result,
-                );
-            }
-        }
-    }
-    assert!(
-        fresh[&key].signed.contains("s1"),
-        "fresh activity with new generation must apply"
+    let (_, after) = actor.env.qr_revision();
+    assert_ne!(
+        after, before,
+        "a later remote job must see the new settings revision"
     );
+    assert_eq!(actor.env.plan_rx().borrow().generation, 5);
 }
 
 #[tokio::test]
@@ -3662,14 +3372,10 @@ async fn qr_generation_change_during_remote_fetch_prevents_put() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (
-        student_base.clone(),
-        "qrcode".to_string(),
-        "RC-GEN-FETCH".to_string(),
-    );
+    let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-GEN-FETCH");
     let deadline = Instant::now() + Duration::from_secs(12);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     group.spawn(async move {
         run_qr_remote(
             deadline,
@@ -3780,14 +3486,10 @@ async fn qr_generation_change_before_next_fanout_chunk_prevents_later_put() {
     });
     let (tx, mut rx) = unbounded_channel();
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
-    let key: ActivityKey = (
-        student_base.clone(),
-        "qrcode".to_string(),
-        "RC-GEN-CHUNK".to_string(),
-    );
+    let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-GEN-CHUNK");
     let deadline = Instant::now() + Duration::from_secs(12);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     group.spawn(async move {
         run_qr_remote(
             deadline,
@@ -3839,331 +3541,6 @@ async fn qr_generation_change_before_next_fanout_chunk_prevents_later_put() {
         "no later chunk messages after generation change, got {msgs}"
     );
     group.cancel();
-}
-
-fn qr_source_failed_via_actor(
-    activities: &mut HashMap<ActivityKey, Activity>,
-    plan: &MonitorPlan,
-    key: &ActivityKey,
-    generation: u64,
-    reason: &str,
-) {
-    // Simulate the actor's QrSourceFailed handler synchronously for focused tests.
-    if let Some(a) = activities.get_mut(key) {
-        if a.plan_generation == generation
-            && plan.generation == generation
-            && a.kind == RollcallKind::Qr
-            && !a.mutation_started
-        {
-            a.source_failed_without_mutation = true;
-            a.qr_source_failed_reason = Some(reason.to_string());
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_qr_sign_result_focused(
-    activities: &mut HashMap<ActivityKey, Activity>,
-    runtime_tx: &tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    self_tx: &tokio::sync::mpsc::UnboundedSender<MonitorMsg>,
-    plan: &MonitorPlan,
-    key: ActivityKey,
-    account_id: String,
-    generation: u64,
-    mutation_attempted: bool,
-    result: Result<SignOutcome, String>,
-) {
-    // Mirrors the actor's QrSignResult branch after the bookkeeping fix.
-    if generation != plan.generation {
-        return;
-    }
-    let Some(a) = activities.get_mut(&key) else {
-        return;
-    };
-    if a.plan_generation != generation {
-        return;
-    }
-    if a.kind == RollcallKind::Qr && !mutation_attempted {
-        publish_rollcall_result(runtime_tx, activities, &key, &account_id, &result);
-        return;
-    }
-    if a.kind == RollcallKind::Qr {
-        a.mutation_started = true;
-        a.source_failed_without_mutation = false;
-    }
-    publish_rollcall_result(runtime_tx, activities, &key, &account_id, &result);
-    on_sign_result(activities, self_tx, noop_cb, key, account_id, result);
-}
-
-#[test]
-fn qr_source_failure_then_false_result_preserves_flag_and_no_mutation_state() {
-    let (runtime_tx, mut runtime_rx) = unbounded_channel();
-    let (self_tx, mut self_rx) = unbounded_channel::<MonitorMsg>();
-    let key: ActivityKey = (
-        "http://x".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
-    let mut activities: HashMap<ActivityKey, Activity> =
-        HashMap::from([(key.clone(), gate_activity(&["acc1", "acc2"]))]);
-    activities.get_mut(&key).unwrap().kind = RollcallKind::Qr;
-    let plan = MonitorPlan {
-        generation: 1,
-        routes: Vec::new(),
-    };
-    qr_source_failed_via_actor(&mut activities, &plan, &key, 1, "qr remote unauthorized");
-    assert!(activities[&key].source_failed_without_mutation);
-    assert!(!activities[&key].mutation_started);
-    // Source-only failures for each account must not increment resign/sign_failed/needs_resign.
-    for acc in ["acc1", "acc2"] {
-        handle_qr_sign_result_focused(
-            &mut activities,
-            &runtime_tx,
-            &self_tx,
-            &plan,
-            key.clone(),
-            acc.to_string(),
-            1,
-            false,
-            Err("qr remote unauthorized".to_string()),
-        );
-    }
-    let a = &activities[&key];
-    assert!(
-        a.source_failed_without_mutation,
-        "false result must preserve source flag"
-    );
-    assert!(
-        !a.mutation_started,
-        "false result must not mark mutation_started"
-    );
-    assert!(
-        a.sign_failed.is_empty(),
-        "source-only must not insert sign_failed"
-    );
-    assert!(a.needs_resign.is_empty());
-    assert!(
-        a.resign_attempts.is_empty(),
-        "source-only must not increment resign_attempts"
-    );
-    assert!(a.signed.is_empty());
-    // Ordering robust: opposite order (false result before QrSourceFailed) also preserves flag.
-    let mut activities2: HashMap<ActivityKey, Activity> =
-        HashMap::from([(key.clone(), gate_activity(&["acc1"]))]);
-    activities2.get_mut(&key).unwrap().kind = RollcallKind::Qr;
-    handle_qr_sign_result_focused(
-        &mut activities2,
-        &runtime_tx,
-        &self_tx,
-        &plan,
-        key.clone(),
-        "acc1".to_string(),
-        1,
-        false,
-        Err("qr remote unauthorized".to_string()),
-    );
-    assert!(
-        !activities2[&key].source_failed_without_mutation,
-        "no source_failed yet"
-    );
-    qr_source_failed_via_actor(&mut activities2, &plan, &key, 1, "qr remote unauthorized");
-    assert!(
-        activities2[&key].source_failed_without_mutation,
-        "subsequent QrSourceFailed must still mark"
-    );
-    assert!(!activities2[&key].mutation_started);
-    let _ = self_rx.try_recv();
-    let _ = runtime_rx.try_recv();
-    // True result still uses normal state.
-    handle_qr_sign_result_focused(
-        &mut activities,
-        &runtime_tx,
-        &self_tx,
-        &plan,
-        key.clone(),
-        "acc1".to_string(),
-        1,
-        true,
-        Err("boom".to_string()),
-    );
-    let a = &activities[&key];
-    assert!(a.mutation_started, "true must mark mutation_started");
-    assert!(
-        !a.source_failed_without_mutation,
-        "true must clear source_failed"
-    );
-    assert!(a.sign_failed.contains("acc1"));
-    assert_eq!(a.resign_attempts.get("acc1"), Some(&1));
-}
-
-#[tokio::test]
-async fn qr_rearm_clears_source_only_failures_once_and_preserves_signed_needs_resign() {
-    let cfg_old = cfg_countdown(15);
-    let mut cfg_new = cfg_countdown(15);
-    cfg_new.qr_remote_enabled = true;
-    cfg_new.qr_remote_base_url = "https://qr.example".to_string();
-    cfg_new.qr_remote_key = Some(Arc::new(Secret::new("k1".to_string())));
-    let plan = MonitorPlan {
-        generation: 1,
-        routes: Vec::new(),
-    };
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
-    let key: ActivityKey = (
-        "http://x".to_string(),
-        "qrcode".to_string(),
-        "qr1".to_string(),
-    );
-    let mut activities: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
-        let mut a = gate_activity(&["acc1", "acc2", "acc3"]);
-        a.kind = RollcallKind::Qr;
-        a.participants =
-            HashSet::from(["acc1".to_string(), "acc2".to_string(), "acc3".to_string()]);
-        a.signed.insert("acc1".to_string());
-        a.needs_resign.insert("acc3".to_string());
-        a.sign_failed.insert("acc2".to_string());
-        a.resign_attempts.insert("acc2".to_string(), 1);
-        a.source_failed_without_mutation = true;
-        a.qr_source_failed_reason = Some("qr remote: no data".to_string());
-        a
-    })]);
-    let accounts: HashMap<String, Arc<Account>> = HashMap::from([
-        (
-            "acc1".to_string(),
-            Arc::new(Account {
-                id: "acc1".to_string(),
-                device_id: String::new(),
-                user_no: String::new(),
-                is_teacher: false,
-                course_id: None,
-                base_url: "http://x".to_string(),
-                client: crate::http::client(),
-                username: String::new(),
-                password: Secret::default(),
-            }),
-        ),
-        (
-            "acc2".to_string(),
-            Arc::new(Account {
-                id: "acc2".to_string(),
-                device_id: String::new(),
-                user_no: String::new(),
-                is_teacher: false,
-                course_id: None,
-                base_url: "http://x".to_string(),
-                client: crate::http::client(),
-                username: String::new(),
-                password: Secret::default(),
-            }),
-        ),
-        (
-            "acc3".to_string(),
-            Arc::new(Account {
-                id: "acc3".to_string(),
-                device_id: String::new(),
-                user_no: String::new(),
-                is_teacher: false,
-                course_id: None,
-                base_url: "http://x".to_string(),
-                client: crate::http::client(),
-                username: String::new(),
-                password: Secret::default(),
-            }),
-        ),
-    ]);
-    assert!(is_meaningful_qr_remote_change(&cfg_old, &cfg_new));
-    let plan_tx = test_plan_tx();
-    rearm_qr_source_failed_activities(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg_new,
-        noop_cb,
-        &plan,
-        &plan_tx,
-        0,
-        leaked_qr_rev_rx(),
-    );
-    let a = &activities[&key];
-    assert!(!a.source_failed_without_mutation);
-    assert!(a.qr_source_failed_reason.is_none());
-    assert!(a.signed.contains("acc1"), "signed must be preserved");
-    assert!(
-        a.needs_resign.contains("acc3"),
-        "needs_resign (possibly mutated) must not be cleared"
-    );
-    assert!(
-        !a.sign_failed.contains("acc2"),
-        "legacy source-only sign_failed for unsigned must be cleared on rearm"
-    );
-    assert!(
-        !a.resign_attempts.contains_key("acc2"),
-        "legacy source-only attempts must be cleared"
-    );
-    // Identical config must do zero.
-    let before = activities[&key].source_failed_without_mutation;
-    rearm_qr_source_failed_activities(
-        &mut activities,
-        &accounts,
-        &tx,
-        &group,
-        &cfg_new,
-        noop_cb,
-        &plan,
-        &plan_tx,
-        0,
-        leaked_qr_rev_rx(),
-    );
-    assert_eq!(activities[&key].source_failed_without_mutation, before);
-    assert!(!is_meaningful_qr_remote_change(&cfg_new, &cfg_new));
-    // Second meaningful change still rearms at most once per ConfigUpdated (no hot loop).
-    let mut activities3: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
-        let mut a = gate_activity(&["acc1"]);
-        a.kind = RollcallKind::Qr;
-        a.source_failed_without_mutation = true;
-        a.qr_source_failed_reason = Some("x".to_string());
-        a
-    })]);
-    let mut cfg_new2 = cfg_new.clone();
-    cfg_new2.qr_remote_key = Some(Arc::new(Secret::new("k2".to_string())));
-    assert!(is_meaningful_qr_remote_change(&cfg_new, &cfg_new2));
-    rearm_qr_source_failed_activities(
-        &mut activities3,
-        &accounts,
-        &tx,
-        &group,
-        &cfg_new2,
-        noop_cb,
-        &plan,
-        &plan_tx,
-        0,
-        leaked_qr_rev_rx(),
-    );
-    assert!(!activities3[&key].source_failed_without_mutation);
-    // Mutation-started activity never rearms.
-    let mut activities4: HashMap<ActivityKey, Activity> = HashMap::from([(key.clone(), {
-        let mut a = gate_activity(&["acc1"]);
-        a.kind = RollcallKind::Qr;
-        a.source_failed_without_mutation = true;
-        a.mutation_started = true;
-        a.qr_source_failed_reason = Some("x".to_string());
-        a
-    })]);
-    rearm_qr_source_failed_activities(
-        &mut activities4,
-        &accounts,
-        &tx,
-        &group,
-        &cfg_new2,
-        noop_cb,
-        &plan,
-        &plan_tx,
-        0,
-        leaked_qr_rev_rx(),
-    );
-    assert!(activities4[&key].source_failed_without_mutation);
 }
 
 #[test]
@@ -4271,14 +3648,10 @@ async fn qr_remote_revision_change_during_fetch_cancels_old_and_prevents_put() {
     });
     let (tx, mut rx) = unbounded_channel();
     let secret = Arc::new(Secret::new("k-qr-test".to_string()));
-    let key: ActivityKey = (
-        student_base.clone(),
-        "qrcode".to_string(),
-        "RC-REV-FETCH".to_string(),
-    );
+    let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-REV-FETCH");
     let deadline = Instant::now() + Duration::from_secs(12);
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     let rev_rx_clone = rev_rx.clone();
     group.spawn(async move {
         run_qr_remote(
@@ -4427,14 +3800,10 @@ async fn qr_teacher_fallback_refuses_stale_remote_lease_on_revision_change() {
         username: String::new(),
         password: crate::secrets::Secret::default(),
     });
-    let key: ActivityKey = (
-        student_base.clone(),
-        "qrcode".to_string(),
-        "RC-REV-FALLBACK".to_string(),
-    );
+    let key = ActivityKey::new(student_base.clone(), "qrcode", "RC-REV-FALLBACK");
     let (tx, mut rx) = unbounded_channel();
     let (panic_tx, _panic_rx) = unbounded_channel();
-    let group = TaskGroup::new(noop_cb, panic_tx);
+    let group = Arc::new(TaskGroup::new(noop_cb, panic_tx));
     // Lease is stale: create rev channel at 0, then bump to 1 before teacher assist starts its fallback.
     let (rev_tx, rev_rx) = watch::channel(0u64);
     let _ = rev_tx.send(1);
@@ -4494,12 +3863,8 @@ async fn qr_teacher_fallback_refuses_stale_remote_lease_on_revision_change() {
 #[tokio::test]
 async fn qr_remote_fanout_panic_sanitizes_unresolved_and_emits_core_panicked() {
     let (panic_tx, mut panic_rx) = tokio::sync::mpsc::unbounded_channel();
-    let group = TaskGroup::new(record_cb, panic_tx);
-    let key: ActivityKey = (
-        "http://127.0.0.1:9".to_string(),
-        "qrcode".to_string(),
-        "RC-PANIC-REMOTE".to_string(),
-    );
+    let group = Arc::new(TaskGroup::new(record_cb, panic_tx));
+    let key = ActivityKey::new("http://127.0.0.1:9", "qrcode", "RC-PANIC-REMOTE");
     let generation = 1u64;
     let students: Vec<Arc<Account>> = ["s1", "s2", "s3", "s4"]
         .iter()
@@ -4641,12 +4006,8 @@ async fn qr_remote_fanout_panic_sanitizes_unresolved_and_emits_core_panicked() {
 #[tokio::test]
 async fn qr_teacher_fanout_panic_sanitizes_unresolved_and_emits_core_panicked() {
     let (panic_tx, mut panic_rx) = tokio::sync::mpsc::unbounded_channel();
-    let group = TaskGroup::new(record_cb, panic_tx);
-    let key: ActivityKey = (
-        "http://127.0.0.1:9".to_string(),
-        "qrcode".to_string(),
-        "RC-PANIC-TEACHER".to_string(),
-    );
+    let group = Arc::new(TaskGroup::new(record_cb, panic_tx));
+    let key = ActivityKey::new("http://127.0.0.1:9", "qrcode", "RC-PANIC-TEACHER");
     let generation = 7u64;
     let students: Vec<Arc<Account>> = ["t1", "t2", "t3"]
         .iter()

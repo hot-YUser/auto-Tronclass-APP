@@ -26,17 +26,6 @@ pub enum Source {
 }
 
 impl Source {
-    pub fn parse(s: &str) -> Source {
-        match s {
-            "vote" | "interaction" => Source::Vote,
-            "courseware-quiz" | "courseware_quiz" => Source::CoursewareQuiz,
-            "classroom-exam" | "classroom_exam" => Source::ClassroomExam,
-            "homework" => Source::Homework,
-            "questionnaire" => Source::Questionnaire,
-            _ => Source::Exam,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Source::Exam => "exam",
