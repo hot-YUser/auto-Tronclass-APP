@@ -113,13 +113,10 @@ pub(super) fn apply_config_patch(settings: &mut Settings, patch: &Value) -> Resu
             "enable_llm_tools" => settings.enable_llm_tools = bool_field(key, value)?,
             "max_tool_iterations" => settings.max_tool_iterations = u32_field(key, value)?,
             "radar_strategy" => settings.radar_strategy = str_vec_field(key, value)?,
-            "number_concurrency" => settings.number_concurrency = u32_field(key, value)?,
-            "number_min_concurrency" => settings.number_min_concurrency = u32_field(key, value)?,
             "number_cooldown_ms" => settings.number_cooldown_ms = u64_field(key, value)?,
             "number_max_cooldowns" => settings.number_max_cooldowns = u32_field(key, value)?,
             "poll_idle_secs" => settings.poll_idle_secs = u64_field(key, value)?,
             "quiz_detect_secs" => settings.quiz_detect_secs = u64_field(key, value)?,
-            "log_level" => settings.log_level = str_field(key, value)?,
             "qr_remote_enabled" => settings.qr_remote_enabled = bool_field(key, value)?,
             "qr_remote_base_url" => {
                 let raw = str_field(key, value)?;

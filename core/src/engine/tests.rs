@@ -1014,48 +1014,51 @@ fn single_field_patch_cannot_break_cross_field_invariants() {
     )
     .is_some());
 
-    // Defaults: number_concurrency=100, number_min_concurrency=5. A SINGLE-field patch must not
-    // be able to break the invariant against the CURRENT value (patch-only checks would miss it).
+    // With the remote address cleared, switching the remote on is incoherent. The patch that does
+    // so names one field only, so the rule must be checked against the value already stored.
     send(
         &core,
-        r#"{"id":3,"cmd":"UpdateConfig","patch":{"number_min_concurrency":300}}"#.as_bytes(),
+        r#"{"id":3,"cmd":"UpdateConfig","patch":{"qr_remote_base_url":""}}"#.as_bytes(),
     );
-    let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == 3, 5).expect("min>max reply");
+    assert!(wait_for(
+        |v| v["event"] == "Reply" && v["id"] == 3 && v["ok"] == true,
+        5
+    )
+    .is_some());
+    send(
+        &core,
+        r#"{"id":4,"cmd":"UpdateConfig","patch":{"qr_remote_enabled":true}}"#.as_bytes(),
+    );
+    let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == 4, 5).expect("reply");
     assert_eq!(reply["ok"], false);
     assert!(reply["error"]
         .as_str()
         .unwrap()
-        .contains("number_min_concurrency"));
+        .contains("qr_remote_base_url"));
 
-    send(
-        &core,
-        r#"{"id":4,"cmd":"UpdateConfig","patch":{"number_concurrency":1}}"#.as_bytes(),
-    );
-    let reply = wait_for(|v| v["event"] == "Reply" && v["id"] == 4, 5).expect("max<min reply");
-    assert_eq!(reply["ok"], false);
-
-    // Both failures left memory AND disk untouched.
+    // The refusal left the disk untouched.
     let config_path = std::path::Path::new(&dir).join("config.json");
-    let on_disk: Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    assert_eq!(on_disk["settings"]["number_concurrency"], 100);
-    assert_eq!(on_disk["settings"]["number_min_concurrency"], 5);
+    let on_disk = || -> Value {
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap()
+    };
+    assert_eq!(on_disk()["settings"]["qr_remote_enabled"], false);
 
     // A coherent pair still applies.
     send(
-            &core,
-            r#"{"id":5,"cmd":"UpdateConfig","patch":{"number_concurrency":8,"number_min_concurrency":8}}"#
-                .as_bytes(),
-        );
+        &core,
+        r#"{"id":5,"cmd":"UpdateConfig","patch":{"qr_remote_enabled":true,"qr_remote_base_url":"https://qr.example"}}"#
+            .as_bytes(),
+    );
     assert!(wait_for(
         |v| v["event"] == "Reply" && v["id"] == 5 && v["ok"] == true,
         5
     )
     .is_some());
-    let on_disk: Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    assert_eq!(on_disk["settings"]["number_concurrency"], 8);
-    assert_eq!(on_disk["settings"]["number_min_concurrency"], 8);
+    assert_eq!(on_disk()["settings"]["qr_remote_enabled"], true);
+    assert_eq!(
+        on_disk()["settings"]["qr_remote_base_url"],
+        "https://qr.example"
+    );
 }
 
 #[test]
@@ -1167,10 +1170,6 @@ fn update_config_rejects_malformed_or_unknown_fields_without_touching_disk() {
     assert_eq!(
         on_disk["settings"]["radar_strategy"],
         json!(Settings::default().radar_strategy)
-    );
-    assert_eq!(
-        on_disk["settings"]["log_level"],
-        Settings::default().log_level
     );
 }
 

@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_SCHEMA_VERSION: u8 = 1;
+pub const CONFIG_SCHEMA_VERSION: u8 = 2;
 pub(crate) const AUTOANSWER_TYPES: &[&str] = &[
     "exam",
     "questionnaire",
@@ -16,7 +16,6 @@ pub(crate) const AUTOANSWER_TYPES: &[&str] = &[
     "courseware",
 ];
 pub(crate) const RADAR_STRATEGIES: &[&str] = &["empty_answer", "global_wgs84"];
-pub(crate) const LOG_LEVELS: &[&str] = &["normal", "debug"];
 const MINUTES_PER_DAY: u16 = 1_440;
 const MINUTES_PER_WEEK: u32 = 7 * MINUTES_PER_DAY as u32;
 
@@ -49,13 +48,10 @@ pub struct Settings {
     pub enable_llm_tools: bool,
     pub max_tool_iterations: u32,
     pub radar_strategy: Vec<String>,
-    pub number_concurrency: u32,
-    pub number_min_concurrency: u32,
     pub number_cooldown_ms: u64,
     pub number_max_cooldowns: u32,
     pub poll_idle_secs: u64,
     pub quiz_detect_secs: u64,
-    pub log_level: String,
     pub qr_remote_enabled: bool,
     pub qr_remote_base_url: String,
 }
@@ -76,13 +72,10 @@ impl Default for Settings {
             enable_llm_tools: true,
             max_tool_iterations: 3,
             radar_strategy: all(RADAR_STRATEGIES),
-            number_concurrency: 100,
-            number_min_concurrency: 5,
             number_cooldown_ms: 5_000,
             number_max_cooldowns: 3,
             poll_idle_secs: 5,
             quiz_detect_secs: 45,
-            log_level: "normal".to_string(),
             qr_remote_enabled: false,
             qr_remote_base_url: "https://api.hlp.qzz.io".to_string(),
         }
@@ -123,9 +116,6 @@ impl Settings {
             RADAR_STRATEGIES,
             false,
         )?;
-        if !LOG_LEVELS.contains(&self.log_level.as_str()) {
-            return Err("log_level 必須是 normal 或 debug".to_string());
-        }
         validate_range("max_answer_reask", u64::from(self.max_answer_reask), 1, 100)?;
         validate_range(
             "prepare_retry_budget_secs",
@@ -139,21 +129,6 @@ impl Settings {
             0,
             100,
         )?;
-        validate_range(
-            "number_concurrency",
-            u64::from(self.number_concurrency),
-            1,
-            256,
-        )?;
-        validate_range(
-            "number_min_concurrency",
-            u64::from(self.number_min_concurrency),
-            1,
-            256,
-        )?;
-        if self.number_min_concurrency > self.number_concurrency {
-            return Err("number_min_concurrency 不得大於 number_concurrency".to_string());
-        }
         validate_range("number_cooldown_ms", self.number_cooldown_ms, 1, 3_600_000)?;
         validate_range(
             "number_max_cooldowns",
@@ -422,15 +397,14 @@ impl std::fmt::Display for ConfigLoadError {
             Self::InvalidJson => write!(formatter, "invalid config JSON"),
             Self::UnsupportedSchema => write!(formatter, "unsupported config schema"),
             Self::UnsupportedOrCorrupt => write!(formatter, "unsupported or corrupt config"),
-            Self::Backup(error) => write!(formatter, "backup legacy config: {error}"),
+            Self::Backup(error) => write!(formatter, "backup older config: {error}"),
             Self::Write(error) => write!(formatter, "write config: {error}"),
         }
     }
 }
 
 impl Config {
-    /// Strictly reads schema 1. A missing file returns an in-memory empty schema for utility callers;
-    /// application startup must use `initialize`, which persists that schema.
+    /// Read a config of the current schema; a missing file reads as the empty config.
     #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self, ConfigLoadError> {
         let bytes = match fs::read(path) {
@@ -440,70 +414,73 @@ impl Config {
             }
             Err(error) => return Err(ConfigLoadError::Read(error.to_string())),
         };
-        Self::parse_schema_one(&bytes)
-    }
-
-    /// Classifies the original bytes before touching them. Only the exact legacy schema is backed up
-    /// and reset; corrupt and future schemas remain byte-for-byte untouched.
-    pub fn initialize(path: &Path) -> Result<InitializedConfig, ConfigLoadError> {
-        let seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        Self::initialize_at(path, seconds)
-    }
-
-    fn initialize_at(path: &Path, unix_seconds: u64) -> Result<InitializedConfig, ConfigLoadError> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let config = Self::default();
-                config.save(path).map_err(ConfigLoadError::Write)?;
-                return Ok(InitializedConfig {
-                    config,
-                    reset_notice: None,
-                });
-            }
-            Err(error) => return Err(ConfigLoadError::Read(error.to_string())),
-        };
-
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| ConfigLoadError::InvalidJson)?;
-        if value.get("schema_version").is_some() {
-            let config = Self::parse_schema_one(&bytes)?;
-            return Ok(InitializedConfig {
-                config,
-                reset_notice: None,
-            });
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(CONFIG_SCHEMA_VERSION))
+        {
+            return Err(ConfigLoadError::UnsupportedSchema);
         }
-        serde_json::from_value::<LegacyConfigShape>(value)
-            .map_err(|_| ConfigLoadError::UnsupportedOrCorrupt)?;
-
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config.json");
-        let backup_path = path.with_file_name(format!("{file_name}.pre-groups-{unix_seconds}.bak"));
-        crate::atomic_file::create_new(&backup_path, &bytes)
-            .map_err(|error| ConfigLoadError::Backup(error.to_string()))?;
-        let config = Self::default();
-        config.save(path).map_err(ConfigLoadError::Write)?;
-        Ok(InitializedConfig {
-            config,
-            reset_notice: Some(ConfigResetNotice { backup_path }),
-        })
+        Self::parse(value)
     }
 
-    fn parse_schema_one(bytes: &[u8]) -> Result<Self, ConfigLoadError> {
+    /// Load the config for this run, creating it on first start. A file written by an older build
+    /// is kept as a backup and replaced by an empty config; the caller is told so through
+    /// `reset_notice`. A file that is not JSON, or that a newer build wrote, is left exactly as
+    /// it is and reported as an error.
+    pub fn initialize(path: &Path) -> Result<InitializedConfig, ConfigLoadError> {
+        Self::initialize_at(path, crate::time::now())
+    }
+
+    fn initialize_at(path: &Path, unix_seconds: i64) -> Result<InitializedConfig, ConfigLoadError> {
+        let fresh = |reset_notice| {
+            let config = Self::default();
+            config.save(path).map_err(ConfigLoadError::Write)?;
+            Ok(InitializedConfig {
+                config,
+                reset_notice,
+            })
+        };
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return fresh(None),
+            Err(error) => return Err(ConfigLoadError::Read(error.to_string())),
+        };
         let value: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|_| ConfigLoadError::InvalidJson)?;
+            serde_json::from_slice(&bytes).map_err(|_| ConfigLoadError::InvalidJson)?;
+        if !value.is_object() {
+            return Err(ConfigLoadError::UnsupportedOrCorrupt);
+        }
+        let current = u64::from(CONFIG_SCHEMA_VERSION);
         match value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
         {
-            Some(version) if version == u64::from(CONFIG_SCHEMA_VERSION) => {}
-            _ => return Err(ConfigLoadError::UnsupportedSchema),
+            Some(version) if version == current => Ok(InitializedConfig {
+                config: Self::parse(value)?,
+                reset_notice: None,
+            }),
+            Some(version) if version > current => Err(ConfigLoadError::UnsupportedSchema),
+            // An older build's file, versioned or not.
+            _ => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("config.json");
+                let backup_path = path.with_file_name(format!(
+                    "{file_name}.pre-v{CONFIG_SCHEMA_VERSION}-{unix_seconds}.bak"
+                ));
+                crate::atomic_file::create_new(&backup_path, &bytes)
+                    .map_err(|error| ConfigLoadError::Backup(error.to_string()))?;
+                fresh(Some(ConfigResetNotice { backup_path }))
+            }
         }
+    }
+
+    /// A config of the current schema, strictly: unknown fields and invalid values are errors.
+    fn parse(value: serde_json::Value) -> Result<Self, ConfigLoadError> {
         let config: Self =
             serde_json::from_value(value).map_err(|_| ConfigLoadError::UnsupportedOrCorrupt)?;
         config
@@ -817,110 +794,6 @@ fn validate_qr_remote(enabled: &bool, base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyConfigShape {
-    #[serde(rename = "active_account")]
-    _active_account: Option<String>,
-    #[serde(rename = "accounts")]
-    _accounts: Vec<LegacyAccountShape>,
-    #[serde(rename = "settings")]
-    _settings: LegacySettingsShape,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyAccountShape {
-    #[serde(rename = "id")]
-    _id: String,
-    #[serde(rename = "label")]
-    _label: String,
-    #[serde(rename = "school_ref")]
-    _school_ref: String,
-    #[serde(rename = "username")]
-    _username: String,
-    #[serde(rename = "device_id", default)]
-    _device_id: String,
-    #[serde(rename = "is_teacher", default)]
-    _is_teacher: bool,
-    #[serde(rename = "course_id", default)]
-    _course_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacySettingsShape {
-    #[serde(rename = "countdown_secs")]
-    _countdown_secs: u64,
-    #[serde(rename = "attendance_gate_percent")]
-    _attendance_gate_percent: f64,
-    #[serde(rename = "llm_endpoint")]
-    _llm_endpoint: String,
-    #[serde(rename = "llm_model")]
-    _llm_model: String,
-    #[serde(rename = "llm_max_tokens")]
-    _llm_max_tokens: u32,
-    #[serde(rename = "resubmit_for_correct")]
-    _resubmit_for_correct: bool,
-    #[serde(rename = "max_answer_reask")]
-    _max_answer_reask: u32,
-    #[serde(rename = "prepare_retry_budget_secs")]
-    _prepare_retry_budget_secs: u64,
-    #[serde(rename = "autoanswer_types")]
-    _autoanswer_types: Vec<String>,
-    #[serde(rename = "enable_llm_tools")]
-    _enable_llm_tools: bool,
-    #[serde(rename = "max_tool_iterations")]
-    _max_tool_iterations: u32,
-    #[serde(rename = "radar_strategy")]
-    _radar_strategy: Vec<String>,
-    #[serde(rename = "number_concurrency")]
-    _number_concurrency: u32,
-    #[serde(rename = "number_min_concurrency")]
-    _number_min_concurrency: u32,
-    #[serde(rename = "number_cooldown_ms")]
-    _number_cooldown_ms: u64,
-    #[serde(rename = "number_max_cooldowns")]
-    _number_max_cooldowns: u32,
-    #[serde(rename = "poll_idle_secs")]
-    _poll_idle_secs: u64,
-    #[serde(rename = "quiz_detect_secs")]
-    _quiz_detect_secs: u64,
-    #[serde(rename = "log_level")]
-    _log_level: String,
-    #[serde(rename = "operating")]
-    _operating: LegacyOperatingShape,
-    #[serde(rename = "tz_offset_minutes")]
-    _tz_offset_minutes: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyOperatingShape {
-    #[serde(rename = "days")]
-    _days: Vec<LegacyDayShape>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyDayShape {
-    #[serde(rename = "weekday")]
-    _weekday: u8,
-    #[serde(rename = "enabled")]
-    _enabled: bool,
-    #[serde(rename = "windows")]
-    _windows: Vec<LegacyWindowShape>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyWindowShape {
-    #[serde(rename = "start")]
-    _start: String,
-    #[serde(rename = "end")]
-    _end: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_is_persisted_as_schema_one() {
+    fn a_missing_config_is_created_with_the_current_schema() {
         let path = temporary_path("missing-config");
         let initialized = Config::initialize_at(&path, 1).unwrap();
         assert_eq!(initialized.config, Config::default());
@@ -1017,25 +890,31 @@ mod tests {
     }
 
     #[test]
-    fn exact_legacy_config_is_backed_up_before_reset() {
-        let path = temporary_path("legacy-config");
-        let bytes = legacy_json();
-        fs::write(&path, &bytes).unwrap();
-        let initialized = Config::initialize_at(&path, 42).unwrap();
-        let backup = initialized.reset_notice.unwrap().backup_path;
-        assert_eq!(fs::read(&backup).unwrap(), bytes);
-        assert_eq!(Config::load(&path).unwrap(), Config::default());
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(backup);
+    fn an_older_config_is_backed_up_before_it_is_reset() {
+        let schema_one = serde_json::to_vec(
+            &json!({ "schema_version": CONFIG_SCHEMA_VERSION - 1, "accounts": [] }),
+        )
+        .unwrap();
+        for (name, bytes) in [("unversioned", legacy_json()), ("schema-one", schema_one)] {
+            let path = temporary_path(name);
+            fs::write(&path, &bytes).unwrap();
+            let initialized = Config::initialize_at(&path, 42).unwrap();
+            let backup = initialized.reset_notice.unwrap().backup_path;
+            assert_eq!(fs::read(&backup).unwrap(), bytes);
+            assert_eq!(Config::load(&path).unwrap(), Config::default());
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(backup);
+        }
     }
 
     #[test]
-    fn backup_failure_does_not_modify_legacy_config() {
+    fn a_failed_backup_leaves_the_older_config_untouched() {
         let path = temporary_path("legacy-backup-failure");
         let bytes = legacy_json();
         fs::write(&path, &bytes).unwrap();
         let file_name = path.file_name().unwrap().to_string_lossy();
-        let backup = path.with_file_name(format!("{file_name}.pre-groups-42.bak"));
+        let backup =
+            path.with_file_name(format!("{file_name}.pre-v{CONFIG_SCHEMA_VERSION}-42.bak"));
         fs::write(&backup, b"occupied").unwrap();
         assert!(matches!(
             Config::initialize_at(&path, 42),
@@ -1047,12 +926,13 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_and_future_config_are_left_untouched() {
+    fn a_corrupt_config_and_a_newer_one_are_left_untouched() {
         for (name, bytes) in [
             ("corrupt", b"{broken".to_vec()),
             (
                 "future",
-                serde_json::to_vec(&json!({ "schema_version": 2 })).unwrap(),
+                serde_json::to_vec(&json!({ "schema_version": CONFIG_SCHEMA_VERSION + 1 }))
+                    .unwrap(),
             ),
         ] {
             let path = temporary_path(name);
@@ -1072,7 +952,7 @@ mod tests {
         assert_eq!(Config::load(&path).unwrap().settings.llm_max_tokens, 0);
 
         let mut invalid = config;
-        invalid.settings.log_level = "verbose".into();
+        invalid.settings.countdown_secs = 0;
         let invalid_bytes = serde_json::to_vec_pretty(&invalid).unwrap();
         fs::write(&path, &invalid_bytes).unwrap();
         assert!(matches!(
@@ -1081,7 +961,7 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
 
-        invalid.settings.log_level = "normal".into();
+        invalid.settings.countdown_secs = 15;
         invalid.settings.llm_endpoint = "https://".into();
         assert!(invalid.save(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
@@ -1128,7 +1008,7 @@ mod tests {
         let path = temporary_path("settings-known-and-save-fail");
         // Known current schema (partial with defaults) must be accepted at load.
         let partial = json!({
-            "schema_version": 1,
+            "schema_version": CONFIG_SCHEMA_VERSION,
             "config_revision": 0,
             "schedule_revision": 0,
             "accounts": [],
@@ -1254,7 +1134,7 @@ mod tests {
     fn qr_remote_old_json_defaults_and_validation() {
         // Old schema v1 config without qr fields must load with defaults (enabled false, default base).
         let old = json!({
-            "schema_version": 1,
+            "schema_version": CONFIG_SCHEMA_VERSION,
             "config_revision": 0,
             "schedule_revision": 0,
             "accounts": [],
@@ -1381,7 +1261,7 @@ mod tests {
 
         // Old JSON without qr fields defaults correctly and validates
         let old = serde_json::json!({
-            "schema_version": 1, "config_revision": 0, "schedule_revision": 0,
+            "schema_version": CONFIG_SCHEMA_VERSION, "config_revision": 0, "schedule_revision": 0,
             "accounts": [],
             "settings": { "countdown_secs": 30 },
             "groups": [], "monitoring": { "global_schedule": { "monday": [], "tuesday": [], "wednesday": [], "thursday": [], "friday": [], "saturday": [], "sunday": [] }, "time_zone": { "kind": "device" }, "all_suspended": false },

@@ -160,8 +160,7 @@ fn settings_persist_over_the_seam() {
 
     let i = hz.next();
     let patch = r#"{"llm_max_tokens":32000,"radar_strategy":["empty_answer","global_wgs84"],
-        "number_concurrency":4,"number_min_concurrency":4,"number_cooldown_ms":500,
-        "poll_idle_secs":9,"quiz_detect_secs":30,"log_level":"debug","max_answer_reask":7}"#;
+        "number_cooldown_ms":500,"poll_idle_secs":9,"quiz_detect_secs":30,"max_answer_reask":7}"#;
     send(
         hz.h,
         &format!(r#"{{"id":{i},"cmd":"UpdateConfig","patch":{patch}}}"#),
@@ -172,12 +171,9 @@ fn settings_persist_over_the_seam() {
     let cfg = crate::config::Config::load(&PathBuf::from(&dir).join("config.json")).unwrap();
     let s = &cfg.settings;
     assert_eq!(s.llm_max_tokens, 32000);
-    assert_eq!(s.number_concurrency, 4);
-    assert_eq!(s.number_min_concurrency, 4);
     assert_eq!(s.number_cooldown_ms, 500);
     assert_eq!(s.poll_idle_secs, 9);
     assert_eq!(s.quiz_detect_secs, 30);
-    assert_eq!(s.log_level, "debug");
     assert_eq!(s.max_answer_reask, 7);
 }
 
