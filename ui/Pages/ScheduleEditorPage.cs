@@ -51,7 +51,7 @@ public sealed class ScheduleEditorPage : ContentPage
                         Children =
                         {
                             _binding,
-                            Theme.Dim("區間為半開；結束早於開始代表跨午夜。可輸入多段，例如 08:00-12:00；13:00-17:00。", 12),
+                            Theme.Dim("可輸入多段，例如 08:00-12:00；13:00-17:00。結束早於開始代表跨午夜。", 12),
                             _weekly,
                             _overlap,
                             _quota,

@@ -94,7 +94,6 @@ public sealed class SettingsPage : ContentPage
             Spacing = 8,
             Children =
             {
-                Theme.Dim("設定全局每週時段與 Device／Named IANA 時區。監控中儲存會先 fail closed，再發布新時鐘。", 12.5),
                 Theme.Primary(
                     "編輯全局時間表與時區",
                     () => Navigation.PushAsync(new MonitoringPreferencesPage(state))),
@@ -107,7 +106,7 @@ public sealed class SettingsPage : ContentPage
             Spacing = 10,
             Children =
             {
-                Theme.Dim("答題由 LLM 產生答案;金鑰加密存於保險庫,不寫入設定檔。", 12.5),
+                Theme.Dim("金鑰加密保存，不寫入設定檔。", 12.5),
                 _keyStatus,
                 _llmKey,
                 Theme.Primary("儲存金鑰", async () =>

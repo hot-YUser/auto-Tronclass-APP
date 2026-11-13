@@ -8,7 +8,7 @@ public sealed class MonitoringPreferencesPage : ContentPage
     readonly Picker _zoneMode = new()
     {
         Title = "時區來源",
-        ItemsSource = new[] { "跟隨裝置", "指定 IANA 時區" },
+        ItemsSource = new[] { "跟隨裝置", "指定時區" },
     };
     readonly Entry _iana = new() { Placeholder = "Asia/Taipei" };
     readonly WeeklyScheduleForm _weekly;
@@ -80,7 +80,7 @@ public sealed class MonitoringPreferencesPage : ContentPage
                         {
                             _zoneMode,
                             _iana,
-                            Theme.Dim("具名時區固定儲存 IANA ID；無法解析時 automatic target 會 fail closed，不會改用固定 offset。", 12),
+                            Theme.Dim("無法辨識的時區不會自動開始監控。", 12),
                             _zoneError,
                         },
                     }),
@@ -92,7 +92,7 @@ public sealed class MonitoringPreferencesPage : ContentPage
                         Spacing = 8,
                         Children =
                         {
-                            Theme.Dim("選擇「跟隨全局」的 target 會使用此表；空表表示沒有自動時段。", 12),
+                            Theme.Dim("選擇「跟隨全局」的帳號與群組使用這份時間表。", 12),
                             _weekly,
                             _quota,
                         },
@@ -129,7 +129,7 @@ public sealed class MonitoringPreferencesPage : ContentPage
         var input = _iana.Text?.Trim() ?? "";
         if (input.Length == 0)
         {
-            ShowZoneError("請輸入 IANA 時區 ID。");
+            ShowZoneError("請輸入時區，例如 Asia/Taipei。");
             return null;
         }
         var normalized = TimeZoneInfo.TryConvertWindowsIdToIanaId(input, out var iana) && iana is not null
