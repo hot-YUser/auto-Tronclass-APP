@@ -114,10 +114,10 @@ sealed class QuizRow : Border
     /// 狀態膠囊短標籤 + 語意色:已送出綠、全滅結束中性(不宣稱成功)、暫緩琥珀、捨棄紅、待定案琥珀、審題中主色。
     static (string, Color, Color, Color, Color) QuizToneOf(QuizVm vm) => vm.Status switch
     {
-        "done" when vm.SubmittedCount == 0 => (vm.StatusTag, Theme.DimL, Theme.DimD, Theme.Card2L, Theme.Card2D),
-        "done" => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
-        "held" => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
-        "discarded" => (vm.StatusTag, Theme.DangerL, Theme.DangerD, Theme.DangerBgL, Theme.DangerBgD),
+        QuizStatus.Done when vm.SubmittedCount == 0 => (vm.StatusTag, Theme.DimL, Theme.DimD, Theme.Card2L, Theme.Card2D),
+        QuizStatus.Done => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
+        QuizStatus.Held => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
+        QuizStatus.Discarded => (vm.StatusTag, Theme.DangerL, Theme.DangerD, Theme.DangerBgL, Theme.DangerBgD),
         _ when vm.AnyConflict => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
         _ => (vm.StatusTag, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD),
     };

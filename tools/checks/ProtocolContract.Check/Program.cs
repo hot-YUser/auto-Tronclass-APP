@@ -122,7 +122,7 @@ static QuizVm Quiz(params (string Id, string State, bool Submitted)[] accounts)
 // all-failed(failed + gone)→ 完成;狀態文字不得宣稱成功送出
 var allFailed = Quiz(("a", "failed", false), ("b", "gone", false));
 Assert(allFailed.IsComplete, "all-failed must complete");
-allFailed.Status = "done";
+allFailed.Status = QuizStatus.Done;
 Assert(allFailed.StatusTag == "已結束", "all-failed tag must not claim 已送出");
 Assert(allFailed.StatusText == "活動已結束 · 未送出作答", "all-failed text must not claim submission");
 

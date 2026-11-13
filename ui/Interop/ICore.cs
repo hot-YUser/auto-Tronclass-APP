@@ -9,8 +9,8 @@ namespace TronClass.Interop;
 ///
 /// Commands are fire-and-await: <see cref="SendAsync"/> returns the id-correlated reply. Unsolicited
 /// events arrive on <see cref="EventReceived"/> — raised on a worker thread, so marshal to the UI
-/// thread yourself (<c>MainThread.BeginInvokeOnMainThread</c>). The <c>Last*</c> snapshots hold the
-/// most recent of each state event so a screen can render immediately on appearing.
+/// thread yourself (<c>MainThread.BeginInvokeOnMainThread</c>).
+/// <see cref="LastMonitoringSnapshot"/> holds the most recent snapshot for the schedule clock.
 /// </summary>
 public interface ICore
 {
@@ -18,9 +18,5 @@ public interface ICore
     Task<JsonElement> SendAsync(string cmd, params (string Key, object? Value)[] fields);
     event Action<JsonElement>? EventReceived;
 
-    JsonElement? LastCaps { get; }
-    JsonElement? LastProviders { get; }
     JsonElement? LastMonitoringSnapshot { get; }
-    JsonElement? LastVaultState { get; }
-    JsonElement? LastNextClass { get; } // null ⇒ no upcoming class → hide the Home "下一堂課" card
 }

@@ -9,11 +9,7 @@ public sealed class MockCore : ICore
 {
     public event Action<JsonElement>? EventReceived;
 
-    public JsonElement? LastCaps { get; private set; }
-    public JsonElement? LastProviders { get; private set; }
     public JsonElement? LastMonitoringSnapshot { get; private set; }
-    public JsonElement? LastVaultState { get; private set; }
-    public JsonElement? LastNextClass { get; private set; }
 
     JsonObject? _snapshot;
     int _nextAccount = 1;
@@ -507,14 +503,7 @@ public sealed class MockCore : ICore
     void Emit(JsonObject payload)
     {
         var element = Element(payload);
-        switch (payload["event"]?.GetValue<string>())
-        {
-            case "Caps": LastCaps = element; break;
-            case "Providers": LastProviders = element; break;
-            case "MonitoringSnapshot": LastMonitoringSnapshot = element; break;
-            case "VaultState": LastVaultState = element; break;
-            case "NextClass": LastNextClass = element; break;
-        }
+        if (payload["event"]?.GetValue<string>() == "MonitoringSnapshot") LastMonitoringSnapshot = element;
         EventReceived?.Invoke(element);
     }
 

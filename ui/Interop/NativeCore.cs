@@ -39,11 +39,7 @@ public sealed class NativeCore : ICore, IDisposable
 
     public event Action<JsonElement>? EventReceived;
 
-    public JsonElement? LastCaps { get; private set; }
-    public JsonElement? LastProviders { get; private set; }
     public JsonElement? LastMonitoringSnapshot { get; private set; }
-    public JsonElement? LastVaultState { get; private set; }
-    public JsonElement? LastNextClass { get; private set; }
 
     public NativeCore()
     {
@@ -301,17 +297,8 @@ public sealed class NativeCore : ICore, IDisposable
         var self = _self;
         if (self is null) return;
         var clone = root.Clone();
-        if (root.TryGetProperty("event", out var ev))
-        {
-            switch (ev.GetString())
-            {
-                case "Caps": self.LastCaps = clone; break;
-                case "Providers": self.LastProviders = clone; break;
-                case "MonitoringSnapshot": self.LastMonitoringSnapshot = clone; break;
-                case "VaultState": self.LastVaultState = clone; break;
-                case "NextClass": self.LastNextClass = clone; break;
-            }
-        }
+        if (root.TryGetProperty("event", out var ev) && ev.ValueEquals("MonitoringSnapshot"))
+            self.LastMonitoringSnapshot = clone;
         // Never invoke managed subscribers while Rust may still hold its state mutex. Queue all
         // unsolicited events onto one FIFO drain: preserves event order and makes callback reentry safe.
         EventQueue.Enqueue(clone);

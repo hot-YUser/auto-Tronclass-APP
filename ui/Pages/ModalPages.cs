@@ -255,8 +255,8 @@ public sealed class HeroQuizPage : ModalPageBase
             // async void 邊界:例外不得逸出(比照 CloseAfterShowing 的處理)。
             try
             {
-                if (vm.Status is "held" or "discarded") await close(this);
-                else if (vm.Status == "done") { ShowEnded(); await Task.Delay(800); await close(this); }
+                if (vm.Status is QuizStatus.Held or QuizStatus.Discarded) await close(this);
+                else if (vm.Status == QuizStatus.Done) { ShowEnded(); await Task.Delay(800); await close(this); }
             }
             catch { /* close 內部已 rollback+Notify */ }
         }
@@ -265,7 +265,7 @@ public sealed class HeroQuizPage : ModalPageBase
             vm.PropertyChanged += OnVm;
             UpdateBig();
             // 備答完成當下就已終結的測驗(例如全部帳號失敗):不給死題上的動作鈕,直接顯示結束態並關閉。
-            if (vm.Status == "done") { ShowEnded(); _ = CloseAfterShowing(); }
+            if (vm.Status == QuizStatus.Done) { ShowEnded(); _ = CloseAfterShowing(); }
         };
         _unsubscribe = () => vm.PropertyChanged -= OnVm;
 

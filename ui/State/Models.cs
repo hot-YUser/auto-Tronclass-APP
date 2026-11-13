@@ -69,30 +69,6 @@ public sealed record SettingsSnapshot(
     bool ResubmitForCorrect, bool EnableLlmTools, bool HasLlmKey,
     bool HasQrRemoteKey, bool QrRemoteEnabled, string QrRemoteBaseUrl);
 
-public sealed class AccountVm : ObservableObject
-{
-    public required string Id { get; init; }
-    string _label = "", _username = "", _schoolRef = "", _state = "offline";
-    bool _isActive, _isTeacher; string? _error, _courseId;
-
-    public string Label { get => _label; set => Set(ref _label, value); }
-    public string Username { get => _username; set => Set(ref _username, value); }
-    public string SchoolRef { get => _schoolRef; set => Set(ref _schoolRef, value); }
-    public bool IsActive { get => _isActive; set => Set(ref _isActive, value); }
-    /// 教師帳號:偵測到 QR 點名時,用它開一場點名取得輪替 data 替學生簽到(core spawn_qr_teacher_assist)。
-    public bool IsTeacher { get => _isTeacher; set => Set(ref _isTeacher, value); }
-    /// 教師帳號主持 QR 點名的課程;null/空 = core 退回教師的第一門課。
-    public string? CourseId { get => _courseId; set => Set(ref _courseId, value); }
-    public string? Error { get => _error; set => Set(ref _error, value); }
-    public string State
-    {
-        get => _state;
-        set { if (Set(ref _state, value)) { Raise(nameof(StateText)); Raise(nameof(LoginFailed)); } }
-    }
-    public bool LoginFailed => State == "login_failed";
-    public string StateText => State switch { "online" => "已連線", "login_failed" => "登入失敗", _ => "未登入" };
-}
-
 public sealed record SchoolVm(string Key, string Label, string BaseUrl);
 
 /// <summary>下一堂課(core 由 /api/my-courses 推導);null ⇒ 首頁該卡整塊隱藏。</summary>
@@ -118,6 +94,8 @@ public sealed record LogEntry(DateTime At, string Level, string Text)
 
 // ---------------- 點名 ----------------
 
+public enum RollcallStatus { Counting, Pending, Done }
+
 public sealed class RollcallVm : ObservableObject, IGateVm
 {
     public required string ActivityToken { get; init; }
@@ -127,7 +105,7 @@ public sealed class RollcallVm : ObservableObject, IGateVm
     public ObservableCollection<RollcallAccountVm> Accounts { get; } = [];
 
     string _kind = "", _course = "";
-    int? _remaining; int _total; string _status = "counting"; // counting | pending | done
+    int? _remaining; int _total; RollcallStatus _status;
     double _rate; double _gate; bool _holding;                // 防假點名門檻(core 的 RollcallGate 事件推來)
 
     public string Kind { get => _kind; set { if (Set(ref _kind, value)) { Raise(nameof(KindText)); Raise(nameof(KindEmblem)); Raise(nameof(MetaText)); } } }
@@ -154,15 +132,15 @@ public sealed class RollcallVm : ObservableObject, IGateVm
 
     public int? RemainingSecs { get => _remaining; set => Set(ref _remaining, value); }
     public int TotalSecs { get => _total; set => Set(ref _total, value); }
-    public string Status
+    public RollcallStatus Status
     {
         get => _status;
         set { if (Set(ref _status, value)) { Raise(nameof(StatusText)); Raise(nameof(StatusTag)); Raise(nameof(IsCounting)); Raise(nameof(IsPending)); Raise(nameof(IsDone)); } }
     }
 
-    public bool IsCounting => Status == "counting";
-    public bool IsPending => Status == "pending";
-    public bool IsDone => Status == "done";
+    public bool IsCounting => Status == RollcallStatus.Counting;
+    public bool IsPending => Status == RollcallStatus.Pending;
+    public bool IsDone => Status == RollcallStatus.Done;
     public string KindText => Kind switch { "radar" => "雷達", "qr" => "QR Code", "number" => "數字碼", _ => Kind };
     /// 徽章字紋(2 字內):列表卡左側的類型標記。
     public string KindEmblem => Kind switch { "radar" => "雷達", "qr" => "QR", "number" => "數字", _ => KindText.Length >= 2 ? KindText[..2] : KindText };
@@ -175,15 +153,15 @@ public sealed class RollcallVm : ObservableObject, IGateVm
     /// 右上狀態膠囊的短標籤(顏色由畫面依 Status/Holding 決定)。
     public string StatusTag => Status switch
     {
-        "pending" => "已暫緩",
-        "done" => "已完成",
+        RollcallStatus.Pending => "已暫緩",
+        RollcallStatus.Done => "已完成",
         _ when Holding => "等待門檻",
         _ => "進行中",
     };
     public string StatusText => Status switch
     {
-        "pending" => "暫緩中 · 可補簽",
-        "done" => $"已簽到 {SignedCount}/{Accounts.Count}",
+        RollcallStatus.Pending => "暫緩中 · 可補簽",
+        RollcallStatus.Done => $"已簽到 {SignedCount}/{Accounts.Count}",
         // 未達門檻:講清楚在等什麼(差多少),而不是含糊的「進行中」。
         _ when Holding => $"等待簽到率 · {AttendanceRate:0.#}% / 門檻 {GatePercent:0.#}%",
         _ => $"進行中 · 已簽 {SignedCount}/{Accounts.Count}",
@@ -223,6 +201,8 @@ public sealed class RollcallAccountVm : ObservableObject
 
 // ---------------- 答題 ----------------
 
+public enum QuizStatus { Reviewing, Held, Discarded, Done }
+
 /// <summary>
 /// 答題完成的權威述詞(純邏輯、零 UI 相依;ProtocolContract.Check 直接編譯驗證)。
 /// 只有「已送出」或 AttemptState ∈ {failed, gone} 是終端;waiting/preparing/ready/submitting
@@ -245,12 +225,12 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     public Dictionary<(string AccountId, string SubjectId), ReasoningVm> Reasoning { get; } = [];
 
     string _course = "";
-    int? _remaining; int _total; string _status = "reviewing"; // reviewing | held | discarded | done
+    int? _remaining; int _total; QuizStatus _status;
 
     public string Course { get => _course; set => Set(ref _course, value); }
     public int? RemainingSecs { get => _remaining; set => Set(ref _remaining, value); }
     public int TotalSecs { get => _total; set => Set(ref _total, value); }
-    public string Status
+    public QuizStatus Status
     {
         get => _status;
         set { if (Set(ref _status, value)) { Raise(nameof(CanSubmit)); Raise(nameof(StatusText)); Raise(nameof(StatusTag)); Raise(nameof(ActionsVisible)); Raise(nameof(HasConflicts)); } }
@@ -260,8 +240,8 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     // 只要「任一帳號任一題」仍衝突就鎖送出,直到全部經 SetAnswer 定案——絕不靜默覆蓋任何帳號的既有作答。
     public bool AnyConflict => PerAccount.Any(a => a.Questions.Any(q => q.Conflict));
     public int ConflictCount => PerAccount.Sum(a => a.Questions.Count(q => q.Conflict));
-    public bool CanSubmit => !AnyConflict && Status is "reviewing" or "held";
-    public bool ActionsVisible => Status is "reviewing" or "held";
+    public bool CanSubmit => !AnyConflict && ActionsVisible;
+    public bool ActionsVisible => Status is QuizStatus.Reviewing or QuizStatus.Held;
     public bool HasConflicts => AnyConflict && ActionsVisible;
     public string ConflictText => $"尚有 {ConflictCount} 處與你既有的作答衝突,定案後才能送出";
     public int QuestionCount => PerAccount.FirstOrDefault()?.Questions.Count ?? 0;
@@ -279,19 +259,19 @@ public sealed class QuizVm : ObservableObject, ICountdownVm
     public string StatusTag => Status switch
     {
         // 全部失敗/已結束時不得宣稱「已送出」——誠實呈現活動結束。
-        "done" when SubmittedCount == 0 => "已結束",
-        "done" => "已送出",
-        "held" => "已暫緩",
-        "discarded" => "已捨棄",
+        QuizStatus.Done when SubmittedCount == 0 => "已結束",
+        QuizStatus.Done => "已送出",
+        QuizStatus.Held => "已暫緩",
+        QuizStatus.Discarded => "已捨棄",
         _ => AnyConflict ? "待定案" : "審題中",
     };
     public string StatusText => Status switch
     {
         // 全部失敗/已結束:0 個送出,不能寫「已送出 0/N」假裝成功。
-        "done" when SubmittedCount == 0 => "活動已結束 · 未送出作答",
-        "done" => $"已送出 {SubmittedCount}/{PerAccount.Count}",
-        "held" => "已暫緩 · 待手動送出",
-        "discarded" => "已捨棄",
+        QuizStatus.Done when SubmittedCount == 0 => "活動已結束 · 未送出作答",
+        QuizStatus.Done => $"已送出 {SubmittedCount}/{PerAccount.Count}",
+        QuizStatus.Held => "已暫緩 · 待手動送出",
+        QuizStatus.Discarded => "已捨棄",
         _ => HasConflicts ? $"審題中 · {ConflictCount} 處衝突" : "審題中",
     };
 

@@ -113,8 +113,8 @@ sealed class RollcallRow : Border
     /// 狀態膠囊的短標籤 + 語意色:已完成綠、暫緩/等待門檻琥珀、進行中主色。列表卡與詳細頁共用。
     internal static (string, Color, Color, Color, Color) RollcallToneOf(RollcallVm vm) => vm.Status switch
     {
-        "done" => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
-        "pending" => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
+        RollcallStatus.Done => (vm.StatusTag, Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
+        RollcallStatus.Pending => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
         _ when vm.Holding => (vm.StatusTag, Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
         _ => (vm.StatusTag, Theme.PrimL, Theme.PrimD, Theme.PrimBgL, Theme.PrimBgD),
     };

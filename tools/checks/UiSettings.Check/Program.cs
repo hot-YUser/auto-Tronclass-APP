@@ -476,10 +476,6 @@ static async Task AssertCanceled(Func<Task> action, string message)
 sealed class ScheduleCoreFake : ICore
 {
     public event Action<JsonElement>? EventReceived { add { } remove { } }
-    public JsonElement? LastCaps => null;
-    public JsonElement? LastProviders => null;
-    public JsonElement? LastVaultState => null;
-    public JsonElement? LastNextClass => null;
     public JsonElement? LastMonitoringSnapshot { get; } = Parse(
         """
         {
