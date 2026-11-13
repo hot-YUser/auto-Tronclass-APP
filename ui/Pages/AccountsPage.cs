@@ -2,11 +2,11 @@ using Microsoft.Maui.Controls.Shapes;
 
 namespace Ui;
 
-/// <summary>帳號定義與驗證入口；畫面唯一輸入是完整 MonitoringSnapshot。</summary>
+/// <summary>帳號清單：新增、驗證、刪除。</summary>
 public sealed class AccountsPage : ContentPage
 {
     readonly AppState _state;
-    readonly VerticalStackLayout _accounts = new() { Spacing = 10 };
+    readonly KeyedStack<AccountSnapshotContract, AccountCard> _accounts;
     readonly Label _empty = Theme.Dim("尚未新增帳號。", 13);
     readonly Button _addButton;
     bool _attached;
@@ -15,6 +15,10 @@ public sealed class AccountsPage : ContentPage
     {
         _state = state;
         Title = "帳號";
+        _accounts = new(
+            account => account.AccountId,
+            () => new AccountCard(state, this),
+            (card, account) => card.Update(account)) { Spacing = 10 };
 
         _addButton = Theme.Primary(
             "＋ 新增帳號",
@@ -70,135 +74,10 @@ public sealed class AccountsPage : ContentPage
 
     void RenderAccounts()
     {
-        _accounts.Children.Clear();
-        var snapshot = _state.Monitoring;
-        var accounts = snapshot?.Accounts ?? [];
+        var accounts = _state.Monitoring?.Accounts ?? [];
         _empty.IsVisible = accounts.Length == 0;
         _addButton.IsEnabled = !_state.IsCommandPending("account:add");
-        foreach (var account in accounts)
-            _accounts.Children.Add(BuildAccountCard(snapshot!, account));
-    }
-
-    View BuildAccountCard(MonitoringSnapshotContract snapshot, AccountSnapshotContract account)
-    {
-        var school = _state.Schools.FirstOrDefault(item => item.Key == account.SchoolRef)?.Label
-                     ?? account.SchoolRef;
-        var title = new HorizontalStackLayout { Spacing = 8 };
-        title.Children.Add(Theme.Strong(account.Label, 15));
-        if (account.Role == "teacher")
-            title.Children.Add(Theme.TextPill(
-                "教師 · QR 輔助",
-                Theme.WarnL,
-                Theme.WarnD,
-                Theme.WarnBgL,
-                Theme.WarnBgD));
-
-        var (status, fgLight, fgDark, bgLight, bgDark) = account.LoginState switch
-        {
-            "logging_in" => ("驗證中…", Theme.WarnL, Theme.WarnD, Theme.WarnBgL, Theme.WarnBgD),
-            "online" => ("已驗證", Theme.OkL, Theme.OkD, Theme.OkBgL, Theme.OkBgD),
-            "error" => ("驗證失敗", Theme.DangerL, Theme.DangerD, Theme.DangerBgL, Theme.DangerBgD),
-            _ => ("尚未驗證", Theme.DimL, Theme.DimD, Theme.Card2L, Theme.Card2D),
-        };
-        var statusPill = Theme.TextPill(status, fgLight, fgDark, bgLight, bgDark);
-        statusPill.HorizontalOptions = LayoutOptions.End;
-
-        var header = new Grid();
-        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
-        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
-        header.Add(title, 0, 0);
-        header.Add(statusPill, 1, 0);
-
-        var commandKey = $"account:{account.AccountId}:auth";
-        var inUse = account.InUseTargets.Length > 0;
-        var busy = account.LoginInFlight || _state.IsCommandPending(commandKey);
-        var canManage = !inUse && !busy;
-        var buttons = new FlexLayout { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap };
-
-        void AddButton(Button button)
-        {
-            button.Margin = new Thickness(0, 0, 8, 0);
-            buttons.Children.Add(button);
-        }
-
-        var verify = Theme.Ghost(
-            account.LoginState == "stored" ? "驗證" : "重新驗證",
-            () => _state.Login(account.AccountId));
-        verify.IsEnabled = canManage;
-        AddButton(verify);
-
-        if (account.LoginState == "error")
-        {
-            var cookie = Theme.Ghost(
-                "Cookie 登入",
-                () => Navigation.PushAsync(new CookieImportPage(_state, account.AccountId, account.Label)));
-            cookie.IsEnabled = canManage;
-            AddButton(cookie);
-        }
-
-        var delete = Theme.Danger("刪除帳號", () => DeleteAccount(snapshot, account));
-        delete.IsEnabled = canManage &&
-                           !_state.IsCommandPending($"account:{account.AccountId}:delete");
-        AddButton(delete);
-
-        var body = new VerticalStackLayout
-        {
-            Spacing = 8,
-            Children =
-            {
-                header,
-                Theme.Dim(account.Username, 12.5),
-                Theme.Dim(school, 12.5),
-            },
-        };
-        if (account.Role == "teacher")
-            body.Children.Add(Theme.Dim(
-                string.IsNullOrWhiteSpace(account.TeacherCourseId)
-                    ? "主持課程：自動選擇"
-                    : $"主持課程：{account.TeacherCourseId}",
-                12.5));
-        if (account.InUseTargets.Length > 0)
-            body.Children.Add(Theme.Text(
-                $"正在由：{string.Join("、", account.InUseTargets.Select(target => target.Name))} 使用",
-                12.5,
-                Theme.FontSemibold,
-                Theme.WarnL,
-                Theme.WarnD));
-        if (account.LoginError is { } error)
-            body.Children.Add(Theme.Text(
-                error.Message,
-                12.5,
-                Theme.FontRegular,
-                Theme.DangerL,
-                Theme.DangerD));
-        body.Children.Add(buttons);
-        return Theme.Card(body);
-    }
-
-    async Task DeleteAccount(
-        MonitoringSnapshotContract snapshot,
-        AccountSnapshotContract account)
-    {
-        var groups = snapshot.Targets
-            .Where(target => target.Target.Kind == "group" &&
-                             target.GroupDefinition?.MemberAccountIds.Contains(
-                                 account.AccountId,
-                                 StringComparer.Ordinal) == true)
-            .Select(target => target.Name)
-            .ToArray();
-        var detail = groups.Length == 0
-            ? "此動作無法復原。"
-            : $"同時會從下列群組移除：{string.Join("、", groups)}。";
-        if (!await DisplayAlertAsync(
-                "刪除帳號",
-                $"確定刪除「{account.Label}」？{detail}",
-                "刪除",
-                "取消"))
-            return;
-        await _state.DeleteAccount(
-            account.AccountId,
-            snapshot.ConfigRevision,
-            removeFromGroups: true);
+        _accounts.Sync(accounts);
     }
 
     static View NavRow(string title, string subtitle, Func<Task> onTap)
@@ -216,6 +95,111 @@ public sealed class AccountsPage : ContentPage
         grid.Add(chevron, 1, 0);
         grid.OnTap(onTap);
         return grid;
+    }
+}
+
+/// <summary>一個帳號的卡片。視圖只建一次，<see cref="Update"/> 寫入新值。</summary>
+sealed class AccountCard : ContentView
+{
+    readonly AppState _state;
+    readonly Page _page;
+    readonly Label _label = Theme.Strong("", 15);
+    readonly TonePill _role = new() { IsVisible = false };
+    readonly TonePill _status = new() { HorizontalOptions = LayoutOptions.End };
+    readonly Label _identity = Theme.Dim("", 12.5);
+    readonly Label _course = Theme.Dim("", 12.5);
+    readonly Label _inUse = Theme.Text("", 12.5, Theme.FontSemibold, Theme.WarnL, Theme.WarnD);
+    readonly Label _error = Theme.Text("", 12.5, Theme.FontRegular, Theme.DangerL, Theme.DangerD);
+    readonly Button _verify, _cookie, _delete;
+    AccountSnapshotContract? _account;
+
+    public AccountCard(AppState state, Page page)
+    {
+        _state = state;
+        _page = page;
+        _role.Set(new("教師 · QR 輔助", ToneKind.Warn));
+        _verify = Theme.Ghost("驗證", () => With(account => state.Login(account.AccountId)));
+        _cookie = Theme.Ghost("Cookie 登入", () => With(account =>
+            page.Navigation.PushAsync(new CookieImportPage(state, account.AccountId, account.Label))));
+        _delete = Theme.Danger("刪除帳號", () => With(Delete));
+
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+        header.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        header.Add(new HorizontalStackLayout { Spacing = 8, Children = { _label, _role } }, 0, 0);
+        header.Add(_status, 1, 0);
+        var buttons = new FlexLayout { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap };
+        foreach (var button in new[] { _verify, _cookie, _delete })
+        {
+            button.Margin = new Thickness(0, 0, 8, 0);
+            buttons.Children.Add(button);
+        }
+        Content = Theme.Card(new VerticalStackLayout
+        {
+            Spacing = 8,
+            Children = { header, _identity, _course, _inUse, _error, buttons },
+        });
+    }
+
+    public void Update(AccountSnapshotContract account)
+    {
+        _account = account;
+        var teacher = account.Role == "teacher";
+        _label.Text = account.Label;
+        _role.IsVisible = teacher;
+        _status.Set(account.LoginState switch
+        {
+            "logging_in" => new("驗證中…", ToneKind.Warn),
+            "online" => new("已驗證", ToneKind.Ok),
+            "error" => new("驗證失敗", ToneKind.Danger),
+            _ => new("尚未驗證", ToneKind.Neutral),
+        });
+        var school = _state.Schools.FirstOrDefault(school => school.Key == account.SchoolRef)?.Label
+                     ?? account.SchoolRef;
+        _identity.Text = $"{account.Username} · {school}";
+        _course.Show(!teacher
+            ? null
+            : string.IsNullOrWhiteSpace(account.TeacherCourseId)
+                ? "主持課程：自動選擇"
+                : $"主持課程：{account.TeacherCourseId}");
+        _inUse.Show(account.InUseTargets.Length == 0
+            ? null
+            : $"正在由：{string.Join("、", account.InUseTargets.Select(target => target.Name))} 使用");
+        _error.Show(account.LoginError?.Message);
+
+        // 使用中或驗證進行中的帳號不能再驗證或刪除。
+        var free = account.InUseTargets.Length == 0 &&
+                   !account.LoginInFlight &&
+                   !_state.IsCommandPending($"account:{account.AccountId}:auth");
+        _verify.Text = account.LoginState == "stored" ? "驗證" : "重新驗證";
+        _verify.IsEnabled = free;
+        _cookie.IsVisible = account.LoginState == "error";
+        _cookie.IsEnabled = free;
+        _delete.IsEnabled = free && !_state.IsCommandPending($"account:{account.AccountId}:delete");
+    }
+
+    Task With(Func<AccountSnapshotContract, Task> action) =>
+        _account is { } account ? action(account) : Task.CompletedTask;
+
+    async Task Delete(AccountSnapshotContract account)
+    {
+        if (_state.Monitoring is not { } snapshot) return;
+        var groups = snapshot.Targets
+            .Where(target => target.Target.Kind == "group" &&
+                             target.GroupDefinition?.MemberAccountIds.Contains(
+                                 account.AccountId,
+                                 StringComparer.Ordinal) == true)
+            .Select(target => target.Name)
+            .ToArray();
+        var detail = groups.Length == 0
+            ? "此動作無法復原。"
+            : $"同時會從下列群組移除：{string.Join("、", groups)}。";
+        if (await _page.DisplayAlertAsync(
+                "刪除帳號",
+                $"確定刪除「{account.Label}」？{detail}",
+                "刪除",
+                "取消"))
+            await _state.DeleteAccount(account.AccountId, snapshot.ConfigRevision, removeFromGroups: true);
     }
 }
 

@@ -93,6 +93,23 @@ public static class Theme
     public static Border TextPill(string t, Color fgL, Color fgD, Color bgL, Color bgD) =>
         Pill(Text(t, 11.5, FontSemibold, fgL, fgD), bgL, bgD);
 
+    /// <summary>語意色組(前景淺/深、底色淺/深)。</summary>
+    public static (Color fgL, Color fgD, Color bgL, Color bgD) Palette(ToneKind kind) => kind switch
+    {
+        ToneKind.Primary => (PrimL, PrimD, PrimBgL, PrimBgD),
+        ToneKind.Ok => (OkL, OkD, OkBgL, OkBgD),
+        ToneKind.Warn => (WarnL, WarnD, WarnBgL, WarnBgD),
+        ToneKind.Danger => (DangerL, DangerD, DangerBgL, DangerBgD),
+        _ => (DimL, DimD, Card2L, Card2D),
+    };
+
+    /// <summary>有內容才顯示：空字串或 null 時整行收合，不佔版面。</summary>
+    public static void Show(this Label label, string? text)
+    {
+        label.IsVisible = !string.IsNullOrEmpty(text);
+        if (label.IsVisible) label.Text = text;
+    }
+
     /// <summary>把既有膠囊改上另一組語意色(狀態變動時原地換色,不重建視圖)。</summary>
     public static void Recolor(this Border pill, Label label, Color fgL, Color fgD, Color bgL, Color bgD)
     {

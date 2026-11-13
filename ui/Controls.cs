@@ -4,6 +4,74 @@ using System.ComponentModel;
 
 namespace Ui;
 
+public enum ToneKind { Neutral, Primary, Ok, Warn, Danger }
+
+/// <summary>一個狀態的短標籤與它的語意色。</summary>
+public readonly record struct Tone(string Text, ToneKind Kind);
+
+/// <summary>語意色膠囊。文字與顏色原地更換;值沒變就什麼都不做。</summary>
+public sealed class TonePill : ContentView
+{
+    readonly Label _label = Theme.Text("", 11.5, Theme.FontSemibold, Theme.DimL, Theme.DimD);
+    readonly Border _pill;
+    Tone? _tone;
+
+    public TonePill()
+    {
+        _pill = Theme.Pill(_label, Theme.Card2L, Theme.Card2D);
+        Content = _pill;
+    }
+
+    public void Set(Tone tone)
+    {
+        if (_tone == tone) return;
+        if (_tone?.Kind != tone.Kind)
+        {
+            var (fgL, fgD, bgL, bgD) = Theme.Palette(tone.Kind);
+            _pill.Recolor(_label, fgL, fgD, bgL, bgD);
+        }
+        _label.Text = tone.Text;
+        _tone = tone;
+    }
+}
+
+/// <summary>
+/// 依 key 重用子視圖的直向清單。同一筆資料的視圖只建一次,之後由 <c>update</c> 原地寫入新值;
+/// 只有離開資料的那幾列才被移除。整份資料重送時不會拆掉重建,捲動位置與按鈕狀態都留著。
+/// </summary>
+public sealed class KeyedStack<TItem, TRow>(
+    Func<TItem, string> key,
+    Func<TRow> create,
+    Action<TRow, TItem> update) : VerticalStackLayout where TRow : View
+{
+    readonly Dictionary<string, TRow> _rows = new(StringComparer.Ordinal);
+
+    public void Sync(IReadOnlyList<TItem> items)
+    {
+        var keys = items.Select(key).ToArray();
+        foreach (var gone in _rows.Keys.Except(keys, StringComparer.Ordinal).ToArray())
+        {
+            Children.Remove(_rows[gone]);
+            _rows.Remove(gone);
+        }
+        for (var index = 0; index < items.Count; index++)
+        {
+            if (!_rows.TryGetValue(keys[index], out var row))
+            {
+                row = create();
+                _rows[keys[index]] = row;
+                Children.Insert(index, row);
+            }
+            else if (!ReferenceEquals(Children[index], row))
+            {
+                Children.Remove(row);
+                Children.Insert(index, row);
+            }
+            update(row, items[index]);
+        }
+    }
+}
+
 /// <summary>空狀態:置中標題 + 說明,收在一張卡裡(比一行灰字更完整、耐看)。</summary>
 public sealed class EmptyState : ContentView
 {
